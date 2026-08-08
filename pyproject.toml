@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fw-audit"
+version = "0.1.0"
+description = "Agentic Firmware Vulnerability Detection System (Stage 1: Ingestion & Pre-processing)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "SUTD Agent1o7" }]
+
+# Core runtime deps: keep the always-required set small.
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Install only the LLM providers you actually use.
+ollama = ["langchain-ollama>=0.2.0"]
+anthropic = ["langchain-anthropic>=0.2.0"]
+google = ["langchain-google-genai>=2.0.0"]
+all = [
+    "langchain-ollama>=0.2.0",
+    "langchain-anthropic>=0.2.0",
+    "langchain-google-genai>=2.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+fw-ingest = "fw_audit.stage1_ingestion.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["fw_audit*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: end-to-end tests against a real firmware image (skipped if absent).",
+]
+
+[tool.coverage.run]
+source = ["fw_audit"]
+branch = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+disallow_untyped_defs = false
+ignore_missing_imports = true

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/python -m pip install --quiet --upgrade pip)",
+      "Bash(.venv/Scripts/python -m pip install --quiet pydantic pydantic-settings python-dotenv langchain-core langgraph)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(docker build *)",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(docker buildx *)",
+      "Bash(.venv/Scripts/python -m pytest -m \"not integration\" -v)",
+      "Bash(.venv/Scripts/python -c \"import fw_audit.stage1_ingestion.identifier.agent, sys; assert 'fw_audit.executors' not in sys.modules; print\\('PURITY OK: identifier.agent never imports fw_audit.executors'\\)\")"
+    ]
+  }
+}

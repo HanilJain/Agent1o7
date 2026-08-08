@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Firmware inputs & the extraction Database (can be huge; never commit)
+data/firmware/*
+data/db/*
+!data/firmware/.gitkeep
+!data/db/.gitkeep
+
+# OS noise
+.DS_Store
+Thumbs.db

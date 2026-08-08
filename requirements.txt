@@ -1,0 +1,11 @@
+# Core runtime (always required)
+langgraph>=0.2.0
+langchain-core>=0.3.0
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+
+# LLM providers (optional — install what you use; or use extras: pip install -e ".[all]")
+langchain-ollama>=0.2.0
+langchain-anthropic>=0.2.0
+langchain-google-genai>=2.0.0
