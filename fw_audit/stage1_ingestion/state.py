@@ -71,6 +71,13 @@ class FirmwareIngestionState(TypedDict, total=False):
     tree_txt_path: str | None
     """Absolute host path to tree.txt, inside db_subfolder. This is also
     what's read and handed directly to the Identifier Agent in this run."""
+    rootfs_dir: str | None
+    """Absolute host path to the directory tree.txt is rooted at. Computed
+    by `generate_tree` after its four-way search (binwalk rootfs / unsquashfs
+    fallback rootfs / the fallback dir itself / out_dir as a last resort).
+    Stage 2 cannot reconstruct this by convention — every path in
+    `identified_binaries` is relative to it — so it must be published here
+    rather than left to be recovered from line 1 of tree.txt."""
 
     # ---- Hand-off 2: identified binaries (Component 2 / Identifier Agent) -
     identified_binaries: Annotated[list[IdentifiedBinary], operator.add]
@@ -100,6 +107,7 @@ def initial_state(
         decrypt_result=None,
         binwalk_2_result=None,
         tree_txt_path=None,
+        rootfs_dir=None,
         identified_binaries=[],
         artifacts=[],
         errors=[],

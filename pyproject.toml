@@ -40,6 +40,7 @@ dev = [
 
 [project.scripts]
 fw-ingest = "fw_audit.stage1_ingestion.runner:main"
+fw-extract = "fw_audit.stage2_extraction.runner:main"
 
 [tool.setuptools.packages.find]
 include = ["fw_audit*"]
@@ -59,6 +60,12 @@ branch = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# docker/ghidra_scripts/ runs inside Ghidra's own PyGhidra/JPype process,
+# not this project's venv — `currentProgram`, `monitor`, `getScriptArgs`,
+# and Java package imports (`java.io`, `ghidra.*`, `jpype`) only exist
+# there, so neither ruff nor mypy can meaningfully check it against this
+# project's environment.
+extend-exclude = ["docker/ghidra_scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
@@ -68,3 +75,6 @@ python_version = "3.11"
 warn_unused_ignores = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
+# See the matching note under [tool.ruff]: docker/ghidra_scripts/ runs
+# inside Ghidra's own PyGhidra process, not this project's venv.
+exclude = ["^docker/ghidra_scripts/"]

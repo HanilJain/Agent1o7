@@ -165,6 +165,25 @@ def write_tree_txt(root: Path, out_path: Path) -> Path:
     """
     lines: list[str] = [str(root)]
 
+    def _is_dir_safe(entry: Path) -> bool:
+        """`Path.is_dir()` follows symlinks and can raise `OSError` for a
+        dangling or otherwise unresolvable one — observed in practice on
+        Windows as WinError 1920 for a relative symlink whose target was
+        never populated in a static rootfs dump (e.g. `debug ->
+        sys/kernel/debug`, since sysfs is normally populated by a running
+        kernel, not present in an extracted image). A symlink is always
+        treated as a leaf here regardless of what it resolves to — this
+        function never walks into one (see this function's docstring) — so
+        it short-circuits on `is_symlink()` and never calls `is_dir()` on a
+        symlink at all, rather than merely catching the error after the
+        fact."""
+        if entry.is_symlink():
+            return False
+        try:
+            return entry.is_dir()
+        except OSError:
+            return False
+
     def _annotate(entry: Path) -> str:
         try:
             size = entry.stat().st_size
@@ -181,7 +200,7 @@ def write_tree_txt(root: Path, out_path: Path) -> Path:
     def _walk(dir_path: Path, prefix: str) -> None:
         try:
             entries = sorted(
-                dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
+                dir_path.iterdir(), key=lambda p: (not _is_dir_safe(p), p.name.lower())
             )
         except (PermissionError, OSError) as exc:
             lines.append(f"{prefix}[unreadable: {exc}]")
@@ -193,10 +212,11 @@ def write_tree_txt(root: Path, out_path: Path) -> Path:
         for i, entry in enumerate(entries):
             is_last = i == len(entries) - 1
             connector = "└── " if is_last else "├── "
-            is_dir = entry.is_dir() and not entry.is_symlink()
+            is_symlink = entry.is_symlink()
+            is_dir = _is_dir_safe(entry)  # already False for any symlink
             suffix = "/" if is_dir else ""
-            symlink_note = f" -> {entry.readlink()}" if entry.is_symlink() else ""
-            annotation = "" if is_dir or entry.is_symlink() else _annotate(entry)
+            symlink_note = f" -> {entry.readlink()}" if is_symlink else ""
+            annotation = "" if is_dir or is_symlink else _annotate(entry)
             lines.append(f"{prefix}{connector}{entry.name}{suffix}{symlink_note}{annotation}")
 
             if is_dir:

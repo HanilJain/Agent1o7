@@ -9,10 +9,7 @@ returns structured data — it never imports `fw_audit.executors`, `os`,
 
 from __future__ import annotations
 
-import json
-import re
-
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from fw_audit.common.constants import TARGET_DAEMONS
 from fw_audit.common.schemas import IdentifiedBinary
@@ -30,17 +27,32 @@ class IdentifierUnavailableError(RuntimeError):
 
 
 class _IdentifiedBinaryList(BaseModel):
-    binaries: list[IdentifiedBinary]
+    """Structured-output schema requested from the LLM.
 
-
-def _extract_json(text: str) -> str:
-    """Best-effort extraction of a JSON array/object from LLM response text.
-
-    Handles the common case of a model wrapping its JSON in a markdown code
-    fence despite being instructed not to.
+    `IdentifiedBinary` (see `common/schemas.py`) IS the wire shape here —
+    strictly `{"path": str}`, nothing else. No separate "extension" field:
+    `path` is required to be the complete filename (extension included) as
+    it appears in the listing, and `extension_from_path` derives an
+    extension from it on demand wherever one is needed downstream, rather
+    than asking the model for a second, redundant field that could drift
+    out of sync with `path`. No separate "raw" model to translate
+    afterward either: the model's `Field(description=...)` is the
+    schema-level instruction the LLM sees (via
+    `BaseChatModel.with_structured_output`), which is the enforcement
+    mechanism now, not prose in the prompt or a post-hoc synthesized field.
+    Works identically across providers (Ollama's native `json_schema`
+    structured output locally, tool-calling-based structured output for
+    Anthropic/Google) since `with_structured_output` is a `BaseChatModel`
+    method, not provider-specific code here.
     """
-    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-    return fence_match.group(1) if fence_match else text.strip()
+
+    binaries: list[IdentifiedBinary] = Field(
+        default_factory=list,
+        description=(
+            "ELF binaries in the listing worth deeper security analysis. "
+            "Empty list if nothing looks worth flagging."
+        ),
+    )
 
 
 async def identify_binaries(tree_text: str) -> list[IdentifiedBinary]:
@@ -55,25 +67,24 @@ async def identify_binaries(tree_text: str) -> list[IdentifiedBinary]:
     except (ImportError, ValueError) as exc:
         raise IdentifierUnavailableError(str(exc)) from exc
 
+    structured_llm = llm.with_structured_output(_IdentifiedBinaryList)
     prompt = build_prompt(tree_text, target_daemons=TARGET_DAEMONS)
 
     try:
-        response = await llm.ainvoke(prompt)
+        parsed = await structured_llm.ainvoke(prompt)
     except (OSError, TimeoutError) as exc:
         raise IdentifierUnavailableError(f"LLM call failed: {exc}") from exc
-
-    content = response.content if hasattr(response, "content") else response
-    if not isinstance(content, str):
-        content = str(content)
-
-    try:
-        payload = json.loads(_extract_json(content))
-        parsed = _IdentifiedBinaryList.model_validate(
-            {"binaries": payload} if isinstance(payload, list) else payload
-        )
-    except (json.JSONDecodeError, ValidationError) as exc:
+    except ValidationError as exc:
         raise IdentifierUnavailableError(
-            f"Identifier Agent returned unparseable output: {exc}"
+            f"Identifier Agent returned output that doesn't match the expected schema: {exc}"
         ) from exc
+
+    if not isinstance(parsed, _IdentifiedBinaryList):
+        # with_structured_output(..., include_raw=False) (our default) should
+        # always return the Pydantic model or raise — this is a defensive
+        # backstop against a provider returning e.g. a bare dict instead.
+        raise IdentifierUnavailableError(
+            f"Identifier Agent returned an unexpected result type: {type(parsed).__name__}"
+        )
 
     return parsed.binaries

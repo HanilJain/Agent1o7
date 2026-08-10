@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import AliasChoices, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Repository root = two levels up from this file (fw_audit/config/settings.py).
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
@@ -63,12 +64,62 @@ class Settings(BaseSettings):
         default="fw-audit-sandbox:latest", validation_alias="FWA_DOCKER_IMAGE"
     )
 
+    # ---- Stage 2: Ghidra decompilation -----------------------------------
+    ghidra_image: str = Field(
+        default="fw-audit-ghidra:latest", validation_alias="FWA_GHIDRA_IMAGE"
+    )
+    ghidra_timeout_seconds: int = Field(
+        default=3600, ge=60, validation_alias="FWA_GHIDRA_TIMEOUT_SECONDS"
+    )
+    """Wall-clock cap for ONE analyzeHeadless invocation (one binary).
+    Distinct from subprocess_timeout_seconds (900s default) — a multi-MB
+    stripped MIPS binary routinely exceeds that."""
+    ghidra_analysis_timeout_seconds: int = Field(
+        default=1800, ge=60, validation_alias="FWA_GHIDRA_ANALYSIS_TIMEOUT_SECONDS"
+    )
+    """Passed to analyzeHeadless as -analysisTimeoutPerFile; bounds Ghidra's
+    own auto-analysis, distinct from the outer process-level timeout above."""
+    ghidra_max_mem: str = Field(
+        default="4g", pattern=r"^\d+[mMgG]$", validation_alias="FWA_GHIDRA_MAX_MEM"
+    )
+    ghidra_max_cpu: int = Field(default=2, ge=1, validation_alias="FWA_GHIDRA_MAX_CPU")
+    ghidra_max_functions: int = Field(
+        default=2000, ge=1, validation_alias="FWA_GHIDRA_MAX_FUNCTIONS"
+    )
+    """Router binaries routinely exceed 10,000 functions; the export script
+    caps at this many (largest/most-referenced first) and records the rest
+    as skipped rather than letting a single binary run unbounded."""
+    ghidra_decompile_timeout_seconds: int = Field(
+        default=60, ge=1, validation_alias="FWA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS"
+    )
+    ghidra_emit_strings: bool = Field(
+        default=True, validation_alias="FWA_GHIDRA_EMIT_STRINGS"
+    )
+    stage2_concurrency: int = Field(
+        default=1, ge=1, le=8, validation_alias="FWA_STAGE2_CONCURRENCY"
+    )
+    """Binaries decompiled in parallel. Default 1: each analyzeHeadless JVM
+    reserves ghidra_max_mem, so N concurrent means N x that on the host."""
+    stage2_max_binaries: int = Field(
+        default=25, ge=1, validation_alias="FWA_STAGE2_MAX_BINARIES"
+    )
+    stage2_max_rescan_files: int = Field(
+        default=200_000, ge=1, validation_alias="FWA_STAGE2_MAX_RESCAN_FILES"
+    )
+    """Cap on the lazily-built rootfs basename index used to recover an
+    IdentifiedBinary.path that doesn't resolve directly (see
+    stage2_extraction.resolve)."""
+
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names
     # (binwalk/unsquashfs/etc.) are no longer configurable here — those run
     # inside the sandbox image at fixed PATH locations
     # (see stage1_ingestion/extraction/script.py), not on the host.
-    command_prefix: list[str] = Field(
+    # NoDecode: pydantic-settings otherwise JSON-decodes complex-typed env
+    # values before our "before" validator runs, which raises on a plain
+    # (or empty) string like `FWA_COMMAND_PREFIX=` — NoDecode hands the raw
+    # string straight to `_split_command_prefix` below instead.
+    command_prefix: Annotated[list[str], NoDecode] = Field(
         default_factory=list, validation_alias="FWA_COMMAND_PREFIX"
     )
     subprocess_timeout_seconds: int = Field(
@@ -111,6 +162,12 @@ class Settings(BaseSettings):
         per the naming convention: every artifact for that image accumulates here.
         """
         path = self.database_path / firmware_stem
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def stage2_dir(self, firmware_stem: str) -> Path:
+        """Return (and create) `<db_subfolder>/stage2/` for a firmware image."""
+        path = self.db_subfolder(firmware_stem) / "stage2"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

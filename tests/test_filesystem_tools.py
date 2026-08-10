@@ -127,6 +127,42 @@ def test_write_tree_txt_annotates_elf_with_descriptor(work_dir: Path, synthetic_
     assert "ELF 32-bit LSB MIPS" in content
 
 
+def test_write_tree_txt_survives_entry_whose_is_dir_raises(work_dir: Path, monkeypatch):
+    """Regression test for a real bug hit against real firmware on Windows:
+    a dangling relative symlink (`debug -> sys/kernel/debug` in a static
+    rootfs where sysfs was never populated by a running kernel) makes
+    `Path.is_dir()` raise `OSError` (WinError 1920) when it tries to
+    resolve the symlink target. The sort key used to call `is_dir()`
+    unconditionally on every entry, so ONE such entry destroyed the
+    ENTIRE sibling listing for that directory — `sorted()` can't return
+    partial results on exception — silently dropping `bin/`, `sbin/`,
+    `usr/`, and every other directory actually containing binaries, with
+    only `[unreadable: ...]` left behind. Reproduced here without relying
+    on OS-specific symlink error codes, by directly forcing `is_dir()` to
+    raise for one named entry."""
+    root = work_dir / "rootfs"
+    (root / "bin").mkdir(parents=True)
+    (root / "bin" / "httpd").write_text("x")
+    (root / "broken").write_text("")  # stands in for the problematic entry
+
+    real_is_dir = Path.is_dir
+
+    def _flaky_is_dir(self: Path, *args, **kwargs):
+        if self.name == "broken":
+            raise OSError(1920, "The file cannot be accessed by the system")
+        return real_is_dir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_dir", _flaky_is_dir)
+
+    out = work_dir / "tree.txt"
+    write_tree_txt(root, out)
+    content = out.read_text()
+
+    assert "bin/" in content
+    assert "httpd" in content
+    assert "broken" in content
+
+
 def test_write_tree_txt_directories_have_no_size_annotation(work_dir: Path):
     root = work_dir / "rootfs"
     (root / "bin").mkdir(parents=True)

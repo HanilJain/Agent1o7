@@ -47,3 +47,17 @@ async def test_run_command_nonzero_exit_reported_not_raised():
     assert result.ok is False
     assert result.returncode == 7
     assert result.timed_out is False
+
+
+async def test_run_command_timeout_preserves_partial_output():
+    """A timeout must not discard output already written before the kill —
+    a long-running tool like Ghidra that times out at minute 29 of 30 should
+    still yield whatever it had already logged."""
+    settings = Settings(_env_file=None, FWA_SUBPROCESS_TIMEOUT_SECONDS=1)
+    result = await run_command(
+        "python",
+        ["-c", "import sys, time; print('partial', flush=True); time.sleep(30)"],
+        settings=settings,
+    )
+    assert result.timed_out is True
+    assert "partial" in result.stdout

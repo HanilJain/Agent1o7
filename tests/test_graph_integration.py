@@ -56,7 +56,7 @@ async def test_graph_completes_full_happy_path(monkeypatch, work_dir, fake_execu
 
     async def fake_identify(tree_text: str):
         assert "httpd" in tree_text  # the real tree.txt content was handed over
-        return [IdentifiedBinary(path="bin/httpd", reason="HTTP admin interface")]
+        return [IdentifiedBinary(path="bin/httpd")]
 
     _patch_identifier(monkeypatch, fake_identify)
 
@@ -68,8 +68,39 @@ async def test_graph_completes_full_happy_path(monkeypatch, work_dir, fake_execu
     assert result["tree_txt_path"] is not None
     assert Path(result["tree_txt_path"]).is_file()
     assert result["identified_binaries"] == [
-        IdentifiedBinary(path="bin/httpd", reason="HTTP admin interface")
+        IdentifiedBinary(path="bin/httpd")
     ]
+
+
+async def test_rootfs_dir_is_published(monkeypatch, work_dir, fake_executor):
+    """Stage 2 resolves every IdentifiedBinary.path relative to rootfs_dir and
+    cannot reconstruct it by convention (see generate_tree's four-way search)
+    — it must come back in the state dict, not just live inside tree.txt."""
+
+    def on_run(command, files):
+        if BINWALK_1_DIR in command:
+            (files / BINWALK_1_DIR / "bin").mkdir(parents=True, exist_ok=True)
+            (files / BINWALK_1_DIR / "bin" / "httpd").write_bytes(b"\x7fELF")
+        return None
+
+    executor = fake_executor(on_run)
+    _patch_executor(monkeypatch, executor)
+
+    async def fake_identify(tree_text: str):
+        return []
+
+    _patch_identifier(monkeypatch, fake_identify)
+
+    state = _init_state(work_dir)
+    result = await get_graph().ainvoke(state)
+
+    assert result["status"] == IngestionStatus.COMPLETED
+    assert result["rootfs_dir"] is not None
+    assert Path(result["rootfs_dir"]).is_dir()
+    # tree.txt's first line is str(rootfs_dir) (filesystem_tools.write_tree_txt) —
+    # the two must agree, since Stage 2's fallback path parses that line.
+    tree_first_line = Path(result["tree_txt_path"]).read_text(encoding="utf-8").splitlines()[0]
+    assert tree_first_line == result["rootfs_dir"]
 
 
 async def test_graph_fails_gracefully_on_missing_firmware(work_dir: Path):
@@ -148,4 +179,4 @@ async def test_graph_runs_on_real_firmware(real_firmware_path: Path | None, work
         assert Path(result["tree_txt_path"]).is_file()
         print(f"\nIdentified binaries ({len(result['identified_binaries'])}):")
         for b in result["identified_binaries"][:10]:
-            print(f"  {b.path} -> {b.reason}")
+            print(f"  {b.path}")

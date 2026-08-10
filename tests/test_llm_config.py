@@ -20,12 +20,15 @@ def test_resolve_spec_default_role_is_balanced():
     assert isinstance(spec, ModelSpec)
 
 
-def test_resolve_spec_stage1_binary_identifier_is_high_reasoning():
+def test_resolve_spec_stage1_binary_identifier_is_fast_local():
     # The Identifier Agent is required (no deterministic fallback) and its
-    # output feeds Stage 2 directly, so it gets the strongest tier.
+    # output feeds Stage 2 directly. Routed to FAST_LOCAL (Ollama
+    # qwen2.5-coder:1.5b) for this dev environment, which has no cloud API
+    # key configured — see the ROLE_TO_TIER comment in llm_config.py for how
+    # to flip it back to HIGH_REASONING (Anthropic) once one is.
     spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER)
-    assert spec.provider == ModelProvider.ANTHROPIC
-    assert spec.model == "claude-sonnet-4-5"
+    assert spec.provider == ModelProvider.OLLAMA
+    assert spec.model == "qwen2.5-coder:1.5b"
 
 
 def test_resolve_spec_unknown_role_falls_back_to_balanced():

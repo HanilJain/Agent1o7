@@ -62,16 +62,21 @@ async def run_command(
             command=full_command, returncode=None, stdout="", stderr=str(exc), timed_out=False
         )
 
+    comm = asyncio.ensure_future(proc.communicate())
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=settings.subprocess_timeout_seconds
+            asyncio.shield(comm), timeout=settings.subprocess_timeout_seconds
         )
         timed_out = False
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
-        stdout_b, stderr_b = b"", b""
         timed_out = True
+        proc.kill()
+        # `shield` kept `comm` alive across the cancelled `wait_for` wrapper
+        # (shield cancels the wrapper, not the inner future) — `kill()` EOFs
+        # the pipes, so this now resolves with whatever the process had
+        # already written instead of discarding it. A Ghidra run that times
+        # out at minute 29 of 30 still yields its partial log output.
+        stdout_b, stderr_b = await comm
 
     return CommandResult(
         command=full_command,

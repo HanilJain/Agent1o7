@@ -10,7 +10,13 @@
       "Bash(.venv/Scripts/python -c ' *)",
       "Bash(docker buildx *)",
       "Bash(.venv/Scripts/python -m pytest -m \"not integration\" -v)",
-      "Bash(.venv/Scripts/python -c \"import fw_audit.stage1_ingestion.identifier.agent, sys; assert 'fw_audit.executors' not in sys.modules; print\\('PURITY OK: identifier.agent never imports fw_audit.executors'\\)\")"
+      "Bash(.venv/Scripts/python -c \"import fw_audit.stage1_ingestion.identifier.agent, sys; assert 'fw_audit.executors' not in sys.modules; print\\('PURITY OK: identifier.agent never imports fw_audit.executors'\\)\")",
+      "Bash(.venv/Scripts/python -m pytest -m \"not integration\" -q)",
+      "Bash(.venv/Scripts/python -m pytest -m \"not integration\")",
+      "Bash(.venv/Scripts/python -m pytest tests/test_schemas.py tests/test_stage1_io.py tests/test_stage2_resolve.py -v)",
+      "Bash(.venv/Scripts/python -m ruff check fw_audit/stage2_extraction fw_audit/common fw_audit/config fw_audit/stage1_ingestion fw_audit/executors tests/test_schemas.py tests/test_stage1_io.py tests/test_stage2_resolve.py tests/test_docker_executor.py tests/test_extraction_tools.py tests/test_graph_integration.py)",
+      "Bash(.venv/Scripts/pip show *)",
+      "Bash(.venv/Scripts/python -m pip install --quiet ruff mypy)"
     ]
   }
 }

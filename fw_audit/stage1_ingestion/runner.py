@@ -15,6 +15,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from fw_audit.common.schemas import extension_from_path
 from fw_audit.config.settings import get_settings
 from fw_audit.stage1_ingestion.graph import get_graph
 from fw_audit.stage1_ingestion.state import IngestionStatus, initial_state
@@ -97,7 +98,7 @@ def _print_summary(result: dict) -> None:
     identified = result.get("identified_binaries") or []
     print(f"Identified binaries: {len(identified)}  (Hand-off 2 -> Stage 2 Ghidra MCP)")
     for b in identified[:15]:
-        print(f"  {b.path}\n    -> {b.reason}")
+        print(f"  {b.path}  (extension: {extension_from_path(b.path) or 'none'})")
 
     if result.get("warnings"):
         print(f"\nWarnings ({len(result['warnings'])}):")
@@ -135,13 +136,20 @@ def main(argv: list[str] | None = None) -> int:
     # convenience, but Stage 2 only needs identified_binaries.
     db_subfolder = Path(result["db_subfolder"])
     summary_path = db_subfolder / "stage1_summary.json"
+    status = result.get("status")
     summary_path.write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "run_id": result.get("run_id"),
-                "status": str(result.get("status")),
+                # `.value`, not `str()` — `str()` on a `str`-Enum member
+                # yields its repr ("IngestionStatus.COMPLETED"), not its
+                # value ("completed"). `getattr` guards the case where
+                # `status` is already a plain string (defensive only).
+                "status": getattr(status, "value", str(status)),
                 "db_subfolder": str(db_subfolder),
                 "tree_txt_path": result.get("tree_txt_path"),
+                "rootfs_dir": result.get("rootfs_dir"),
                 "identified_binaries": [
                     b.model_dump(mode="json") for b in result.get("identified_binaries", [])
                 ],

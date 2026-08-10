@@ -10,6 +10,7 @@ container, NOT a "sandbox" in the LLM-controlled-execution sense — see
 from __future__ import annotations
 
 import subprocess
+import uuid
 from pathlib import Path
 
 from fw_audit.config.settings import Settings, get_settings
@@ -69,7 +70,11 @@ class DockerExecutor(Executor):
         timeout: int | None = None,
     ) -> ExecutionResult:
         settings = self._settings
-        docker_args = ["run", "--rm", "--network=none"]
+        # Named (rather than anonymous) so a timeout can address it for
+        # cleanup below; `--init` reaps zombie processes a long-running tool
+        # like Ghidra's JVM can otherwise leave behind as PID 1.
+        container_name = f"fw-audit-{uuid.uuid4().hex[:12]}"
+        docker_args = ["run", "--rm", "--init", "--network=none", "--name", container_name]
 
         if files is not None:
             files = Path(files).resolve()
@@ -88,10 +93,38 @@ class DockerExecutor(Executor):
         run_settings = run_settings.model_copy(update={"command_prefix": []})
 
         result = await run_command(settings.docker_bin, docker_args, settings=run_settings)
+        stderr = result.stderr
+        if result.timed_out:
+            stderr = await self._cleanup_orphaned_container(container_name, run_settings, stderr)
+
         return ExecutionResult(
             command=command,
             returncode=result.returncode,
             stdout=result.stdout,
-            stderr=result.stderr,
+            stderr=stderr,
             timed_out=result.timed_out,
+        )
+
+    async def _cleanup_orphaned_container(
+        self, container_name: str, settings: Settings, stderr: str
+    ) -> str:
+        """Best-effort `docker rm -f` after a timeout.
+
+        `run_command`'s `asyncio.wait_for` cancellation kills the host
+        `docker` CLI process, not the daemon-side container it started
+        (dockerd owns the container, not the CLI's process tree) — so
+        without this, a timed-out run leaves the container running
+        indefinitely despite `--rm`. Cleanup failure is appended to stderr,
+        never raised: a best-effort cleanup must not turn a reported timeout
+        into a different, more confusing error.
+        """
+        cleanup_settings = settings.model_copy(update={"subprocess_timeout_seconds": 30})
+        cleanup = await run_command(
+            self._settings.docker_bin, ["rm", "-f", container_name], settings=cleanup_settings
+        )
+        if cleanup.ok:
+            return stderr
+        return (
+            f"{stderr}\n[fw-audit] cleanup of orphaned container {container_name} "
+            f"failed: {cleanup.stderr}"
         )

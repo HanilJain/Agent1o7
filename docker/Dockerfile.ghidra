@@ -1,0 +1,155 @@
+# syntax=docker/dockerfile:1
+#
+# fw-audit Ghidra decompilation image. This is a PLAIN, deterministic
+# container — targeted by Stage 2's ghidra_executor() (see
+# fw_audit/stage2_extraction/ghidra/client.py) for a fixed, known command
+# sequence: one analyzeHeadless invocation per binary. It is NOT an
+# LLM-controlled sandbox; see fw_audit/executors/sandbox_executor.py.
+#
+# DELIBERATELY SEPARATE from the main docker/Dockerfile (the Stage 1
+# extraction sandbox):
+#   - Stage 1's Extraction Script starts its container 6+ times per firmware
+#     (unzip, binwalk, optional decrypt, binwalk, unsquashfs, sasquatch
+#     fallback). Bundling ~2GB of JDK + Ghidra into that image would tax
+#     every one of those starts and every pull, for zero benefit to Stage 1.
+#   - The main Dockerfile's tpl-builder stage is currently a best-effort,
+#     partially-broken build (see its own comments) that downloads ~100MB of
+#     firmware over plain HTTP. A Ghidra image must not inherit that failure
+#     surface or that network profile.
+#   - Layer sharing isn't lost by splitting: the fetch stage below still
+#     shares a debian:bookworm-slim base layer with the main Dockerfile via
+#     Docker's content-addressed store, even though the runtime stage uses a
+#     different base (see that stage's own comment for why).
+#
+# Runtime is started with --network=none (DockerExecutor, same as Stage 1);
+# BUILD time needs network for apt, the Ghidra release zip from GitHub, and
+# pip (PyGhidra/JPype wheels).
+
+# ---------------------------------------------------------------------------
+# Stage A: fetch — download and verify the Ghidra release.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS fetch
+
+# Pin explicitly rather than "latest": a Ghidra version bump changes the
+# decompiler's output vocabulary, which the normalizer's prelude
+# (fw_audit/stage2_extraction/normalize/prelude.py) and passes are written
+# against — an unpinned image could silently drift out of sync with them.
+ARG GHIDRA_VERSION=12.1.2
+ARG GHIDRA_TAG=Ghidra_12.1.2_build
+# The release asset filename embeds its build date; read the exact value off
+# https://github.com/NationalSecurityAgency/ghidra/releases/tag/${GHIDRA_TAG}
+# when bumping GHIDRA_VERSION.
+ARG GHIDRA_ASSET_DATE=20260605
+# Verified by actually downloading
+# ghidra_12.1.2_PUBLIC_20260605.zip from the URL below on 2026-08-10 and
+# computing this locally (`sha256sum`) — not copied from any third-party
+# listing. Re-verify the same way after bumping GHIDRA_VERSION/GHIDRA_TAG/
+# GHIDRA_ASSET_DATE; never trust a pasted value for a new version.
+ARG GHIDRA_SHA256=b62e81a0390618466c019c60d8c2f796ced2509c4c1aea4a37644a77272cf99d
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/ghidra.zip \
+        "https://github.com/NationalSecurityAgency/ghidra/releases/download/${GHIDRA_TAG}/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_ASSET_DATE}.zip" \
+    && echo "${GHIDRA_SHA256}  /tmp/ghidra.zip" | sha256sum -c - \
+    && unzip -q /tmp/ghidra.zip -d /opt \
+    && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
+    && rm -rf /opt/ghidra/docs /opt/ghidra/Extensions/Eclipse /tmp/ghidra.zip
+
+# ---------------------------------------------------------------------------
+# Stage B: runtime — the image Stage 2's ghidra_executor() actually runs.
+# ---------------------------------------------------------------------------
+# eclipse-temurin, NOT debian:bookworm-slim + apt: OpenJDK 21 is not
+# installable via apt on Debian bookworm — confirmed against a real build,
+# not just docs. It's absent from bookworm's regular archive (bookworm
+# shipped with OpenJDK 17 as default) AND from bookworm-backports (`apt-get
+# install -t bookworm-backports openjdk-21-jdk-headless` -> "E: Unable to
+# locate package", even after adding the backports source list). Eclipse
+# Adoptium's official Temurin image sidesteps the whole Debian-archive
+# question — it's the standard way to pin an exact JDK LTS version in a
+# container. The `-jammy` tag specifically (Ubuntu 22.04-based, not Alpine
+# or UBI) so apt-get still works the same way the rest of this Dockerfile
+# (and docker/Dockerfile) assumes.
+FROM eclipse-temurin:21-jdk-jammy AS runtime
+
+# python3/pip/venv are for PyGhidra (see ghidra_scripts/fw_audit_export.py's
+# module docstring for why PyGhidra over classic Jython/Java GhidraScript).
+# The JDK itself (Ghidra compiles Java GhidraScripts on the fly, and several
+# launcher code paths expect a JDK regardless of scripting engine) already
+# comes from the eclipse-temurin base image above.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv file ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=fetch /opt/ghidra /opt/ghidra
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra
+
+ARG GHIDRA_DEFAULT_MAX_MEM=4G
+# Baked default heap. Overridable at RUN time via `_JAVA_OPTIONS` exported
+# inside the `sh -c` command string DockerExecutor composes — HotSpot applies
+# `_JAVA_OPTIONS` *after* command-line-derived args, so it wins over whatever
+# this bakes into launch.properties (see ghidra/command.py). Docker's `-e`
+# isn't available through DockerExecutor's interface, and doesn't need to be:
+# see the "no -e env vars" row in the Stage 2 plan's Executor-limitations
+# table for the full reasoning.
+RUN sed -i "s/^VMARGS=-Xmx.*/VMARGS=-Xmx${GHIDRA_DEFAULT_MAX_MEM}/" /opt/ghidra/support/launch.properties
+
+# Install PyGhidra/JPype from Ghidra's OWN BUNDLED wheels
+# (Ghidra/Features/PyGhidra/pypkg/dist/), not a guessed PyPI version pin —
+# confirmed against a real build that guessing is a real trap: this image
+# initially pinned pyghidra==2.1.0 from PyPI, but Ghidra 12.1.2 actually
+# bundles (and its own pyghidra_launcher.py's version-matching logic
+# expects) pyghidra 3.1.0 + JPype1 1.5.2. Installing from `--no-index -f
+# <bundled dist dir>` makes the installed version always match whatever
+# this specific Ghidra release ships, with no separate pin to keep in sync.
+#
+# No --break-system-packages: that flag requires pip >=23.0.1's PEP 668
+# support, which the Temurin/jammy base's system pip predates — and jammy's
+# system Python isn't marked externally-managed anyway, so the flag isn't
+# needed here regardless (unlike on a Debian bookworm base, which would need it).
+RUN pip install --no-cache-dir --no-index \
+        -f /opt/ghidra/Ghidra/Features/PyGhidra/pypkg/dist \
+        pyghidra
+
+COPY docker/ghidra_scripts/ /opt/fwaudit/ghidra_scripts/
+
+# Non-root: Ghidra needs no root privilege (unlike Stage 1's `binwalk
+# --run-as=root`, which extracts arbitrary vendor archive formats). The
+# Ghidra *project* directory is deliberately container-local, not on the
+# bind mount — a Ghidra project is a `.rep` tree of many small files plus
+# lock files, and on Docker Desktop for Windows (this repo's dev host) the
+# bind mount is a gRPC-FUSE/9p layer where that access pattern is
+# pathologically slow and lock semantics are unreliable. Only *outputs* are
+# written under /work; --deleteProject (see ghidra/command.py) disposes of
+# the project itself every run.
+RUN useradd -m -u 1000 ghidra \
+    && mkdir -p /ghidra_projects /work \
+    && chown -R ghidra:ghidra /ghidra_projects /work /opt/fwaudit
+USER ghidra
+
+# BUILD-TIME SMOKE TEST. Two jobs: (1) pre-warm ~/.ghidra's user settings
+# directory so the first real analysis run doesn't pay Ghidra's one-time
+# initialization cost, and (2) prove PyGhidra can actually execute a .py
+# postScript end-to-end against *some* binary. If the PyGhidra/JPype install
+# is broken, or fw_audit_export.py has an import-time error, the BUILD fails
+# here — not 40 minutes into a real firmware run.
+#
+# `pyghidraRun -H`, NOT `analyzeHeadless` directly — confirmed against a
+# real build that the latter fails with "Ghidra was not started with
+# PyGhidra. Python is not available". PyGhidra needs the JVM started BY
+# Python (via JPype), not the reverse: `pyghidraRun -H <args>` forwards
+# through to `python3 -m pyghidra.ghidra_launch --install-dir <dir>
+# ghidra.app.util.headless.AnalyzeHeadless <args>`, which is the real
+# equivalent of a plain `analyzeHeadless` call for a PyGhidra script.
+# ghidra/command.py (the real per-binary invocation) uses the same
+# entry point — see its own comment for this same reasoning.
+RUN /opt/ghidra/support/pyghidraRun -H /ghidra_projects fwaudit_smoke \
+        -import /bin/true \
+        -scriptPath /opt/fwaudit/ghidra_scripts \
+        -postScript smoke_test.py \
+        -deleteProject \
+    && test -f /tmp/fwaudit_smoke_ok
+
+WORKDIR /work

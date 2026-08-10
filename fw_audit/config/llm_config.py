@@ -69,17 +69,56 @@ class ModelSpec:
 ROLE_TO_TIER: dict[AgentRole, ModelTier] = {
     AgentRole.DEFAULT: ModelTier.BALANCED,
     # The Identifier Agent IS the identification step (no deterministic
-    # fallback) and its JSON output feeds Stage 2 directly — one call per
-    # firmware makes HIGH_REASONING's cost negligible relative to the
-    # quality it buys.
-    AgentRole.STAGE1_BINARY_IDENTIFIER: ModelTier.HIGH_REASONING,
+    # fallback) and its JSON output feeds Stage 2 directly, so HIGH_REASONING
+    # (cloud) is preferred when a provider key is configured — one call per
+    # firmware makes the cost negligible relative to the quality it buys.
+    # Routed to FAST_LOCAL here because this dev environment has no cloud
+    # API key configured, only a local Ollama install (qwen2.5-coder:1.5b).
+    # Flip back to ModelTier.HIGH_REASONING once ANTHROPIC_API_KEY (or
+    # GOOGLE_API_KEY) is set, for better accuracy on the untrusted-path-list
+    # judgment call Stage 2 depends on.
+    AgentRole.STAGE1_BINARY_IDENTIFIER: ModelTier.FAST_LOCAL,
 }
 
 # ---------------------------------------------------------------------- #
 # Tier -> concrete ModelSpec
 # ---------------------------------------------------------------------- #
 TIER_TO_SPEC: dict[ModelTier, ModelSpec] = {
-    ModelTier.FAST_LOCAL: ModelSpec(provider=ModelProvider.OLLAMA, model="llama3.2"),
+    # Locally installed via `ollama pull qwen2.5-coder:1.5b`. Small (1.5B)
+    # but coder-tuned, and runs fully offline against OLLAMA_BASE_URL.
+    #
+    # No format="json" here: output-shape enforcement is done via
+    # `BaseChatModel.with_structured_output(...)` at the call site
+    # (`identifier/agent.py`), not a constructor-level format kwarg or
+    # prompt prose. That method resolves per-provider (Ollama's native
+    # `json_schema` structured-output API by default here; tool-calling for
+    # Anthropic/Google), so nothing provider-specific belongs in this spec.
+    #
+    # num_ctx=32768: Ollama's server-side default context window is only
+    # 2048 tokens — confirmed against a real run that this silently
+    # truncates the Identifier Agent's prompt for any non-trivial firmware
+    # (a real router rootfs's tree.txt is routinely 150K+ chars / 30-40K+
+    # tokens), producing a cut-off, unparseable JSON response rather than a
+    # clean error. 32768 is qwen2.5-coder:1.5b's own trained context limit
+    # (raising it further wouldn't help — the model can't use it). Even at
+    # 32768 an unusually large tree.txt can still exceed the model's
+    # window; see AgentRole.STAGE1_BINARY_IDENTIFIER's docstring — this is
+    # exactly the kind of accuracy tradeoff HIGH_REASONING (a cloud model
+    # with a much larger context) is meant to remove once a key is set.
+    #
+    # num_predict=4096: a hard cap on generation length. Confirmed
+    # necessary against a real (large, repetitive) firmware tree: without
+    # it, this model can fall into a degenerate repetition loop and
+    # generate 1MB+ of output before Ollama cuts it off mid-token — several
+    # minutes spent producing something `agent.py` was always going to
+    # reject as unparseable anyway. 4096 tokens is generous for the
+    # expected shape of the response (a JSON list of short path/reason
+    # pairs) and turns that failure mode into a fast, clean one instead.
+    ModelTier.FAST_LOCAL: ModelSpec(
+        provider=ModelProvider.OLLAMA,
+        model="qwen2.5-coder:1.5b",
+        kwargs={"num_ctx": 32768, "num_predict": 4096},
+    ),
     ModelTier.BALANCED: ModelSpec(provider=ModelProvider.OLLAMA, model="kimi-k3"),
     ModelTier.HIGH_REASONING: ModelSpec(
         provider=ModelProvider.ANTHROPIC, model="claude-sonnet-4-5"

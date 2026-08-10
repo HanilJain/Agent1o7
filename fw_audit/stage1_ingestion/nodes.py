@@ -244,6 +244,7 @@ async def generate_tree(state: FirmwareIngestionState) -> dict:
     return {
         "status": IngestionStatus.GENERATING_TREE,
         "tree_txt_path": str(tree_path),
+        "rootfs_dir": str(rootfs_dir),
         "artifacts": artifacts,
     }
 

@@ -1,0 +1,364 @@
+C:\Users\Asus\NULLVOID\SUTD\Agent1o7\data\db\GT-AXE16000_9.0.0.6_102_37487-gccf2eb6_491-gc7ec3_nand_squashfs\binwalk_1\_input.pkgtb.extracted\squashfs-root
+├── bin/
+│   ├── ash
+│   ├── bash
+│   ├── bcm_boot_launcher  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── bcm_bootstate  9.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── bcm_flasher  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── bcmmcastctl  9.8K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── bcmtm
+│   ├── bcmtmctl  18.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── bdmf_shell  13.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── blog
+│   ├── blogctl  9.8K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── bmc -> bcmmcastctl
+│   ├── bpm
+│   ├── bpmctl  9.9K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── brctl  25.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── bs  58B
+│   ├── bsi  55B
+│   ├── busybox  455.0K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── cat -> busybox
+│   ├── ceventc  13.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ceventd  46.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── chmod -> busybox
+│   ├── chown -> busybox
+│   ├── comgt  53.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── cp -> busybox
+│   ├── date -> busybox
+│   ├── dd -> busybox
+│   ├── df -> busybox
+│   ├── dmesg -> busybox
+│   ├── dnsspoof  5.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── doc_loadbios  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── docfdisk  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── dry  17.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── eapd  53.8K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── echo -> busybox
+│   ├── egrep -> busybox
+│   ├── epi_ttcp  29.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ethctl  45.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ethswctl  54.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── false -> busybox
+│   ├── fatattr -> busybox
+│   ├── fc
+│   ├── fcctl  26.8K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── FcStats.sh  4.0K
+│   ├── fgrep -> busybox
+│   ├── flash_erase  33.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── flash_eraseall  150B
+│   ├── flash_lock  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── flash_otp_dump  5.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── flash_otp_info  5.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── flash_otp_lock  5.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── flash_otp_write  5.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── flash_unlock  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── flashcp  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── fsync -> busybox
+│   ├── ftl_check  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ftl_format  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── grep -> busybox
+│   ├── gunzip -> busybox
+│   ├── gzip -> busybox
+│   ├── hw_accel_dump.sh  91B
+│   ├── ifenslave  17.9K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ionice -> busybox
+│   ├── iq
+│   ├── iqctl  24.3K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ivictl  13.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── kill -> busybox
+│   ├── ln -> busybox
+│   ├── login -> busybox
+│   ├── ls -> busybox
+│   ├── lsmtd  50.0K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── mcp
+│   ├── mcpctl  9.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── mcpd  122.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── memaccess  5.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── mkdir -> busybox
+│   ├── mknod -> busybox
+│   ├── mmc  91.8K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── more -> busybox
+│   ├── mount -> busybox
+│   ├── mtd_debug  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── mtdinfo  37.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── mtdpart  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── mv -> busybox
+│   ├── nanddump  33.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── nandtest  9.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── nandwrite  37.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── netstat -> busybox
+│   ├── nftl_format  9.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── nftldump  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── nice -> busybox
+│   ├── nvram  22.8K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── nvramUpdate  17.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── pidof -> busybox
+│   ├── ping -> busybox
+│   ├── ping6 -> busybox
+│   ├── ps -> busybox
+│   ├── pspctl
+│   ├── pwd -> busybox
+│   ├── pwr
+│   ├── pwrctl  11.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── qdf_cv_lvl.sh  738B
+│   ├── rawSocketTest  6.9K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── recv_image  17.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── rfddump  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── rfdformat  5.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── rm -> busybox
+│   ├── rmdir -> busybox
+│   ├── rstats  21.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── rtpolicy  7.1K
+│   ├── runner  587B
+│   ├── runner_dump.sh  6.4K
+│   ├── scratchpadctl  9.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── sed -> busybox
+│   ├── serve_image  17.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── sh -> busybox
+│   ├── sleep -> busybox
+│   ├── stress  17.9K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── stty -> busybox
+│   ├── sync -> busybox
+│   ├── tar -> busybox
+│   ├── tmctl  44.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── touch -> busybox
+│   ├── true -> busybox
+│   ├── ubiattach  25.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubiblock  21.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubicrc32  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubidetach  21.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubiformat  61.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubimkvol  25.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubinfo  29.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubinize  29.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubirename  21.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubirmvol  21.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubirsvol  25.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── ubiupdatevol  25.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── umount -> busybox
+│   ├── uname -> busybox
+│   ├── urlfilterd  21.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── usleep -> busybox
+│   ├── vi -> busybox
+│   ├── vlanctl  29.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── vpmstats  9.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── watch -> busybox
+│   ├── wdtctl  13.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── wlaffinity  25.7K
+│   └── zcat -> busybox
+├── sbin/
+│   ├── add_account
+│   ├── add_folder
+│   ├── add_multi_routes
+│   ├── amas_bhctrl
+│   ├── amas_ipc
+│   ├── amas_lanctrl
+│   ├── amas_lib
+│   ├── amas_misc
+│   ├── amas_portstatus
+│   ├── amas_ssd
+│   ├── amas_ssd_cd
+│   ├── amas_status
+│   ├── amas_wlcconnect
+│   ├── apg_get_status
+│   ├── arp -> ..\bin\busybox
+│   ├── asus_lp
+│   ├── asus_sd
+│   ├── asus_sg
+│   ├── asus_sr
+│   ├── asus_tty
+│   ├── asus_usb_interface
+│   ├── asus_usbbcm
+│   ├── ATE
+│   ├── auto46det
+│   ├── auto_macclone
+│   ├── autodet
+│   ├── blkid -> ..\bin\busybox
+│   ├── blockdev -> ..\bin\busybox
+│   ├── bwdpi
+│   ├── bwdpi_check
+│   ├── bwdpi_db_10
+│   ├── bwdpi_wred_alive
+│   ├── check_lan_port_cap
+│   ├── check_watchdog
+│   ├── check_wgc_ep
+│   ├── check_wifi_band_cap
+│   ├── chk_app_state
+│   ├── collect_debuglog
+│   ├── conn_diag
+│   ├── console
+│   ├── create_if_no_var_files
+│   ├── ddns_updated
+│   ├── del_account
+│   ├── del_folder
+│   ├── delay_exec
+│   ├── depmod -> ..\bin\busybox
+│   ├── detect_usb_devices
+│   ├── dhcpc_lease
+│   ├── diag_data
+│   ├── disk_monitor
+│   ├── disk_remove
+│   ├── dslited
+│   ├── dualwan
+│   ├── ejusb
+│   ├── erp_monitor
+│   ├── extphy_bit_op
+│   ├── fdisk -> ..\bin\busybox
+│   ├── firmware_check
+│   ├── firmware_check_update
+│   ├── firmware_webs_update
+│   ├── free_caches
+│   ├── fsck -> ..\bin\busybox
+│   ├── fsck.minix -> ..\bin\busybox
+│   ├── fstrim -> ..\bin\busybox
+│   ├── get_account_list
+│   ├── get_all_folder
+│   ├── get_apps_name
+│   ├── get_ext_phy_id
+│   ├── get_folder_list
+│   ├── get_mtlan
+│   ├── get_mtlan_by_idx
+│   ├── get_mtlan_by_vid
+│   ├── get_mtsubnet
+│   ├── get_permission
+│   ├── get_phy_speed
+│   ├── get_phy_status
+│   ├── get_rm_mtlan
+│   ├── get_rm_mtlan_by_idx
+│   ├── get_rm_mtlan_by_vid
+│   ├── get_rm_mtsubnet
+│   ├── get_usb_node_by_string
+│   ├── get_var_file_name
+│   ├── GetExtPhyStatus
+│   ├── GetPhyStatus
+│   ├── gpy211_monitor
+│   ├── halt
+│   ├── hnd-erase
+│   ├── hnd-write
+│   ├── hotplug
+│   ├── hotplug2  21.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── hour_monitor
+│   ├── how_many_layer
+│   ├── ic
+│   ├── ifconfig -> ..\bin\busybox
+│   ├── ig_s2s_client
+│   ├── init
+│   ├── init_wan46
+│   ├── initial_all_var_file
+│   ├── initial_folder_list
+│   ├── initial_var_file
+│   ├── insmod -> ..\bin\busybox
+│   ├── klogd -> ..\bin\busybox
+│   ├── lanports_ctrl
+│   ├── le_acme
+│   ├── led_ctrl
+│   ├── led_str_ctrl
+│   ├── ledbtn
+│   ├── ledg
+│   ├── lminus
+│   ├── logread -> ..\bin\busybox
+│   ├── lplus
+│   ├── lsmod -> ..\bin\busybox
+│   ├── mapcalc
+│   ├── mdev -> ..\bin\busybox
+│   ├── memdw
+│   ├── mkswap -> ..\bin\busybox
+│   ├── mlo_api
+│   ├── mod_account
+│   ├── mod_folder
+│   ├── modem_data
+│   ├── modify_if_exist_new_folder
+│   ├── modprobe -> ..\bin\busybox
+│   ├── mtd_erase_image_update
+│   ├── mtd_erase_misc2
+│   ├── nbr_monitor
+│   ├── netool
+│   ├── nordvpn
+│   ├── ntp
+│   ├── obd
+│   ├── obd_eth
+│   ├── obd_monitor
+│   ├── ocnvcd
+│   ├── order
+│   ├── pc
+│   ├── pc_block
+│   ├── pc_reward
+│   ├── pc_tmp
+│   ├── pctime
+│   ├── poweroff -> ..\bin\busybox
+│   ├── pregr
+│   ├── pregw
+│   ├── pressure
+│   ├── psta_monitor
+│   ├── radio
+│   ├── rc  2.5M  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── rcheck -> rc
+│   ├── re_wpsc -> rc
+│   ├── read_sms  1.6K
+│   ├── realip -> rc
+│   ├── reboot -> rc
+│   ├── regr -> rc
+│   ├── regw -> rc
+│   ├── reset_mtlan -> rc
+│   ├── reset_rm_mtlan -> rc
+│   ├── restart_wireless -> rc
+│   ├── rmd -> rc
+│   ├── rmmod -> ..\bin\busybox
+│   ├── roamast -> rc
+│   ├── route -> ..\bin\busybox
+│   ├── rsarootca_check -> rc
+│   ├── rsasign_check -> rc
+│   ├── rsasign_sig_check -> rc
+│   ├── run_app_script -> rc
+│   ├── run_pptpd -> rc
+│   ├── run_sshd -> rc
+│   ├── run_telnetd -> rc
+│   ├── s46reset -> rc
+│   ├── sched_daemon -> rc
+│   ├── send_sms  600B
+│   ├── sendarp -> rc
+│   ├── sendfeedback -> rc
+│   ├── service -> rc
+│   ├── set_ex53134_ctrl -> rc
+│   ├── set_factory_mode -> rc
+│   ├── set_permission
+│   ├── set_phy_ctrl -> rc
+│   ├── setconsole -> ..\bin\busybox
+│   ├── setup_dnsmq -> rc
+│   ├── sigmon  1.3K
+│   ├── surfshark -> rc
+│   ├── sw_devled -> rc
+│   ├── swapoff -> ..\bin\busybox
+│   ├── swapon -> ..\bin\busybox
+│   ├── syslogd -> ..\bin\busybox
+│   ├── tcpcheck -> rc
+│   ├── test_disk1  5.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── test_disk2  25.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── test_endian -> rc
+│   ├── test_if_exist_account
+│   ├── test_if_exist_share
+│   ├── test_of_var_files
+│   ├── test_share  17.5K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── udevtrigger  25.7K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── udhcpc -> ..\bin\busybox
+│   ├── unset_usb_nvram -> rc
+│   ├── update_asus_ddns_token -> rc
+│   ├── usb_notify -> rc
+│   ├── usbled -> rc
+│   ├── v6plusd -> rc
+│   ├── vconfig -> ..\bin\busybox
+│   ├── wanduck -> rc
+│   ├── watchdog -> rc
+│   ├── watchdog02 -> rc
+│   ├── wave_monitor -> rc
+│   ├── wlcconnect -> rc
+│   ├── wlconf_pre -> rc
+│   ├── wlcscan -> rc
+│   ├── wpasupp -> rc
+│   ├── wps_pbcd  77.8K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── wpsaide -> rc
+│   ├── write_3g_ppp_conf -> rc
+│   ├── write_smb_conf  21.6K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   ├── write_webdav_conf  13.4K  (ELF 32-bit LSB ARM, dynamically linked, not stripped)
+│   └── zcip -> ..\bin\busybox
