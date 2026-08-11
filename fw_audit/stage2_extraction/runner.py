@@ -61,7 +61,17 @@ def _print_summary(summary) -> None:
     if summary.binaries:
         print(f"\nDecompiled binaries ({len(summary.binaries)}):")
         for b in summary.binaries:
-            print(f"  {b.rootfs_path}  [{b.status.value}]  {b.function_count} functions")
+            # rootfs_path is the RESOLVED target; requested_path is what
+            # identified_binaries actually asked for -- these differ for a
+            # symlink (e.g. sbin/wpasupp -> rc resolves to sbin/rc) or a
+            # basename-rescan recovery, and hiding that makes a correct
+            # resolution look like an unrelated binary appeared.
+            via = (
+                f"  (requested: {b.requested_path})" if b.requested_path != b.rootfs_path else ""
+            )
+            print(f"  {b.rootfs_path}  [{b.status.value}]  {b.function_count} functions{via}")
+            if b.aliases:
+                print(f"      aliases: {', '.join(b.aliases)}")
 
     if summary.unresolved:
         print(f"\nUnresolved ({len(summary.unresolved)}):")

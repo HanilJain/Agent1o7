@@ -13,17 +13,11 @@
       "path": "sbin/wpasupp"
     },
     {
-      "path": "bin/bcm_ota"
-    },
-    {
       "path": "lib\\libnvram.so"
     },
     {
       "path": "/usr/sbin/app_base_library.sh"
-    },
-    {
-      "path": "bin/bcm_ota_updater3"
-    } 
+    }
   ],
   "warnings": [],
   "errors": []
