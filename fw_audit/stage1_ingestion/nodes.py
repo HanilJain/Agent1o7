@@ -37,6 +37,7 @@ from fw_audit.stage1_ingestion.extraction.script import (
     DECRYPTED_DIR,
     binwalk_attempt,
     binwalk_target,
+    normalize_permissions,
     stage_firmware,
     tplink_decrypt,
     unsquashfs_fallback,
@@ -44,7 +45,10 @@ from fw_audit.stage1_ingestion.extraction.script import (
 )
 from fw_audit.stage1_ingestion.identifier.agent import IdentifierUnavailableError, identify_binaries as _identify
 from fw_audit.stage1_ingestion.state import FirmwareIngestionState, IngestionStatus
-from fw_audit.stage1_ingestion.tools.filesystem_tools import write_tree_txt
+from fw_audit.stage1_ingestion.tools.filesystem_tools import (
+    normalize_rootfs_permissions,
+    write_tree_txt,
+)
 
 UNSUPPORTED_MESSAGE = "squashfs filesystem not found or not supported"
 
@@ -229,6 +233,31 @@ async def generate_tree(state: FirmwareIngestionState) -> dict:
             rootfs_dir = find_extracted_rootfs(workspace / fallback_dir_name) or (workspace / fallback_dir_name)
         else:
             rootfs_dir = out_dir  # last resort: scan whatever binwalk produced directly
+
+    # Before anything reads rootfs_dir (write_tree_txt right below, and
+    # Stage 2's later Docker bind-mount of this same directory into the
+    # Ghidra container): a vendor firmware routinely ships some files
+    # owner-only (confirmed: sbin/rc as root-only), which unsquashfs
+    # faithfully preserves. The AUTHORITATIVE fix has to run inside this
+    # same sandbox container (still root) via the executor — see
+    # normalize_permissions's docstring for why a host-side Python chmod
+    # alone (below) is confirmed insufficient on Windows + Docker Desktop.
+    rootfs_rel = rootfs_dir.relative_to(workspace).as_posix()
+    chmod_result = await normalize_permissions(get_executor(), workspace, rootfs_rel)
+    artifacts.append(
+        ExtractionArtifact(
+            kind=ExtractionArtifactKind.NORMALIZE_PERMISSIONS,
+            path=str(rootfs_dir),
+            source_tool="chmod",
+            success=chmod_result.ok,
+            notes=chmod_result.stderr or None,
+        )
+    )
+    # Defensive secondary layer: a no-op on Windows + Docker Desktop (see
+    # above) but does matter for a host that runs `fw-ingest` and later
+    # reads/serves this same rootfs directly (no container translation
+    # layer in between) rather than only ever handing it to Stage 2.
+    normalize_rootfs_permissions(rootfs_dir)
 
     tree_path = workspace / "tree.txt"
     write_tree_txt(rootfs_dir, tree_path)

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "program": {"name": "sample_mips_httpd"},
+  "analysis": {
+    "ghidra_version": "12.1.2",
+    "elapsed_seconds": 1.0,
+    "status": "succeeded",
+    "skipped_functions": [],
+    "decompile_failures": []
+  },
+  "functions": [
+    {
+      "name": "FUN_00401234",
+      "entry_point": "00401234",
+      "size": 64,
+      "signature": "undefined4 FUN_00401234(int param_1, undefined4 param_2)",
+      "calling_convention": "__fastcall",
+      "is_thunk": false,
+      "is_external": false,
+      "calls": [],
+      "called_by": [],
+      "decompiled": true
+    },
+    {
+      "name": "wlcsm_mngr_resume_restart",
+      "entry_point": "00401300",
+      "size": 8,
+      "signature": "bool wlcsm_mngr_resume_restart(undefined4 param_1, undefined4 param_2)",
+      "is_thunk": false,
+      "is_external": false,
+      "calls": [],
+      "called_by": [],
+      "decompiled": true
+    }
+  ],
+  "imports": [
+    {"name": "strcmp", "library": "<EXTERNAL>", "address": "EXTERNAL:00000001"}
+  ],
+  "exports": [],
+  "strings": []
+}

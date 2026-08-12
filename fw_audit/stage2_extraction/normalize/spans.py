@@ -77,3 +77,25 @@ def apply_to_code(text: str, fn: Callable[[str], str]) -> str:
     untouched. This is what a pass calls instead of matching `text` directly."""
     spans = tokenize(text)
     return "".join(fn(s.text) if s.kind == SpanKind.CODE else s.text for s in spans)
+
+
+def mask_non_code(text: str, fill: str = " ") -> str:
+    """Same-length copy of `text` with every STRING/CHAR/COMMENT span
+    blanked out (each character replaced by `fill`, except newlines, which
+    are preserved) — CODE spans are returned verbatim.
+
+    Structural passes (e.g. `structure.find_function_bodies`) need to match
+    against text shape — a function header, a brace, a declaration — without
+    a stray `{`/`;`/identifier inside a `/* ... */` comment or a string
+    literal producing a spurious match. Matching against the mask instead of
+    `text` gets that for free, and because the mask is the same length with
+    every newline kept in place, every offset and line number found in the
+    mask is valid as-is against the original `text` — no re-mapping needed.
+    """
+
+    def _blank(s: str) -> str:
+        return "".join(ch if ch == "\n" else fill for ch in s)
+
+    return "".join(
+        span.text if span.kind == SpanKind.CODE else _blank(span.text) for span in tokenize(text)
+    )

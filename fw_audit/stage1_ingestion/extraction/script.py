@@ -105,3 +105,34 @@ async def unsquashfs_fallback(
     if result.ok:
         return result
     return await executor.run(f"sasquatch -f -d {out_dir} {squashfs_path}", files=workspace)
+
+
+async def normalize_permissions(
+    executor: Executor, workspace: Path, target_dir: str
+) -> ExecutionResult:
+    """`chmod -R a+rwX target_dir`, run INSIDE the sandbox (as this image's
+    default/root user — see `docker/Dockerfile`'s runtime stage, no `USER`
+    directive).
+
+    `unsquashfs` faithfully preserves the ORIGINAL firmware's file mode —
+    router vendors routinely ship some files owner-only-root (confirmed
+    against a real firmware image: `sbin/rc` extracted as `-r-x------
+    root root`). That matters because Stage 2's Ghidra container later
+    bind-mounts this same rootfs as a DIFFERENT, non-root user (`ghidra`,
+    uid 1000 — see `docker/Dockerfile.ghidra`), which cannot open a file
+    it has zero access bits on — surfacing as an opaque
+    "java.io.FileNotFoundException: ... (Permission denied)" with nothing
+    connecting it back to the original firmware's ownership.
+
+    MUST run as an actual in-container command, not a host-side Python
+    `os.chmod()` call: confirmed empirically on Windows + Docker Desktop
+    (WSL2 backend) that a host-side chmod has ZERO effect on what a bind-
+    mounted container sees — the container's Linux permission bits are
+    tracked independently of anything visible from the Windows side
+    (NTFS attributes, ACLs — checked both, identical to a file that
+    decompiled fine). Only a `chmod` run by a process that's actually
+    inside a Linux mount namespace — this sandbox, while it still has
+    root, right after extraction — reliably changes what Stage 2's
+    container will later see.
+    """
+    return await executor.run(f"chmod -R a+rwX {target_dir}", files=workspace)

@@ -10,6 +10,8 @@ this module only describes what's there.
 
 from __future__ import annotations
 
+import os
+import stat
 import struct
 from pathlib import Path
 
@@ -227,3 +229,51 @@ def write_tree_txt(root: Path, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
+
+
+def _ensure_owner_writable(entry: Path, *, is_dir: bool) -> None:
+    """OR in the owner-write bit (and owner-execute for a directory, so it
+    stays traversable), never removing any bit already set. Never raises —
+    one entry's mode failing to change must not abort extraction over a
+    cosmetic permission issue."""
+    try:
+        mode = entry.stat().st_mode
+        new_mode = mode | stat.S_IWUSR | (stat.S_IXUSR if is_dir else 0)
+        if new_mode != mode:
+            entry.chmod(new_mode)
+    except OSError:
+        pass
+
+
+def normalize_rootfs_permissions(rootfs_dir: Path) -> None:
+    """Ensure every file/dir under `rootfs_dir` is owner-writable.
+
+    `unsquashfs` faithfully preserves the ORIGINAL firmware's file mode —
+    router vendors routinely ship files read-only (confirmed against a
+    real firmware: `sbin/rc` extracted as `-r--r--r--`). Left as-is, Stage
+    2's later Docker bind-mount of this same rootfs into the Ghidra
+    container fails to even READ that file — Ghidra's
+    `java.io.RandomAccessFile` opens in a mode that still needs the host
+    write bit set, surfacing as an opaque
+    "java.io.FileNotFoundException: ... (Permission denied)" deep inside a
+    container log a user would have no reason to associate with a file
+    permission from the original router's firmware. Called once, right
+    after `rootfs_dir` is settled and before anything reads from it (see
+    `nodes.generate_tree`), so every later consumer — Stage 1's own
+    `write_tree_txt` below, and Stage 2's Ghidra invocation — sees a
+    filesystem it can always open.
+
+    Symlinks are never touched (`os.walk(followlinks=False)` doesn't
+    recurse into one, and this function only chmods regular files/dirs it
+    is handed) — matching this module's established policy of treating a
+    symlink as a leaf, never dereferencing it (see `write_tree_txt`).
+    """
+    for dirpath, dirnames, filenames in os.walk(str(rootfs_dir), followlinks=False):
+        for name in dirnames:
+            entry = Path(dirpath) / name
+            if not entry.is_symlink():
+                _ensure_owner_writable(entry, is_dir=True)
+        for name in filenames:
+            entry = Path(dirpath) / name
+            if not entry.is_symlink():
+                _ensure_owner_writable(entry, is_dir=False)

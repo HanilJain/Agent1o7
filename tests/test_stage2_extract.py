@@ -15,6 +15,7 @@ import pytest
 from fw_audit.common.schemas import DecompilationStatus, ExtractionStatus
 from fw_audit.config.settings import Settings
 from fw_audit.executors.base import ExecutionResult
+from fw_audit.stage2_extraction import layout
 from fw_audit.stage2_extraction.extract import Stage2InputError, _write_mirror, run_extraction
 
 _OUT_DIR_RE = re.compile(r'-postScript fw_audit_export\.py "(/work/[^"]+)"')
@@ -91,6 +92,69 @@ def _write_metadata(out_dir: Path) -> None:
     (out_dir / "decompiled" / "whole.c").write_text(
         "undefined4 main(void)\n{\n  return 0;\n}\n", encoding="utf-8"
     )
+    (out_dir / "decompiled" / "functions").mkdir(exist_ok=True)
+    (out_dir / "decompiled" / "functions" / "00401000_main.c").write_text(
+        "undefined4 main(void)\n{\n  return 0;\n}\n", encoding="utf-8"
+    )
+
+
+def _write_metadata_with_thunk(out_dir: Path) -> None:
+    """Like `_write_metadata`, but `whole.c` contains a self-forwarding
+    Ghidra thunk stub for `calloc`, and `metadata.json` marks it
+    `is_thunk: true` — exercises the end-to-end thunk-replacement path
+    through `run_extraction` (not just `passes.replace_thunk_bodies` in
+    isolation)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "program": {"name": "x"},
+        "analysis": {
+            "status": "succeeded",
+            "elapsed_seconds": 1.0,
+            "skipped_functions": [],
+            "decompile_failures": [],
+        },
+        "functions": [
+            {
+                "name": "main",
+                "entry_point": "00401000",
+                "size": 10,
+                "signature": "void main(void)",
+                "is_thunk": False,
+                "is_external": False,
+                "calls": [],
+                "called_by": [],
+                "decompiled": True,
+            },
+            {
+                "name": "calloc",
+                "entry_point": "00401100",
+                "size": 8,
+                "signature": "void * calloc(size_t n, size_t s)",
+                "is_thunk": True,
+                "is_external": False,
+                "calls": [],
+                "called_by": [],
+                "decompiled": True,
+            },
+        ],
+        "imports": [],
+        "exports": [],
+        "strings": [],
+    }
+    whole_c = (
+        "undefined4 main(void)\n{\n  return 0;\n}\n"
+        "\n"
+        "void * calloc(size_t n,size_t s)\n"
+        "{\n"
+        "  void *p;\n"
+        "  p = calloc(n,s);\n"
+        "  return p;\n"
+        "}\n"
+    )
+    (out_dir / "metadata.json").write_text(json.dumps(payload), encoding="utf-8")
+    (out_dir / "decompiled").mkdir(exist_ok=True)
+    (out_dir / "decompiled" / "whole.c").write_text(whole_c, encoding="utf-8")
     (out_dir / "decompiled" / "functions").mkdir(exist_ok=True)
     (out_dir / "decompiled" / "functions" / "00401000_main.c").write_text(
         "undefined4 main(void)\n{\n  return 0;\n}\n", encoding="utf-8"
@@ -342,6 +406,98 @@ async def test_normalized_output_written_and_free_of_bare_undefined_types(
     assert "undefined4 main" in joern_text  # still present textually...
     # ...but now a real type, not a bare undeclared one:
     assert "typedef uint32_t undefined4;" in joern_text
+
+
+async def test_thunk_stub_becomes_extern_declaration_in_delivered_output(
+    tmp_path, synthetic_elf_bytes, fake_executor, monkeypatch
+):
+    """End-to-end: a self-forwarding Ghidra thunk stub for `calloc`,
+    flagged `is_thunk: true` in metadata.json, must come out of
+    `run_extraction` as an `extern` declaration in the normalized Joern
+    output — not as a self-recursive body."""
+    summary_path = _setup_stage1(
+        tmp_path, binaries=[{"path": "bin/a"}], elf_bytes=synthetic_elf_bytes
+    )
+
+    def on_run(command, files):
+        _write_metadata_with_thunk(_host_out_dir(command, files))
+        return None
+
+    _patch_ghidra_executor(monkeypatch, fake_executor(on_run))
+
+    summary = await run_extraction(
+        stage1_summary_path=summary_path, settings=Settings(_env_file=None)
+    )
+
+    joern_path = Path(summary.db_subfolder) / summary.binaries[0].artifacts.normalized_joern_c
+    joern_text = joern_path.read_text(encoding="utf-8")
+    assert "extern void * calloc(size_t n,size_t s);" in joern_text
+    assert "p = calloc(n,s);" not in joern_text
+
+
+# --------------------------------------------------------------------- #
+# normalized/normalization_report.json — the per-pass audit trail.
+# --------------------------------------------------------------------- #
+
+
+async def test_normalization_report_written(
+    tmp_path, synthetic_elf_bytes, fake_executor, monkeypatch
+):
+    summary_path = _setup_stage1(
+        tmp_path, binaries=[{"path": "bin/a"}], elf_bytes=synthetic_elf_bytes
+    )
+
+    def on_run(command, files):
+        _write_metadata(_host_out_dir(command, files))
+        return None
+
+    _patch_ghidra_executor(monkeypatch, fake_executor(on_run))
+
+    summary = await run_extraction(
+        stage1_summary_path=summary_path, settings=Settings(_env_file=None)
+    )
+
+    stage2_dir = Path(summary.stage2_dir)
+    bin_dir = layout.binary_dir(stage2_dir, summary.binaries[0].bin_id)
+    report_path = layout.normalization_report_path(bin_dir)
+    assert report_path.is_file()
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["bin_id"] == summary.binaries[0].bin_id
+    assert report["context_summary"]["functions"] == 1
+    assert report["context_summary"]["thunks"] == 0
+    assert report["joern_whole_c"] is not None
+    joern_pass_names = [s["name"] for s in report["joern_whole_c"]["stats"]]
+    from fw_audit.stage2_extraction.normalize.pipeline import JOERN_PIPELINE
+
+    assert joern_pass_names == [p.name for p in JOERN_PIPELINE]
+    assert report["llm_function_count"] == 1
+
+
+async def test_normalization_report_reflects_thunk_context(
+    tmp_path, synthetic_elf_bytes, fake_executor, monkeypatch
+):
+    summary_path = _setup_stage1(
+        tmp_path, binaries=[{"path": "bin/a"}], elf_bytes=synthetic_elf_bytes
+    )
+
+    def on_run(command, files):
+        _write_metadata_with_thunk(_host_out_dir(command, files))
+        return None
+
+    _patch_ghidra_executor(monkeypatch, fake_executor(on_run))
+
+    summary = await run_extraction(
+        stage1_summary_path=summary_path, settings=Settings(_env_file=None)
+    )
+
+    stage2_dir = Path(summary.stage2_dir)
+    bin_dir = layout.binary_dir(stage2_dir, summary.binaries[0].bin_id)
+    report = json.loads(
+        layout.normalization_report_path(bin_dir).read_text(encoding="utf-8")
+    )
+    assert report["context_summary"]["functions"] == 2
+    assert report["context_summary"]["thunks"] == 1
 
 
 # --------------------------------------------------------------------- #

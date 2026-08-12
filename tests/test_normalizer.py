@@ -7,14 +7,20 @@ exercising pass *interaction* that inline tests can't catch on their own.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from fw_audit.stage2_extraction.normalize import passes
+from fw_audit.stage2_extraction.normalize.context import EMPTY_CONTEXT, BinaryContext, build_context
 from fw_audit.stage2_extraction.normalize.pipeline import (
     JOERN_PIPELINE,
     LLM_PIPELINE,
+    build_joern_pipeline,
+    build_llm_pipeline,
     normalize,
 )
 from fw_audit.stage2_extraction.normalize.prelude import PRELUDE_HEADER
@@ -46,6 +52,21 @@ def test_normalize_import_purity_no_executor_no_os_no_subprocess():
     assert proc.returncode == 0, proc.stderr
 
 
+def test_never_writes_into_raw():
+    """`normalize/` must never perform filesystem writes at all — grep its
+    own source for the write-capable Path methods rather than trying to
+    exhaustively simulate every call path. If this ever needs a real
+    `Path.write_text`/`write_bytes` call, it belongs in `extract.py`
+    (which writes `normalized/`, never `raw/`), not in this package."""
+    package_dir = Path(__file__).parent.parent / "fw_audit" / "stage2_extraction" / "normalize"
+    offending: list[str] = []
+    for py_file in package_dir.glob("*.py"):
+        text = py_file.read_text(encoding="utf-8")
+        if ".write_text(" in text or ".write_bytes(" in text or "open(" in text:
+            offending.append(py_file.name)
+    assert not offending, f"normalize/ files perform filesystem writes: {offending}"
+
+
 # --------------------------------------------------------------------- #
 # spans.py
 # --------------------------------------------------------------------- #
@@ -69,6 +90,17 @@ def test_spans_classify_block_comment():
     assert spans[0].kind == SpanKind.COMMENT
 
 
+def test_mask_non_code_preserves_length_and_newlines():
+    from fw_audit.stage2_extraction.normalize.spans import mask_non_code
+
+    text = 'int x; /* c\no */\nchar *s = "a\nb";\nint y;\n'
+    masked = mask_non_code(text)
+    assert len(masked) == len(text)
+    assert masked.count("\n") == text.count("\n")
+    assert "int x;" in masked and "int y;" in masked
+    assert "c" not in masked.split("\n")[1]  # comment body blanked
+
+
 # --------------------------------------------------------------------- #
 # Individual passes (inline before/after)
 # --------------------------------------------------------------------- #
@@ -79,6 +111,31 @@ def test_p04_strips_calling_conventions():
     after = passes.strip_calling_conventions(before)
     assert "__fastcall" not in after
     assert "int FUN_00401234(int p1)" in after
+
+
+def test_p05_fixes_illegal_array_declaration():
+    before = "undefined1[1372] mapInfo;\n"
+    after = passes.fix_illegal_array_declarations(before)
+    assert after.strip() == "undefined1 mapInfo[1372];"
+
+
+def test_p05_fixes_illegal_array_declaration_with_named_type():
+    before = "Elf32_Sym[1106] __DT_SYMTAB;\n"
+    after = passes.fix_illegal_array_declarations(before)
+    assert after.strip() == "Elf32_Sym __DT_SYMTAB[1106];"
+
+
+def test_p05_does_not_touch_valid_local_array_declaration():
+    before = "undefined1 auStack_10 [16];\n"
+    after = passes.fix_illegal_array_declarations(before)
+    assert after == before
+
+
+def test_p05_is_idempotent():
+    before = "undefined1[1372] mapInfo;\n"
+    once = passes.fix_illegal_array_declarations(before)
+    twice = passes.fix_illegal_array_declarations(once)
+    assert once == twice
 
 
 def test_p08_rewrites_double_colon_switch_labels():
@@ -141,6 +198,38 @@ def test_p09_declares_each_name_once_even_if_used_twice():
     assert after.count("uintptr_t unaff_EBX;") == 1
 
 
+def test_p09_does_not_double_declare_a_name_ghidra_already_declared():
+    """The headline regression: Ghidra itself declares roughly a third of
+    these references in practice (`int extraout_r2;`), just never all of
+    them in one body — injecting a second, differently-typed declaration
+    next to Ghidra's own is a hard C error the OLD guard (which only
+    recognized its own `uintptr_t NAME;` format) would create."""
+    before = (
+        "void FUN_1(void)\n"
+        "{\n"
+        "  int iVar1;\n"
+        "  int extraout_r2;\n"
+        "  iVar1 = extraout_r2;\n"
+        "}\n"
+    )
+    after = passes.declare_register_vars(before)
+    assert "uintptr_t extraout_r2;" not in after
+    assert after.count("extraout_r2;") == 2  # the one Ghidra decl + the one use
+
+
+def test_p09_uses_structure_module_and_handles_multiline_signature():
+    before = (
+        "bool wlcsm_mngr_resume_restart\n"
+        "               (undefined4 param_1,undefined4 param_2)\n"
+        "\n"
+        "{\n"
+        "  return unaff_r4 != 0;\n"
+        "}\n"
+    )
+    after = passes.declare_register_vars(before)
+    assert "uintptr_t unaff_r4;" in after
+
+
 def test_p10_collapses_exact_duplicate_casts():
     before = "uVar1 = (uint)(uint)x;\n"
     after = passes.collapse_redundant_casts(before)
@@ -167,16 +256,65 @@ def test_p10_drops_void_zero_statement():
 def test_p12_dedupes_duplicate_typedef():
     before = "typedef unsigned int foo;\ntypedef unsigned int foo;\n"
     after = passes.dedupe_type_definitions(before)
-    # The second occurrence is commented out (its original text still
-    # appears, inside the explanatory comment) — assert on ACTIVE lines.
+    # The second occurrence is deleted outright, no explanatory comment
+    # left behind (that audit trail lives in normalization_report.json).
     active = [line for line in after.splitlines() if line.strip() == "typedef unsigned int foo;"]
     assert len(active) == 1
-    assert "duplicate definition removed" in after
+    assert "duplicate definition removed" not in after
 
 
 def test_p12_keeps_distinct_typedefs():
     before = "typedef unsigned int foo;\ntypedef unsigned int bar;\n"
     after = passes.dedupe_type_definitions(before)
+    assert after == before
+
+
+# --------------------------------------------------------------------- #
+# p12b — dedupe_global_declarations (context-bound)
+# --------------------------------------------------------------------- #
+
+
+def test_dedupe_global_declarations_removes_duplicate():
+    before = "undefined4 DAT_1;\nint DAT_1;\n"
+    after = passes.dedupe_global_declarations(EMPTY_CONTEXT, before)
+    assert "undefined4 DAT_1;" in after
+    # Deleted outright, no explanatory comment left behind.
+    assert "duplicate global declaration removed" not in after
+    active = [line for line in after.splitlines() if line.strip() == "int DAT_1;"]
+    assert active == []
+
+
+def test_dedupe_global_declarations_keeps_distinct_names():
+    before = "undefined4 DAT_1;\nundefined4 DAT_2;\n"
+    after = passes.dedupe_global_declarations(EMPTY_CONTEXT, before)
+    assert after == before
+
+
+def test_dedupe_global_declarations_does_not_touch_typedef_struct_or_fndecl():
+    before = "typedef unsigned int foo;\nstruct bar { int x; };\nvoid FUN_1(int a);\n"
+    after = passes.dedupe_global_declarations(EMPTY_CONTEXT, before)
+    assert after == before
+
+
+def test_dedupe_global_declarations_does_not_touch_indented_body_statement():
+    before = "void FUN_1(void)\n{\n  int local;\n  local = 1;\n}\n"
+    after = passes.dedupe_global_declarations(EMPTY_CONTEXT, before)
+    assert after == before
+
+
+def test_dedupe_global_declarations_removes_function_shadowing_decl_with_context():
+    ctx = BinaryContext(known_function_names=frozenset({"FUN_x"}))
+    before = "undefined FUN_x;\n"
+    after = passes.dedupe_global_declarations(ctx, before)
+    active = [line for line in after.splitlines() if line.strip() == "undefined FUN_x;"]
+    assert active == []
+
+
+def test_dedupe_global_declarations_keeps_shadowing_decl_under_empty_context():
+    """Without metadata confirming `FUN_x` is a function, this pass has no
+    way to know the declaration is wrong — it should not guess."""
+    before = "undefined FUN_x;\n"
+    after = passes.dedupe_global_declarations(EMPTY_CONTEXT, before)
     assert after == before
 
 
@@ -187,7 +325,8 @@ def test_p13_removes_conflicting_sigaction_declaration():
         line for line in after.splitlines() if line.strip() == "typedef unsigned int sigaction;"
     ]
     assert active == []
-    assert "conflicting builtin declaration" in after
+    # Deleted outright, no explanatory comment left behind.
+    assert "conflicting builtin declaration" not in after
 
 
 def test_p13_does_not_touch_indented_call_site():
@@ -221,6 +360,36 @@ def test_non_semantic_warning_comment_stripped_for_llm():
     before = "/* WARNING: some unrelated note */\nint x;\n"
     after = passes.strip_non_semantic_ghidra_warnings(before)
     assert "WARNING" not in after
+
+
+def test_line_comment_warning_stripped_for_joern():
+    """The regression this whole pass exists to fix: Ghidra's CppExporter
+    emits `// WARNING: ...` LINE comments in practice, not only the
+    `/* WARNING: */` block form the old pattern matched exclusively."""
+    before = "// WARNING: Unknown calling convention -- yet parameter storage is locked\nint x;\n"
+    after = passes.strip_all_ghidra_warnings(before)
+    assert "WARNING" not in after
+    assert "int x;" in after
+
+
+def test_whole_line_warning_comment_leaves_no_orphan_blank_line():
+    before = "int a;\n\n// WARNING: something\n\nint b;\n"
+    after = passes.strip_all_ghidra_warnings(before)
+    assert after == "int a;\n\n\nint b;\n"
+
+
+def test_trailing_warning_comment_on_code_line_keeps_the_code():
+    before = "x = 1; // WARNING: something\ny = 2;\n"
+    after = passes.strip_all_ghidra_warnings(before)
+    assert "WARNING" not in after
+    assert "x = 1;" in after
+    assert "y = 2;" in after
+
+
+def test_warning_text_inside_string_literal_is_untouched():
+    before = 'char *s = "// WARNING: not a real comment";\n'
+    after = passes.strip_all_ghidra_warnings(before)
+    assert after == before
 
 
 # --------------------------------------------------------------------- #
@@ -262,8 +431,18 @@ def test_joern_pipeline_strips_calling_convention():
 
 def test_joern_pipeline_dedupes_duplicate_sigaction_typedef_and_flags_conflict():
     result = normalize(_load_fixture(), JOERN_PIPELINE)
-    assert "duplicate definition removed" in result.text
-    assert "conflicting builtin declaration" in result.text
+    # The fixture's SECOND `typedef unsigned int sigaction;` (duplicate) and
+    # its top-level `sigaction` declarations (conflicting builtin) must both
+    # be gone — deleted outright now, not commented out, so assert on
+    # ACTIVE occurrence counts rather than an explanatory-comment string.
+    active_sigaction_typedefs = [
+        line
+        for line in result.text.splitlines()
+        if line.strip() == "typedef unsigned int sigaction;"
+    ]
+    assert len(active_sigaction_typedefs) <= 1
+    assert "conflicting builtin declaration" not in result.text
+    assert "duplicate definition removed" not in result.text
 
 
 def test_pipeline_result_records_source_hash_and_stats():
@@ -300,6 +479,49 @@ def test_pipelines_are_idempotent_on_plain_c_with_no_distortions():
         assert once == twice
 
 
+def _fixture_context() -> BinaryContext:
+    """The `BinaryContext` a real Stage 2 run would build for the golden
+    fixture, from its companion metadata fixture (deliberately missing one
+    thunk, exercising the truncation/veto path)."""
+
+    class _FuncFacts:
+        def __init__(self, d: dict) -> None:
+            self.name = d["name"]
+            self.is_thunk = d.get("is_thunk", False)
+            self.is_external = d.get("is_external", False)
+
+    metadata = json.loads(
+        (FIXTURES_DIR / "sample_mips_httpd_metadata.json").read_text(encoding="utf-8")
+    )
+    return build_context(_FuncFacts(d) for d in metadata["functions"])
+
+
+@pytest.mark.parametrize("build_pipeline", [build_joern_pipeline, build_llm_pipeline])
+@pytest.mark.parametrize("context", [EMPTY_CONTEXT, None], ids=["empty_context", "real_context"])
+def test_pipeline_is_idempotent_with_and_without_context(build_pipeline, context):
+    """Generalizes the two pipeline-idempotence tests above to also cover
+    the context-bound passes (`replace_thunk_bodies`,
+    `dedupe_global_declarations`) under both a real `BinaryContext` and
+    `EMPTY_CONTEXT` — four combinations total with the two `build_pipeline`
+    values. Every new pass is designed so its own output falls outside its
+    own input language (a spliced-out thunk body can't be re-found, a
+    fixed array declarator no longer matches, edits become protected
+    comments), so this should hold by construction."""
+    ctx = context if context is not None else _fixture_context()
+    pipeline = build_pipeline(ctx)
+    once = normalize(_load_fixture(), pipeline).text
+    twice = normalize(once, pipeline).text
+    assert once == twice
+
+
+def test_pipeline_constants_match_factory_defaults():
+    """`JOERN_PIPELINE`/`LLM_PIPELINE` are documented as `build_*_pipeline()`
+    (i.e. the `EMPTY_CONTEXT` case) — this pins that relationship so the
+    two can never silently drift apart."""
+    assert [p.name for p in JOERN_PIPELINE] == [p.name for p in build_joern_pipeline()]
+    assert [p.name for p in LLM_PIPELINE] == [p.name for p in build_llm_pipeline()]
+
+
 # --------------------------------------------------------------------- #
 # Prelude coverage — self-maintaining: fails if a new Ghidra type shows up
 # in a fixture without a corresponding typedef in the generated header.
@@ -310,7 +532,8 @@ def test_prelude_covers_every_type_family_referenced_in_fixtures():
     import re
 
     type_family_re = re.compile(
-        r"\b(undefined\d*|uint|ulong|ushort|byte|sbyte|word|dword|qword|code)\b"
+        r"\b(undefined\d*|uint|ulong|ushort|byte|sbyte|word|dword|qword|code"
+        r"|bool|pointer|ulonglong|longlong|string)\b"
     )
     fixture_text = _load_fixture()
     referenced = {m.group(1) for m in type_family_re.finditer(fixture_text)}

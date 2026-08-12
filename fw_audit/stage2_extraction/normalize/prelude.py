@@ -37,9 +37,70 @@ def _short_aliases() -> str:
             "typedef unsigned short word;",
             "typedef unsigned int dword;",
             "typedef unsigned long long qword;",
-            "typedef void code;",
-            "/* Ghidra's function-pointer idiom, e.g. `code *pcVar1`, only",
-            " * parses once `code` itself is a real (if empty) type. */",
+            "typedef long long longlong;",
+            "typedef unsigned long long ulonglong;",
+            "typedef void *pointer;",
+            "",
+            "/* `code` is Ghidra's \"executable bytes at an address\" type;",
+            " * `code *` is its generic function-pointer idiom, e.g.",
+            " * `code *pcVar1` or `(*(code *)ptr)(a, b)`. It must be a",
+            " * FUNCTION type, not `void` — that idiom needs something",
+            " * dereferenceable, callable with any arguments, and",
+            " * assignable-from all at once, which `typedef void code;`",
+            " * cannot satisfy (verified: every such call site becomes a",
+            " * hard 'invalid use of void expression' error under that",
+            " * definition). C23 makes an empty `()` parameter list mean",
+            " * `(void)` — `(...)` is required there instead — while a",
+            " * pre-C23 compiler (and Eclipse CDT, Joern's C frontend) both",
+            " * accept the classic unprototyped `()` form; branch on",
+            " * __STDC_VERSION__ so both take the callable-with-anything",
+            " * shape they each support. */",
+            "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L",
+            "typedef int code(...);",
+            "#else",
+            "typedef int code();",
+            "#endif",
+        ]
+    )
+
+
+def _c99_bool() -> str:
+    """`bool`/`true`/`false` — Ghidra emits them freely but never declares
+    them. Guarded on `__STDC_VERSION__`: under C23 these are keywords, so
+    redeclaring `bool` as a typedef is a hard error there; pre-C23 (and
+    Eclipse CDT, which does not define `__STDC_VERSION__ >= 202311L`) treat
+    `bool` as a plain identifier needing exactly this declaration."""
+    return "\n".join(
+        [
+            "#ifndef __cplusplus",
+            "#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L",
+            "typedef unsigned char bool;",
+            "#define true 1",
+            "#define false 0",
+            "#endif",
+            "#endif",
+        ]
+    )
+
+
+def _ghidra_pseudo_types() -> str:
+    """Names Ghidra's CppExporter occasionally emits where a TYPE is
+    expected but a PARAMETER NAME appears instead (observed on glibc's
+    `pthread_create`-style prototypes: `__start_routine *__start_routine`).
+    `typedef void X;` makes `X *` equivalent to `void *`, which is correct
+    at every such site — this is a declaration-only fix, so it carries the
+    same zero-rewriting-risk property as every other prelude entry.
+
+    `string` is a second such pseudo-type, confirmed against real firmware:
+    Ghidra labels a recovered string-literal address symbol
+    (`s_<hash>_<addr>`) with the bare declaration `string s_...;` and every
+    site that references it treats it exactly like `char *` (assigned to
+    a `char *` local, passed where a `char *` argument is expected) — so
+    `typedef char *string;` is the correct, zero-rewriting declaration."""
+    return "\n".join(
+        [
+            "typedef void __start_routine;",
+            "typedef char *string;",
         ]
     )
 
@@ -159,6 +220,12 @@ def generate_prelude_header() -> str:
         "",
         "/* ---- Ghidra's other short type aliases ------------------------ */",
         _short_aliases(),
+        "",
+        "/* ---- C99 bool (Ghidra emits it, never declares it) ------------- */",
+        _c99_bool(),
+        "",
+        "/* ---- Ghidra pseudo-types (parameter name used as a type) ------- */",
+        _ghidra_pseudo_types(),
         "",
         "/* ---- Wide (9-16 byte) container types -------------------------- */",
         _unk_wide_types(),

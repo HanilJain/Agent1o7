@@ -116,6 +116,58 @@ def test_absolute_symlink_is_rerooted_inside_rootfs_not_followed_to_host(
     resolved = report.resolved[0]
     assert resolved.host_path == (rootfs / "bin" / "busybox").resolve()
     assert resolved.resolution == Resolution.SYMLINK
+    # The requested name ("wget") is what gets decompiled/reported under --
+    # bin_id, DecompiledBinary.rootfs_path, and the mirror tree all derive
+    # from this -- even though the actual bytes come from busybox.
+    assert resolved.rootfs_rel == "usr/bin/wget"
+
+
+def test_symlink_target_requested_separately_becomes_an_alias(tmp_path, synthetic_elf_bytes):
+    """When BOTH a symlink and its real target are separately requested
+    (e.g. Stage 1 flags "sbin/wpasupp" AND "sbin/rc"), only one physical
+    decompilation happens -- whichever was listed first keeps its own name
+    as the identity, the other folds into aliases. This mirrors the
+    existing content-hash dedup policy (first-in-order wins), just via the
+    host-path fold instead."""
+    rootfs = _make_rootfs(tmp_path)
+    _write_elf(rootfs / "sbin" / "rc", synthetic_elf_bytes)
+    _symlink_or_skip(rootfs / "sbin" / "wpasupp", "rc")
+
+    report = resolve_binaries(
+        [IdentifiedBinary(path="sbin/wpasupp"), IdentifiedBinary(path="sbin/rc")],
+        rootfs,
+        max_binaries=25,
+        max_rescan_files=10_000,
+    )
+
+    assert len(report.resolved) == 1
+    resolved = report.resolved[0]
+    assert resolved.rootfs_rel == "sbin/wpasupp"  # first-listed wins as identity
+    assert resolved.aliases == ("sbin/rc",)
+
+
+def test_basename_rescan_still_reports_actual_found_location_not_requested(
+    tmp_path, synthetic_elf_bytes
+):
+    """Unlike a symlink, a basename-rescan recovery means the REQUESTED
+    path was wrong (a hallucinated directory) -- the identity must stay
+    the actual found location, not the incorrect request, or the report
+    would claim a file lives somewhere it doesn't."""
+    rootfs = _make_rootfs(tmp_path)
+    _write_elf(rootfs / "bin" / "httpd", synthetic_elf_bytes)
+
+    report = resolve_binaries(
+        [IdentifiedBinary(path="usr/sbin/httpd")],  # wrong directory
+        rootfs,
+        max_binaries=25,
+        max_rescan_files=10_000,
+    )
+
+    assert len(report.resolved) == 1
+    resolved = report.resolved[0]
+    assert resolved.resolution == Resolution.BASENAME_RESCAN
+    assert resolved.requested == "usr/sbin/httpd"  # what was (wrongly) asked
+    assert resolved.rootfs_rel == "bin/httpd"  # where it actually is
 
 
 def test_symlink_escaping_rootfs_is_rejected(tmp_path, synthetic_elf_bytes):

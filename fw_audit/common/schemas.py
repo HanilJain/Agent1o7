@@ -55,6 +55,7 @@ class ExtractionArtifactKind(str, Enum):
     BINWALK = "binwalk"
     UNSQUASHFS = "unsquashfs"
     VENDOR_DECRYPT = "vendor_decrypt"
+    NORMALIZE_PERMISSIONS = "normalize_permissions"
     TREE_LISTING = "tree_listing"
     OTHER = "other"
 

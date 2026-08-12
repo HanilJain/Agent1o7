@@ -7,16 +7,7 @@
   "rootfs_dir": "C:\\Users\\Asus\\NULLVOID\\SUTD\\Agent1o7\\data\\db\\GT-AXE16000_9.0.0.6_102_37487-gccf2eb6_491-gc7ec3_nand_squashfs\\binwalk_1\\_input.pkgtb.extracted\\squashfs-root",
   "identified_binaries": [
     {
-      "path": "bin/bcm_boot_launcher"
-    },
-    {
       "path": "sbin/wpasupp"
-    },
-    {
-      "path": "lib\\libnvram.so"
-    },
-    {
-      "path": "/usr/sbin/app_base_library.sh"
     }
   ],
   "warnings": [],

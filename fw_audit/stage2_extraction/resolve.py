@@ -68,7 +68,24 @@ class ResolvedBinary:
 
     requested: str
     host_path: Path
+    """The TRUE physical location bytes are actually read from — always the
+    final target after following every symlink hop, never the identity
+    path. Ghidra always decompiles what's at `host_path`; `rootfs_rel`
+    below is naming/identity only and never affects which bytes get
+    decompiled."""
     rootfs_rel: str
+    """The IDENTITY path used for naming (`bin_id`, `DecompiledBinary.
+    rootfs_path`, the decompiled-C mirror tree) — deliberately NOT always
+    `host_path`'s location. For `Resolution.DIRECT`/`SYMLINK`, this is the
+    normalized REQUESTED path: `sbin/wpasupp` stays "wpasupp" even though
+    it's a symlink to `sbin/rc` and `host_path` points at `rc`'s bytes —
+    the symlink is a genuine, real entry in the firmware, so asking for it
+    by name and getting a report back under a different name it never
+    literally appears as is confusing, not more correct. For
+    `Resolution.BASENAME_RESCAN`, this is instead the ACTUAL location the
+    rescan found — `requested` was wrong (a hallucinated directory) there,
+    so showing where the file really lives is the useful information, not
+    the incorrect path that was asked for."""
     sha256: str
     size_bytes: int
     elf: ELFInfo | None
@@ -125,11 +142,13 @@ def resolve_binaries(
     `rootfs_dir`, never followed onto the host) -> on a miss, fall back to a
     lazily-built basename index -> reject non-ELF hits -> dedupe by host
     path and then by content hash. See the module docstring for the
-    never-raises contract.
+    never-raises contract, and `ResolvedBinary.rootfs_rel`'s docstring for
+    why a symlink's OWN name is kept as the identity even though the bytes
+    actually read/decompiled come from wherever it points.
     """
     warnings: list[str] = []
     unresolved: list[UnresolvedBinaryRecord] = []
-    hits: list[tuple[IdentifiedBinary, _Hit]] = []
+    hits: list[tuple[IdentifiedBinary, str, _Hit]] = []
     basename_index: dict[str, list[str]] | None = None
 
     for item in identified:
@@ -175,7 +194,7 @@ def resolve_binaries(
             )
             continue
 
-        hits.append((item, hit))
+        hits.append((item, rel_posix, hit))
 
     resolved = _dedupe_and_hash(hits, warnings)
 
@@ -445,19 +464,34 @@ def _add_alias(resolved: ResolvedBinary, alias_path: str) -> ResolvedBinary:
     return dataclasses.replace(resolved, aliases=(*resolved.aliases, alias_path))
 
 
+def _identity_rel(rel_posix: str, hit: _Hit) -> str:
+    """The path used for naming (`ResolvedBinary.rootfs_rel`) — see that
+    field's docstring for the full reasoning. Short version: a symlink is
+    a real entry with its own name, so DIRECT/SYMLINK keep the requested
+    name; BASENAME_RESCAN's requested name was wrong, so it uses where the
+    file was actually found instead."""
+    if hit.resolution == Resolution.BASENAME_RESCAN:
+        return hit.rootfs_rel
+    return rel_posix
+
+
 def _dedupe_and_hash(
-    hits: list[tuple[IdentifiedBinary, _Hit]], warnings: list[str]
+    hits: list[tuple[IdentifiedBinary, str, _Hit]], warnings: list[str]
 ) -> list[ResolvedBinary]:
     """Single pass, immutable: fold a hit into an existing `ResolvedBinary`
     (via `dataclasses.replace`, never in-place mutation) when its resolved
     host path, or its content hash, matches one already seen. The
     content-hash fold is the busybox case — N applets symlinked to one
-    binary must decompile once, not N times."""
+    binary must decompile once, not N times. Dedup itself is always keyed
+    on the physical `host_path`/content hash — never on `_identity_rel` —
+    so which entry ends up "primary" (and which fold into `aliases`) is
+    unaffected by this function; it's purely about what NAME the winning
+    entry is reported under."""
     results: list[ResolvedBinary] = []
     index_by_host_path: dict[str, int] = {}
     index_by_sha256: dict[str, int] = {}
 
-    for item, hit in hits:
+    for item, rel_posix, hit in hits:
         host_key = str(hit.host_path.resolve())
 
         existing = index_by_host_path.get(host_key)
@@ -492,7 +526,7 @@ def _dedupe_and_hash(
             ResolvedBinary(
                 requested=item.path,
                 host_path=hit.host_path,
-                rootfs_rel=hit.rootfs_rel,
+                rootfs_rel=_identity_rel(rel_posix, hit),
                 sha256=sha256,
                 size_bytes=size_bytes,
                 elf=_safe_parse_elf(hit.host_path),

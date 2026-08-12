@@ -32,8 +32,20 @@ from fw_audit.config.settings import Settings, get_settings
 from fw_audit.executors.base import Executor
 from fw_audit.stage2_extraction import layout
 from fw_audit.stage2_extraction.ghidra.client import decompile_binary, ghidra_executor
-from fw_audit.stage2_extraction.normalize.pipeline import JOERN_PIPELINE, LLM_PIPELINE, normalize
+from fw_audit.stage2_extraction.normalize.context import build_context
+from fw_audit.stage2_extraction.normalize.pipeline import (
+    NamedPass,
+    build_joern_pipeline,
+    build_llm_pipeline,
+    normalize,
+)
 from fw_audit.stage2_extraction.normalize.prelude import PRELUDE_HEADER
+from fw_audit.stage2_extraction.normalize.report import (
+    NormalizationReport,
+    NormalizationResult,
+    PassStat,
+    aggregate_stats,
+)
 from fw_audit.stage2_extraction.resolve import ResolvedBinary, resolve_binaries
 from fw_audit.stage2_extraction.stage1_io import (
     Stage2InputError,
@@ -281,47 +293,131 @@ def _normalize_all(
     artifact under `stage2/` is unaffected either way.
     """
     updated: list[DecompiledBinary] = []
-    mirror_warnings: list[str] = []
+    all_warnings: list[str] = []
     for binary in decompiled:
         if binary.status not in _SUCCEEDED_STATUSES:
             updated.append(binary)
             continue
-
         bin_dir = layout.binary_dir(stage2_dir, binary.bin_id)
-        artifacts_update: dict[str, str] = {}
-
-        whole_c = layout.raw_decompiled_whole_c(bin_dir)
-        if whole_c.is_file():
-            joern_out = layout.normalized_joern_whole_c(bin_dir)
-            joern_out.parent.mkdir(parents=True, exist_ok=True)
-            raw_text = whole_c.read_text(encoding="utf-8", errors="replace")
-            result = normalize(raw_text, JOERN_PIPELINE)
-            joern_out.write_text(result.text, encoding="utf-8")
-            artifacts_update["normalized_joern_c"] = layout.relative_to_db_subfolder(
-                joern_out, workspace
-            )
-            if decompiled_tree is not None:
-                mirrored = _write_mirror(
-                    decompiled_tree, binary.rootfs_path, result.text, mirror_warnings
-                )
-                if mirrored is not None:
-                    artifacts_update["decompiled_tree_c"] = mirrored
-
-        functions_dir = layout.raw_decompiled_functions_dir(bin_dir)
-        if functions_dir.is_dir() and any(functions_dir.glob("*.c")):
-            llm_functions_dir = layout.normalized_llm_functions_dir(bin_dir)
-            llm_functions_dir.mkdir(parents=True, exist_ok=True)
-            for func_file in sorted(functions_dir.glob("*.c")):
-                result = normalize(
-                    func_file.read_text(encoding="utf-8", errors="replace"), LLM_PIPELINE
-                )
-                (llm_functions_dir / func_file.name).write_text(result.text, encoding="utf-8")
-            artifacts_update["normalized_llm_functions_dir"] = layout.relative_to_db_subfolder(
-                llm_functions_dir, workspace
-            )
-
-        if artifacts_update:
-            new_artifacts = binary.artifacts.model_copy(update=artifacts_update)
-            binary = binary.model_copy(update={"artifacts": new_artifacts})
+        binary = _normalize_one(
+            binary, bin_dir, workspace, decompiled_tree=decompiled_tree, warnings=all_warnings
+        )
         updated.append(binary)
-    return updated, mirror_warnings
+    return updated, all_warnings
+
+
+def _normalize_one(
+    binary: DecompiledBinary,
+    bin_dir: Path,
+    workspace: Path,
+    *,
+    decompiled_tree: Path | None,
+    warnings: list[str],
+) -> DecompiledBinary:
+    """Normalize one binary's raw Ghidra output into both targets, write
+    every artifact, and return the binary with `artifacts` updated.
+
+    Builds a `BinaryContext` from `binary.functions` (already parsed from
+    `metadata.json` by `ghidra/client.py` — no extra file read here) so the
+    two context-bound passes (thunk-stub replacement, global-declaration
+    dedup) see this binary's real thunk/external/function-name sets rather
+    than degrading to `EMPTY_CONTEXT`."""
+    context = build_context(binary.functions)
+    joern_pipeline = build_joern_pipeline(context)
+    llm_pipeline = build_llm_pipeline(context)
+    artifacts_update: dict[str, str] = {}
+
+    joern_result = _normalize_whole_c(
+        binary, bin_dir, workspace, joern_pipeline, decompiled_tree, artifacts_update, warnings
+    )
+    llm_count, llm_totals = _normalize_functions(
+        bin_dir, workspace, llm_pipeline, artifacts_update
+    )
+
+    report = NormalizationReport(
+        bin_id=binary.bin_id,
+        context_summary={
+            "functions": len(context.known_function_names),
+            "thunks": len(context.thunk_names),
+            "externals": len(context.external_names),
+        },
+        joern_whole_c=joern_result,
+        llm_function_count=llm_count,
+        llm_function_totals=llm_totals,
+    )
+    _write_normalization_report(bin_dir, report, warnings)
+
+    if not artifacts_update:
+        return binary
+    new_artifacts = binary.artifacts.model_copy(update=artifacts_update)
+    return binary.model_copy(update={"artifacts": new_artifacts})
+
+
+def _normalize_whole_c(
+    binary: DecompiledBinary,
+    bin_dir: Path,
+    workspace: Path,
+    joern_pipeline: tuple[NamedPass, ...],
+    decompiled_tree: Path | None,
+    artifacts_update: dict[str, str],
+    warnings: list[str],
+) -> NormalizationResult | None:
+    """Normalize `raw/decompiled/whole.c` for the Joern target, write it,
+    mirror it, and return the `NormalizationResult` (or `None` if there was
+    no raw whole-program C to normalize)."""
+    whole_c = layout.raw_decompiled_whole_c(bin_dir)
+    if not whole_c.is_file():
+        return None
+    joern_out = layout.normalized_joern_whole_c(bin_dir)
+    joern_out.parent.mkdir(parents=True, exist_ok=True)
+    raw_text = whole_c.read_text(encoding="utf-8", errors="replace")
+    result = normalize(raw_text, joern_pipeline)
+    joern_out.write_text(result.text, encoding="utf-8")
+    artifacts_update["normalized_joern_c"] = layout.relative_to_db_subfolder(joern_out, workspace)
+    if decompiled_tree is not None:
+        mirrored = _write_mirror(decompiled_tree, binary.rootfs_path, result.text, warnings)
+        if mirrored is not None:
+            artifacts_update["decompiled_tree_c"] = mirrored
+    return result
+
+
+def _normalize_functions(
+    bin_dir: Path,
+    workspace: Path,
+    llm_pipeline: tuple[NamedPass, ...],
+    artifacts_update: dict[str, str],
+) -> tuple[int, tuple[PassStat, ...]]:
+    """Normalize every `raw/decompiled/functions/*.c` for the LLM target;
+    return `(function_count, aggregated_pass_stats)`."""
+    functions_dir = layout.raw_decompiled_functions_dir(bin_dir)
+    func_files = sorted(functions_dir.glob("*.c")) if functions_dir.is_dir() else []
+    if not func_files:
+        return 0, ()
+    llm_functions_dir = layout.normalized_llm_functions_dir(bin_dir)
+    llm_functions_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    for func_file in func_files:
+        result = normalize(func_file.read_text(encoding="utf-8", errors="replace"), llm_pipeline)
+        (llm_functions_dir / func_file.name).write_text(result.text, encoding="utf-8")
+        results.append(result)
+    artifacts_update["normalized_llm_functions_dir"] = layout.relative_to_db_subfolder(
+        llm_functions_dir, workspace
+    )
+    return len(results), aggregate_stats(results)
+
+
+def _write_normalization_report(
+    bin_dir: Path, report: NormalizationReport, warnings: list[str]
+) -> None:
+    """Best-effort write of `normalized/normalization_report.json` — the
+    per-pass audit trail proving what the cleaning pipeline actually did.
+    Never fails the run: same non-fatal discipline as `_write_mirror`,
+    since the report is an audit convenience, not the authoritative
+    artifact (the normalized C files themselves have already been written
+    by the time this is called)."""
+    try:
+        path = layout.normalization_report_path(bin_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report.to_json_dict(), indent=2), encoding="utf-8")
+    except OSError as exc:
+        warnings.append(f"normalization report write failed for {report.bin_id!r}: {exc}")
