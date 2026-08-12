@@ -1,5 +1,5 @@
-"""Compose `passes.py`'s individual transforms into the Joern- and
-LLM-targeted pipelines, and fold one over one file's text.
+"""Compose `passes.py`'s individual transforms into the Joern-targeted
+pipeline, and fold it over one file's text.
 
 Ordering is deliberate:
 
@@ -25,14 +25,17 @@ Ordering is deliberate:
    removal pass left behind. Also the idempotence anchor: everything before
    it should already be a fixed point (see `tests/test_normalizer.py`).
 
-The two pipelines share every pass except the three that must differ by
-target (see each pass's own docstring for why): warning-comment handling,
-prelude insertion, and the `halt_baddata()` rewrite.
+`build_joern_pipeline` takes the three passes that are inherently
+target-specific (warning-comment handling, prelude insertion, and the
+`halt_baddata()` rewrite) as parameters rather than hardcoding them,
+so a future target-specific pipeline (e.g. LLM-facing preparation, planned
+for a later stage) can reuse `_head_passes`/`_body_passes`/`_tail_passes`
+without duplicating the shared pass list.
 
 `replace_thunk_bodies` and `dedupe_global_declarations` additionally need a
-per-binary `normalize.context.BinaryContext` — see `build_joern_pipeline`/
-`build_llm_pipeline` below for how that's threaded in without breaking the
-"every pass is `Callable[[str], str]`" contract every other pass relies on.
+per-binary `normalize.context.BinaryContext` — see `build_joern_pipeline`
+below for how that's threaded in without breaking the "every pass is
+`Callable[[str], str]`" contract every other pass relies on.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from typing import NamedTuple
 
 from fw_audit.stage2_extraction.normalize import passes
 from fw_audit.stage2_extraction.normalize.context import EMPTY_CONTEXT, BinaryContext
-from fw_audit.stage2_extraction.normalize.prelude import include_prelude, inline_prelude
+from fw_audit.stage2_extraction.normalize.prelude import inline_prelude
 from fw_audit.stage2_extraction.normalize.report import (
     NormalizationResult,
     PassStat,
@@ -178,31 +181,13 @@ def build_joern_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedP
     )
 
 
-def build_llm_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedPass, ...]:
-    """The LLM-targeted pipeline — see `build_joern_pipeline` for the
-    `context` default's rationale."""
-    return _build_pipeline(
-        warnings_pass=NamedPass(
-            "strip_non_semantic_ghidra_warnings",
-            passes.strip_non_semantic_ghidra_warnings,
-            "remove WARNING comments except semantically-loaded ones",
-        ),
-        prelude_pass=NamedPass("include_prelude", include_prelude, "#include ghidra_types.h"),
-        halt_pass=NamedPass(
-            "rewrite_halt_baddata", passes.rewrite_halt_baddata_for_llm, "halt_baddata() -> comment"
-        ),
-        context=context,
-    )
-
-
-#: The no-metadata pipelines — kept as module-level constants (rather than
-#: requiring every caller to invoke the factory) because they have a real
-#: meaning of their own: "the pipeline to run when there is no
+#: The no-metadata pipeline — kept as a module-level constant (rather than
+#: requiring every caller to invoke the factory) because it has a real
+#: meaning of its own: "the pipeline to run when there is no
 #: `BinaryContext` to give it". Every existing caller/test that references
-#: these by name keeps working unchanged; `test_pipeline.py` asserts they
-#: can never silently drift from `build_*_pipeline()`'s own default.
+#: it by name keeps working unchanged; `test_pipeline.py` asserts it can
+#: never silently drift from `build_joern_pipeline()`'s own default.
 JOERN_PIPELINE: tuple[NamedPass, ...] = build_joern_pipeline()
-LLM_PIPELINE: tuple[NamedPass, ...] = build_llm_pipeline()
 
 
 def _count_changed_lines(before: str, after: str) -> int:

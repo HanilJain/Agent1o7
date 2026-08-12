@@ -374,7 +374,6 @@ async def test_stage2_summary_written_with_relative_artifact_paths(
     binary = summary.binaries[0]
     assert not Path(binary.artifacts.raw_c).is_absolute()
     assert not Path(binary.artifacts.normalized_joern_c).is_absolute()
-    assert not Path(binary.artifacts.normalized_llm_functions_dir).is_absolute()
 
     # And the written file on disk matches what run_extraction returned.
     on_disk_path = Path(summary.stage2_dir) / "stage2_summary.json"
@@ -471,7 +470,6 @@ async def test_normalization_report_written(
     from fw_audit.stage2_extraction.normalize.pipeline import JOERN_PIPELINE
 
     assert joern_pass_names == [p.name for p in JOERN_PIPELINE]
-    assert report["llm_function_count"] == 1
 
 
 async def test_normalization_report_reflects_thunk_context(

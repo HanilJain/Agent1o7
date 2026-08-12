@@ -111,9 +111,8 @@ fw-extract data/db/<firmware-stem>/stage1_summary.json --only bin/httpd  # repea
 Output lands under `data/db/<firmware-stem>/stage2/`:
 
 - `resolution_report.json` — what every `IdentifiedBinary.path` resolved to (or why it didn't).
-- `ghidra_types.h` — the generated prelude header (shared by every binary's normalized LLM output).
 - `binaries/<bin_id>/raw/` — Ghidra's untouched output (decompiled C, disassembly, `metadata.json`).
-- `binaries/<bin_id>/normalized/joern/whole.c` and `normalized/llm/functions/*.c` — sanitized output.
+- `binaries/<bin_id>/normalized/joern/whole.c` — sanitized, Joern-targeted output (the generated prelude header, `ghidra_types.h`, is inlined directly into this file rather than written separately).
 - `stage2_summary.json` — the machine-readable hand-off to Stage 3/4, with every path relative to `db_subfolder`.
 
 Additionally, a flat **decompiled-C mirror tree** is written as a *sibling*
@@ -185,7 +184,7 @@ fw_audit/
       prelude.py                   # generates ghidra_types.h
       spans.py                      # CODE|STRING|CHAR|COMMENT tokenizer
       passes.py                      # individual (str) -> str normalization passes
-      pipeline.py                     # JOERN_PIPELINE / LLM_PIPELINE / normalize()
+      pipeline.py                     # JOERN_PIPELINE / normalize()
       report.py                        # PassStat / NormalizationResult
   stage3_rag/ … stage6_reporting/   # Scaffolded, not yet implemented
 docker/

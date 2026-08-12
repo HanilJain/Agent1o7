@@ -18,9 +18,7 @@ from fw_audit.stage2_extraction.normalize import passes
 from fw_audit.stage2_extraction.normalize.context import EMPTY_CONTEXT, BinaryContext, build_context
 from fw_audit.stage2_extraction.normalize.pipeline import (
     JOERN_PIPELINE,
-    LLM_PIPELINE,
     build_joern_pipeline,
-    build_llm_pipeline,
     normalize,
 )
 from fw_audit.stage2_extraction.normalize.prelude import PRELUDE_HEADER
@@ -158,12 +156,6 @@ def test_p08_rewrites_double_colon_default_switch_label():
 def test_p08b_halt_baddata_joern_becomes_declared_noop_call():
     after = passes.rewrite_halt_baddata_for_joern("  halt_baddata();\n")
     assert after.strip() == "__fw_audit_unreachable();"
-
-
-def test_p08b_halt_baddata_llm_becomes_comment():
-    after = passes.rewrite_halt_baddata_for_llm("  halt_baddata();\n")
-    assert "halt_baddata" not in after
-    assert "/* ghidra:" in after
 
 
 def test_p09_declares_in_fs_offset_inside_the_function():
@@ -350,18 +342,6 @@ def test_warning_comment_stripped_for_joern():
     assert "int x;" in after
 
 
-def test_semantic_warning_comment_kept_for_llm():
-    before = "/* WARNING: Subroutine does not return */\nint x;\n"
-    after = passes.strip_non_semantic_ghidra_warnings(before)
-    assert "Subroutine does not return" in after
-
-
-def test_non_semantic_warning_comment_stripped_for_llm():
-    before = "/* WARNING: some unrelated note */\nint x;\n"
-    after = passes.strip_non_semantic_ghidra_warnings(before)
-    assert "WARNING" not in after
-
-
 def test_line_comment_warning_stripped_for_joern():
     """The regression this whole pass exists to fix: Ghidra's CppExporter
     emits `// WARNING: ...` LINE comments in practice, not only the
@@ -412,12 +392,6 @@ def test_joern_pipeline_inlines_prelude():
     assert result.text.index("typedef uint32_t undefined4;") < result.text.index("FUN_00401234")
 
 
-def test_llm_pipeline_includes_prelude_header():
-    result = normalize(_load_fixture(), LLM_PIPELINE)
-    assert '#include "ghidra_types.h"' in result.text
-    assert "typedef uint32_t undefined4;" not in result.text  # not inlined for LLM
-
-
 def test_joern_pipeline_removes_bare_halt_baddata_call():
     result = normalize(_load_fixture(), JOERN_PIPELINE)
     assert "halt_baddata()" not in result.text
@@ -465,15 +439,9 @@ def test_joern_pipeline_is_idempotent():
     assert once == twice
 
 
-def test_llm_pipeline_is_idempotent():
-    once = normalize(_load_fixture(), LLM_PIPELINE).text
-    twice = normalize(once, LLM_PIPELINE).text
-    assert once == twice
-
-
 def test_pipelines_are_idempotent_on_plain_c_with_no_distortions():
     plain = "int add(int a, int b)\n{\n  return a + b;\n}\n"
-    for pipeline in (JOERN_PIPELINE, LLM_PIPELINE):
+    for pipeline in (JOERN_PIPELINE,):
         once = normalize(plain, pipeline).text
         twice = normalize(once, pipeline).text
         assert once == twice
@@ -496,17 +464,16 @@ def _fixture_context() -> BinaryContext:
     return build_context(_FuncFacts(d) for d in metadata["functions"])
 
 
-@pytest.mark.parametrize("build_pipeline", [build_joern_pipeline, build_llm_pipeline])
+@pytest.mark.parametrize("build_pipeline", [build_joern_pipeline])
 @pytest.mark.parametrize("context", [EMPTY_CONTEXT, None], ids=["empty_context", "real_context"])
 def test_pipeline_is_idempotent_with_and_without_context(build_pipeline, context):
-    """Generalizes the two pipeline-idempotence tests above to also cover
-    the context-bound passes (`replace_thunk_bodies`,
+    """Generalizes the pipeline-idempotence test above to also cover the
+    context-bound passes (`replace_thunk_bodies`,
     `dedupe_global_declarations`) under both a real `BinaryContext` and
-    `EMPTY_CONTEXT` — four combinations total with the two `build_pipeline`
-    values. Every new pass is designed so its own output falls outside its
-    own input language (a spliced-out thunk body can't be re-found, a
-    fixed array declarator no longer matches, edits become protected
-    comments), so this should hold by construction."""
+    `EMPTY_CONTEXT`. Every new pass is designed so its own output falls
+    outside its own input language (a spliced-out thunk body can't be
+    re-found, a fixed array declarator no longer matches, edits become
+    protected comments), so this should hold by construction."""
     ctx = context if context is not None else _fixture_context()
     pipeline = build_pipeline(ctx)
     once = normalize(_load_fixture(), pipeline).text
@@ -515,11 +482,10 @@ def test_pipeline_is_idempotent_with_and_without_context(build_pipeline, context
 
 
 def test_pipeline_constants_match_factory_defaults():
-    """`JOERN_PIPELINE`/`LLM_PIPELINE` are documented as `build_*_pipeline()`
-    (i.e. the `EMPTY_CONTEXT` case) — this pins that relationship so the
-    two can never silently drift apart."""
+    """`JOERN_PIPELINE` is documented as `build_joern_pipeline()` (i.e. the
+    `EMPTY_CONTEXT` case) — this pins that relationship so it can never
+    silently drift apart."""
     assert [p.name for p in JOERN_PIPELINE] == [p.name for p in build_joern_pipeline()]
-    assert [p.name for p in LLM_PIPELINE] == [p.name for p in build_llm_pipeline()]
 
 
 # --------------------------------------------------------------------- #

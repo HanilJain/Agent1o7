@@ -197,7 +197,6 @@ def _artifacts(bin_dir: Path, workspace: Path) -> DecompilationArtifacts:
         disasm_functions_dir=_rel_if_exists(layout.raw_disasm_functions_dir(bin_dir)),
         metadata_json=_rel_if_exists(layout.raw_metadata_path(bin_dir)),
         normalized_joern_c=None,  # populated by normalize_all, not this module
-        normalized_llm_functions_dir=None,
         ghidra_log=_rel_if_exists(layout.ghidra_log_path(bin_dir)),
     )
 

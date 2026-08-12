@@ -1,13 +1,13 @@
 """Individual normalization passes: each one is a pure `(str) -> str`
 function — no pass mutates, no pass does I/O, no pass raises on malformed
 input (a pass that finds nothing to rewrite just returns its input
-unchanged). `pipeline.py` composes these into the Joern- and LLM-targeted
-pipelines; see its module docstring for the ordering rationale.
+unchanged). `pipeline.py` composes these into the Joern-targeted pipeline;
+see its module docstring for the ordering rationale.
 
 Every pass that could plausibly match inside a string/char literal or a
 comment goes through `spans.apply_to_code`, which only ever hands it CODE
-spans. The few that don't (`normalize_line_endings`, the two warning-comment
-passes, `collapse_blank_lines`) either operate on line/comment structure
+spans. The few that don't (`normalize_line_endings`, the warning-comment
+pass, `collapse_blank_lines`) either operate on line/comment structure
 directly or are safe to run over the whole file by construction.
 
 Two passes (`replace_thunk_bodies`, `dedupe_global_declarations`) take a
@@ -56,7 +56,6 @@ def normalize_line_endings(text: str) -> str:
 # comments survive into delivered output on one real binary with the old
 # `/\*\s*WARNING:`-only pattern. Matching both comment openers fixes it.
 _WARNING_COMMENT_RE = re.compile(r"\A(?:/\*|//)\s*WARNING:", re.DOTALL)
-_SEMANTIC_WARNING_MARKERS = ("Subroutine does not return", "Removing unreachable block")
 
 
 def _is_ghidra_warning_comment(comment_text: str) -> bool:
@@ -109,19 +108,6 @@ def strip_all_ghidra_warnings(text: str) -> str:
     count. The un-normalized originals stay readable in
     `raw/decompiled/whole.c` for anyone who needs them."""
     return _drop_comment_spans(text, _is_ghidra_warning_comment)
-
-
-def strip_non_semantic_ghidra_warnings(text: str) -> str:
-    """LLM target: delete `WARNING: ...` comments except ones carrying real
-    signal (non-returning subroutines, unreachable blocks) — free context
-    for the model at negligible token cost."""
-
-    def _discard(comment_text: str) -> bool:
-        if not _is_ghidra_warning_comment(comment_text):
-            return False
-        return not any(marker in comment_text for marker in _SEMANTIC_WARNING_MARKERS)
-
-    return _drop_comment_spans(text, _discard)
 
 
 # --------------------------------------------------------------------- #
@@ -209,17 +195,6 @@ def rewrite_halt_baddata_for_joern(text: str) -> str:
     the original decompiled output."""
     return apply_to_code(
         text, lambda code: _HALT_BADDATA_CALL_RE.sub("__fw_audit_unreachable();", code)
-    )
-
-
-def rewrite_halt_baddata_for_llm(text: str) -> str:
-    """LLM target: replace with a comment — a fake call here would mislead
-    the model into thinking real code exists at this point."""
-    return apply_to_code(
-        text,
-        lambda code: _HALT_BADDATA_CALL_RE.sub(
-            "/* ghidra: undefined instruction / bad data */", code
-        ),
     )
 
 

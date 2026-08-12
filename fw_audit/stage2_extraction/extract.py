@@ -36,15 +36,11 @@ from fw_audit.stage2_extraction.normalize.context import build_context
 from fw_audit.stage2_extraction.normalize.pipeline import (
     NamedPass,
     build_joern_pipeline,
-    build_llm_pipeline,
     normalize,
 )
-from fw_audit.stage2_extraction.normalize.prelude import PRELUDE_HEADER
 from fw_audit.stage2_extraction.normalize.report import (
     NormalizationReport,
     NormalizationResult,
-    PassStat,
-    aggregate_stats,
 )
 from fw_audit.stage2_extraction.resolve import ResolvedBinary, resolve_binaries
 from fw_audit.stage2_extraction.stage1_io import (
@@ -164,8 +160,6 @@ async def run_extraction(
             "fw-audit-ghidra image is built "
             "(docker build -f docker/Dockerfile.ghidra -t fw-audit-ghidra:latest .)."
         )
-
-    layout.ghidra_types_header_path(stage2_dir).write_text(PRELUDE_HEADER, encoding="utf-8")
 
     decompiled = await _decompile_all(
         tuple(resolved_list),
@@ -314,7 +308,7 @@ def _normalize_one(
     decompiled_tree: Path | None,
     warnings: list[str],
 ) -> DecompiledBinary:
-    """Normalize one binary's raw Ghidra output into both targets, write
+    """Normalize one binary's raw Ghidra output for the Joern target, write
     every artifact, and return the binary with `artifacts` updated.
 
     Builds a `BinaryContext` from `binary.functions` (already parsed from
@@ -324,14 +318,10 @@ def _normalize_one(
     than degrading to `EMPTY_CONTEXT`."""
     context = build_context(binary.functions)
     joern_pipeline = build_joern_pipeline(context)
-    llm_pipeline = build_llm_pipeline(context)
     artifacts_update: dict[str, str] = {}
 
     joern_result = _normalize_whole_c(
         binary, bin_dir, workspace, joern_pipeline, decompiled_tree, artifacts_update, warnings
-    )
-    llm_count, llm_totals = _normalize_functions(
-        bin_dir, workspace, llm_pipeline, artifacts_update
     )
 
     report = NormalizationReport(
@@ -342,8 +332,6 @@ def _normalize_one(
             "externals": len(context.external_names),
         },
         joern_whole_c=joern_result,
-        llm_function_count=llm_count,
-        llm_function_totals=llm_totals,
     )
     _write_normalization_report(bin_dir, report, warnings)
 
@@ -379,31 +367,6 @@ def _normalize_whole_c(
         if mirrored is not None:
             artifacts_update["decompiled_tree_c"] = mirrored
     return result
-
-
-def _normalize_functions(
-    bin_dir: Path,
-    workspace: Path,
-    llm_pipeline: tuple[NamedPass, ...],
-    artifacts_update: dict[str, str],
-) -> tuple[int, tuple[PassStat, ...]]:
-    """Normalize every `raw/decompiled/functions/*.c` for the LLM target;
-    return `(function_count, aggregated_pass_stats)`."""
-    functions_dir = layout.raw_decompiled_functions_dir(bin_dir)
-    func_files = sorted(functions_dir.glob("*.c")) if functions_dir.is_dir() else []
-    if not func_files:
-        return 0, ()
-    llm_functions_dir = layout.normalized_llm_functions_dir(bin_dir)
-    llm_functions_dir.mkdir(parents=True, exist_ok=True)
-    results = []
-    for func_file in func_files:
-        result = normalize(func_file.read_text(encoding="utf-8", errors="replace"), llm_pipeline)
-        (llm_functions_dir / func_file.name).write_text(result.text, encoding="utf-8")
-        results.append(result)
-    artifacts_update["normalized_llm_functions_dir"] = layout.relative_to_db_subfolder(
-        llm_functions_dir, workspace
-    )
-    return len(results), aggregate_stats(results)
 
 
 def _write_normalization_report(

@@ -252,12 +252,10 @@ def generate_prelude_header() -> str:
 #: of nothing, so there is no reason to regenerate it per call.
 PRELUDE_HEADER = generate_prelude_header()
 
-PRELUDE_HEADER_FILENAME = "ghidra_types.h"
-
 
 def inline_prelude(text: str) -> str:
-    """Joern target: prepend the full header text verbatim — Joern runs no
-    preprocessor and will not resolve an `#include`.
+    """Prepend the full header text verbatim — Joern runs no preprocessor
+    and will not resolve an `#include`.
 
     Guarded by the include-guard macro name rather than being unconditional
     — `normalize()` must be idempotent (see `tests/test_normalizer.py`), and
@@ -265,17 +263,3 @@ def inline_prelude(text: str) -> str:
     if _INCLUDE_GUARD in text:
         return text
     return f"{PRELUDE_HEADER}\n{text}"
-
-
-_INCLUDE_DIRECTIVE = f'#include "{PRELUDE_HEADER_FILENAME}"'
-
-
-def include_prelude(text: str) -> str:
-    """LLM target: a one-line `#include`, saving ~100+ lines of typedefs
-    and macros from every function-granular chunk's context budget. The
-    header itself is written once to `stage2/ghidra_types.h` by the caller.
-
-    Guarded the same way as `inline_prelude`, for the same idempotence reason."""
-    if _INCLUDE_DIRECTIVE in text:
-        return text
-    return f"{_INCLUDE_DIRECTIVE}\n\n{text}"

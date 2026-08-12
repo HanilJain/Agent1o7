@@ -269,7 +269,6 @@ class DecompilationArtifacts(BaseModel):
     disasm_functions_dir: str | None = None
     metadata_json: str | None = None
     normalized_joern_c: str | None = None
-    normalized_llm_functions_dir: str | None = None
     ghidra_log: str | None = None
     decompiled_tree_c: str | None = None
     """Flat mirror copy of `normalized_joern_c` (same bytes), relative to

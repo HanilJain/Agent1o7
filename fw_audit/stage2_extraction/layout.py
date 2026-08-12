@@ -11,7 +11,6 @@ Layout, under `<db_subfolder>/stage2/`::
 
     stage2_summary.json
     resolution_report.json
-    ghidra_types.h
     binaries/<bin_id>/
       binary_info.json
       ghidra/{headless_stdout.txt, ghidra.log, ghidra_script.log}
@@ -19,7 +18,6 @@ Layout, under `<db_subfolder>/stage2/`::
       raw/decompiled/{whole.c, whole.h, functions/<addr>_<name>.c}
       raw/disasm/{listing.asm, functions/<addr>_<name>.asm}
       normalized/joern/whole.c
-      normalized/llm/functions/<addr>_<name>.c
       normalized/normalization_report.json
 
 Additionally, as a SIBLING of `<db_subfolder>` (an alternate flat view of
@@ -38,7 +36,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 #: Windows' 260-char MAX_PATH is easy to exceed with
-#: `stage2/binaries/<bin_id>/normalized/llm/functions/<addr>_<longname>.c`;
+#: `stage2/binaries/<bin_id>/raw/decompiled/functions/<addr>_<longname>.c`;
 #: the address prefix alone keeps filenames unique, so truncating the name
 #: is lossless for that purpose.
 MAX_FUNCTION_NAME_LEN = 64
@@ -59,7 +57,7 @@ def bin_id(rootfs_rel: str, sha256: str) -> str:
 
 def safe_function_filename(name: str, entry_point: str, suffix: str) -> str:
     """`<entry_point>_<name>.<suffix>`, name truncated to stay well under
-    Windows' MAX_PATH when nested under `normalized/llm/functions/`."""
+    Windows' MAX_PATH when nested under `raw/decompiled/functions/`."""
     safe_name = _SAFE_NAME_RE.sub("_", name)[:MAX_FUNCTION_NAME_LEN] or "anon"
     safe_entry = _SAFE_NAME_RE.sub("_", entry_point)
     return f"{safe_entry}_{safe_name}.{suffix}"
@@ -71,10 +69,6 @@ def stage2_summary_path(stage2_dir: Path) -> Path:
 
 def resolution_report_path(stage2_dir: Path) -> Path:
     return stage2_dir / "resolution_report.json"
-
-
-def ghidra_types_header_path(stage2_dir: Path) -> Path:
-    return stage2_dir / "ghidra_types.h"
 
 
 def binaries_dir(stage2_dir: Path) -> Path:
@@ -151,14 +145,6 @@ def normalized_joern_dir(bin_dir: Path) -> Path:
 
 def normalized_joern_whole_c(bin_dir: Path) -> Path:
     return normalized_joern_dir(bin_dir) / "whole.c"
-
-
-def normalized_llm_dir(bin_dir: Path) -> Path:
-    return normalized_dir(bin_dir) / "llm"
-
-
-def normalized_llm_functions_dir(bin_dir: Path) -> Path:
-    return normalized_llm_dir(bin_dir) / "functions"
 
 
 def normalization_report_path(bin_dir: Path) -> Path:
