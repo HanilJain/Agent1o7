@@ -30,6 +30,16 @@ all = [
     "langchain-anthropic>=0.2.0",
     "langchain-google-genai>=2.0.0",
 ]
+# Stage 3's tree-sitter-based function extraction (fw_audit.stage3_analysis.clean).
+# Optional: --debug degrades gracefully (raw dump only, with a warning) without this.
+# Pinned to a matched 0.23.x pair, not just "latest": tree-sitter 0.26.0 paired with
+# tree-sitter-c 0.24.2 (the latest of each independently) produces CORRUPTED Node
+# fields (observed: start_point.row returning ~4*10^11 for real nodes) that crash the
+# process outright on real ~6MB input — an ABI mismatch between the two independently
+# versioned packages, not a bug in this codebase. Confirmed tree-sitter==0.23.2 +
+# tree-sitter-c==0.23.2 together are correct (sane row numbers, no crash, full file
+# parses in ~10s). Re-verify with the same reproduction before ever bumping either.
+stage3 = ["tree-sitter==0.23.2", "tree-sitter-c==0.23.2"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -41,6 +51,7 @@ dev = [
 [project.scripts]
 fw-ingest = "fw_audit.stage1_ingestion.runner:main"
 fw-extract = "fw_audit.stage2_extraction.runner:main"
+fw-analyze = "fw_audit.stage3_analysis.runner:main"
 
 [tool.setuptools.packages.find]
 include = ["fw_audit*"]

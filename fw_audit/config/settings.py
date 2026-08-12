@@ -110,6 +110,27 @@ class Settings(BaseSettings):
     IdentifiedBinary.path that doesn't resolve directly (see
     stage2_extraction.resolve)."""
 
+    # ---- Stage 3: analysis core (ingest / clean / chunk / queue) --------
+    stage3_chunk_lines: int = Field(
+        default=1000, ge=50, validation_alias="FWA_STAGE3_CHUNK_LINES"
+    )
+    """Soft per-chunk line-count target for Step 3's AST-aware chunker.
+    Unused by this session's code (Step 1 only); reserved so `Settings` and
+    the `fw-analyze --chunk-lines` flag don't need a second change once
+    chunking lands."""
+    stage3_max_chunk_lines: int = Field(
+        default=4000, ge=1, validation_alias="FWA_STAGE3_MAX_CHUNK_LINES"
+    )
+    """Hard cap before a single oversized AST node (e.g. one huge function)
+    is emitted as its own oversized chunk rather than merged with others.
+    Unused by this session's code; reserved for Step 3."""
+    stage3_debug_dump: bool = Field(
+        default=False, validation_alias="FWA_STAGE3_DEBUG_DUMP"
+    )
+    """When true, Step 4's queue writes chunk payloads to
+    <db_subfolder>/stage3/chunks/ as they're produced. Unused by this
+    session's code; reserved for Step 4."""
+
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names
     # (binwalk/unsquashfs/etc.) are no longer configurable here — those run
@@ -168,6 +189,12 @@ class Settings(BaseSettings):
     def stage2_dir(self, firmware_stem: str) -> Path:
         """Return (and create) `<db_subfolder>/stage2/` for a firmware image."""
         path = self.db_subfolder(firmware_stem) / "stage2"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def stage3_dir(self, firmware_stem: str) -> Path:
+        """Return (and create) `<db_subfolder>/stage3/` for a firmware image."""
+        path = self.db_subfolder(firmware_stem) / "stage3"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

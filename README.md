@@ -1,14 +1,18 @@
 # fw-audit — Agentic Firmware Vulnerability Detection System
 
 A six-stage agentic pipeline for automated router-firmware vulnerability
-auditing: ingestion → feature extraction → RAG fusion → agentic analysis →
-sandboxed verification → reporting. Built on **LangGraph** (stateful agent
-orchestration), **LangChain** (unified LLM abstraction), **MCP** (tool
-integration for later stages), and **Docker** (sandboxed extraction).
+auditing: ingestion → feature extraction → analysis core (clean/chunk/queue)
+→ agentic analysis → sandboxed verification → reporting. Built on
+**LangGraph** (stateful agent orchestration), **LangChain** (unified LLM
+abstraction), **MCP** (tool integration for later stages), and **Docker**
+(sandboxed extraction).
 
 **Current status:** Stage 1 (Firmware Ingestion & Pre-processing) and
-Stage 2 (Feature Extraction) are implemented. Stages 3–6 are scaffolded as
-empty sub-packages (`fw_audit/stage3_rag/` … `fw_audit/stage6_reporting/`).
+Stage 2 (Feature Extraction) are implemented. Stage 3 (Analysis Core,
+`fw_audit/stage3_analysis/`) has its ingestion/whitelisting step
+implemented; cleaning, chunking, and queueing are designed but not yet
+built. Stages 4–6 are scaffolded as empty sub-packages
+(`fw_audit/stage4_analysis/` … `fw_audit/stage6_reporting/`).
 
 ## Stage 1 — Firmware Ingestion & Pre-processing
 
@@ -125,6 +129,24 @@ It lives outside `db_subfolder` (see `Stage2Summary.decompiled_tree_dir`'s
 docstring for the one path-relativity exception this causes), so it is *not*
 covered by the "everything relocates with `db_subfolder`" guarantee below.
 
+### Running Stage 3 (Analysis Core — ingestion only, for now)
+
+```bash
+fw-analyze data/db/<firmware-stem>/stage1_summary.json
+fw-analyze data/db/<firmware-stem>/stage1_summary.json --only bin/httpd  # repeatable
+```
+
+Joins Stage 1's whitelist against Stage 2's verified index, locates each
+matched binary's file in the decompiled-C mirror tree, and writes
+`data/db/<firmware-stem>/stage3/ingestion_report.json` — the list of
+`Target`s (analyzable) and `SkippedTarget`s (whitelisted but unresolved,
+failed, missing on disk, or empty, each with a reason code) that later
+steps will consume. Only ingestion is implemented; cleaning (converting the
+mirror tree's Joern-targeted C to LLM-targeted C, in memory, reusing Stage
+2's repair passes), AST-aware chunking (tree-sitter), and queueing for a
+future agent worker pool are designed but not yet built. Never writes into
+`stage2/` or the mirror tree — only into its own `stage3/` directory.
+
 ## Execution architecture: the Executor abstraction
 
 `fw_audit/executors/` provides a uniform interface so callers never know or
@@ -186,7 +208,17 @@ fw_audit/
       passes.py                      # individual (str) -> str normalization passes
       pipeline.py                     # JOERN_PIPELINE / normalize()
       report.py                        # PassStat / NormalizationResult
-  stage3_rag/ … stage6_reporting/   # Scaffolded, not yet implemented
+  stage3_analysis/
+    errors.py                  # Stage3InputError
+    models.py                   # Target / SkippedTarget / IngestionReport
+    layout.py                    # pure path algebra for stage3/'s output tree
+    stage2_io.py                  # load stage2_summary.json + resolve the mirror tree dir
+    whitelist.py                   # stage1 identified_binaries ∩ stage2 binaries[], pure
+    discover.py                     # locate each Target's file in the mirror tree
+    ingest.py                        # ingest() orchestrator -> IngestionReport
+    runner.py                         # fw-analyze CLI entry point
+    # clean/, chunk/, chunk_queue.py: designed, not yet implemented
+  stage4_analysis/ … stage6_reporting/   # Scaffolded, not yet implemented
 docker/
   Dockerfile               # The fw-audit-sandbox image (Stage 1) DockerExecutor targets
   Dockerfile.ghidra        # The fw-audit-ghidra image (Stage 2) — separate, see above

@@ -9,3 +9,10 @@ python-dotenv>=1.0
 langchain-ollama>=0.2.0
 langchain-anthropic>=0.2.0
 langchain-google-genai>=2.0.0
+
+# Stage 3 function extraction (optional — --debug degrades gracefully without it)
+# Pinned exact: tree-sitter 0.26.0 + tree-sitter-c 0.24.2 (latest of each) crash on
+# real ~6MB input with corrupted Node fields — an ABI mismatch between the two
+# independently versioned packages. This exact pair is confirmed working.
+tree-sitter==0.23.2
+tree-sitter-c==0.23.2
