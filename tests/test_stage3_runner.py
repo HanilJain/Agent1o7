@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from fw_audit.stage3_analysis.runner import _parse_args, main
 
 
@@ -67,6 +69,7 @@ def test_parse_args_defaults():
     assert args.stage1_summary_path == "stage1_summary.json"
     assert args.only == []
     assert args.debug is False
+    assert args.debug_chunks is False
     assert args.chunk_lines is None
     assert args.run_id is None
 
@@ -79,6 +82,12 @@ def test_parse_args_only_is_repeatable():
 def test_parse_args_debug_flag():
     args = _parse_args(["s.json", "--debug"])
     assert args.debug is True
+
+
+def test_parse_args_debug_chunks_flag():
+    args = _parse_args(["s.json", "--debug-chunks"])
+    assert args.debug_chunks is True
+    assert args.debug is False  # independent of --debug
 
 
 def test_parse_args_chunk_lines():
@@ -124,6 +133,65 @@ def test_main_debug_dump_untruncated_for_large_source(tmp_path: Path):
     written = dumped.read_text(encoding="utf-8")
     assert written == source  # full content, never head/tail-truncated
     assert "line 250" in written  # a middle line specifically, to rule out truncation
+
+
+def _padded_function(name: str, n_statements: int = 60) -> str:
+    """Padded well past `stage3_chunk_lines`'s minimum allowed value (50)
+    so it closes its own chunk on its own — see the identical helper in
+    `test_stage3_ingest.py` for the full rationale."""
+    body = "\n".join(f"  x += {i};" for i in range(n_statements))
+    return f"int {name}(int x)\n{{\n{body}\n  return x;\n}}\n"
+
+
+def test_main_without_debug_chunks_writes_no_chunks_dir(tmp_path: Path, capsys):
+    summary_path = _setup_single_target_run(tmp_path, source_text="int main(void) { return 0; }\n")
+
+    code = main([str(summary_path)])
+
+    assert code == 0
+    chunks_dir = tmp_path / "db" / "fw" / "stage3" / "chunks"
+    assert not chunks_dir.exists()
+    captured = capsys.readouterr()
+    assert "Chunk debug dump" not in captured.out
+
+
+def test_main_debug_chunks_writes_chunk_files_to_disk(tmp_path: Path, capsys):
+    pytest.importorskip("tree_sitter_c")
+    source = _padded_function("add") + "\n" + _padded_function("sub")
+    summary_path = _setup_single_target_run(tmp_path, source_text=source)
+
+    code = main([str(summary_path), "--debug-chunks", "--chunk-lines", "50"])
+
+    assert code == 0
+    chunks_dir = tmp_path / "db" / "fw" / "stage3" / "chunks"
+    files = sorted(p.name for p in chunks_dir.glob("*.c"))
+    assert files == ["bin_busybox__0000.c", "bin_busybox__0001.c"]
+    captured = capsys.readouterr()
+    assert "Chunk debug dump" in captured.out
+    assert str(chunks_dir) in captured.out
+
+
+def test_main_debug_chunks_independent_of_debug(tmp_path: Path, capsys):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_single_target_run(tmp_path, source_text="int main(void) { return 0; }\n")
+
+    code = main([str(summary_path), "--debug-chunks"])
+
+    assert code == 0
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert (stage3_dir / "chunks").exists()
+    assert not (stage3_dir / "debug").exists()
+
+
+def test_main_debug_independent_of_debug_chunks(tmp_path: Path, capsys):
+    summary_path = _setup_single_target_run(tmp_path, source_text="int main(void) { return 0; }\n")
+
+    code = main([str(summary_path), "--debug"])
+
+    assert code == 0
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert (stage3_dir / "debug").exists()
+    assert not (stage3_dir / "chunks").exists()
 
 
 def test_main_debug_never_modifies_stage2_or_mirror_tree(tmp_path: Path, capsys):
@@ -249,10 +317,11 @@ def test_main_exit_code_0_and_prints_targets_skipped_aliases(tmp_path: Path, cap
     assert "lib/orphan.so.c" in captured.out
 
 
-def test_main_debug_and_chunk_lines_flags_accepted(tmp_path: Path, capsys):
-    """--debug/--chunk-lines are parsed and threaded into Settings even
-    though Steps 3/4 don't consume them yet -- confirms the CLI surface
-    doesn't error out on them."""
+def test_main_debug_debug_chunks_and_chunk_lines_flags_accepted(tmp_path: Path, capsys):
+    """--debug/--debug-chunks/--chunk-lines all parse and thread into
+    Settings together without erroring, even against a zero-target run
+    (Step 4/queueing doesn't consume any of this yet, but the CLI surface
+    must accept all three flags at once)."""
     db_subfolder = tmp_path / "db" / "fw"
     stage2_dir = db_subfolder / "stage2"
     stage2_dir.mkdir(parents=True)
@@ -281,7 +350,7 @@ def test_main_debug_and_chunk_lines_flags_accepted(tmp_path: Path, capsys):
         encoding="utf-8",
     )
 
-    code = main([str(summary_path), "--debug", "--chunk-lines", "500"])
+    code = main([str(summary_path), "--debug", "--debug-chunks", "--chunk-lines", "500"])
 
     assert code == 1  # zero targets, but flags themselves didn't error
 

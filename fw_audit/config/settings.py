@@ -114,22 +114,43 @@ class Settings(BaseSettings):
     stage3_chunk_lines: int = Field(
         default=1000, ge=50, validation_alias="FWA_STAGE3_CHUNK_LINES"
     )
-    """Soft per-chunk line-count target for Step 3's AST-aware chunker.
-    Unused by this session's code (Step 1 only); reserved so `Settings` and
-    the `fw-analyze --chunk-lines` flag don't need a second change once
-    chunking lands."""
+    """Soft per-chunk line-count target consumed by
+    `chunk.strategy.chunk_source`: a chunk closes once its accumulated
+    functions reach this many lines (the function that crosses it stays
+    in that chunk — see that function's docstring for the exact
+    algorithm). `chunk_source` raises `ValueError` if this exceeds
+    `stage3_max_chunk_lines` below. Threaded through by the
+    `fw-analyze --chunk-lines` flag."""
     stage3_max_chunk_lines: int = Field(
         default=4000, ge=1, validation_alias="FWA_STAGE3_MAX_CHUNK_LINES"
     )
-    """Hard cap before a single oversized AST node (e.g. one huge function)
-    is emitted as its own oversized chunk rather than merged with others.
-    Unused by this session's code; reserved for Step 3."""
+    """Hard cap consumed by `chunk.strategy.chunk_source`, two roles: (1)
+    a single function whose own line span exceeds this becomes its own
+    `oversized=True` chunk rather than being merged with neighbors or
+    (never allowed) split; (2) merging a function into an in-progress
+    chunk is refused — the chunk is flushed first — if it would push the
+    chunk's total over this cap."""
     stage3_debug_dump: bool = Field(
         default=False, validation_alias="FWA_STAGE3_DEBUG_DUMP"
     )
-    """When true, Step 4's queue writes chunk payloads to
-    <db_subfolder>/stage3/chunks/ as they're produced. Unused by this
-    session's code; reserved for Step 4."""
+    """When true, `ingest()` writes Step 1's raw resolved-source dump
+    (`stage3/debug/<bin_id>.c`) and Step 2's function-only cleaned dump
+    (`stage3/debug/<bin_id>.cleaned.c`) for every target. Purely for
+    manual testing/verification, never read back by any later step. Does
+    NOT gate chunk-payload dumps — see `stage3_chunk_debug_dump` below,
+    an independent flag for Step 3's own debug output."""
+    stage3_chunk_debug_dump: bool = Field(
+        default=False, validation_alias="FWA_STAGE3_CHUNK_DEBUG_DUMP"
+    )
+    """When true, `ingest()` additionally chunks every Target's function-
+    only extraction via `chunk.strategy.chunk_source` and writes one file
+    per `Chunk` to `<db_subfolder>/stage3/chunks/<chunk_id>.c`. Independent
+    of `stage3_debug_dump` above — dumping chunk payloads and dumping
+    raw/cleaned source answer different questions, gated separately,
+    mirroring why `debug_dir` and `chunks_dir` are separate directories in
+    `layout.py`. Same discipline as `stage3_debug_dump`: manual
+    testing/verification only, best-effort per file, never read back by
+    any later step."""
 
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names

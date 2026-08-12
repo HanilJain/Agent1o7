@@ -634,6 +634,197 @@ def test_ingest_writes_report_without_touching_stage2_or_mirror_tree(tmp_path):
     assert len(report.targets) == 1
 
 
+def test_ingest_without_chunk_debug_dump_writes_no_chunks_dir(tmp_path):
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[_binary_dict("sbin/wpasupp")],
+        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
+    )
+
+    ingest(stage1_summary_path=stage1_path)
+
+    chunks_dir = tmp_path / "db" / "fw" / "stage3" / "chunks"
+    assert not chunks_dir.exists()
+
+
+def _padded_function(name: str, n_statements: int = 60) -> str:
+    """A syntactically simple function padded to comfortably exceed
+    `stage3_chunk_lines`'s minimum allowed value (50, per `Settings.
+    stage3_chunk_lines`'s `ge=50` constraint) on its own, so each one
+    forces its own chunk closure without needing an out-of-range
+    `chunk_lines` value in the test."""
+    body = "\n".join(f"  x += {i};" for i in range(n_statements))
+    return f"int {name}(int x)\n{{\n{body}\n  return x;\n}}\n"
+
+
+def test_ingest_chunk_debug_dump_writes_one_file_per_chunk(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    source = _padded_function("add") + "\n" + _padded_function("sub")
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[
+            _binary_dict(
+                "sbin/wpasupp",
+                functions=[_ghidra_function_dict("add"), _ghidra_function_dict("sub")],
+            )
+        ],
+        tree_files={"sbin/wpasupp.c": source},
+    )
+
+    # chunk_lines=50 (the minimum allowed): each padded function's own span
+    # (~63 lines) already exceeds it, so each closes its own chunk on its own.
+    chunk_settings = Settings(
+        _env_file=None, stage3_chunk_debug_dump=True, stage3_chunk_lines=50
+    )
+    ingest(stage1_summary_path=stage1_path, settings=chunk_settings)
+
+    chunks_dir = tmp_path / "db" / "fw" / "stage3" / "chunks"
+    files = sorted(p.name for p in chunks_dir.glob("*.c"))
+    assert files == ["sbin_wpasupp__0000.c", "sbin_wpasupp__0001.c"]
+    assert "int add(int x)" in (chunks_dir / "sbin_wpasupp__0000.c").read_text(encoding="utf-8")
+    assert "int sub(int x)" in (chunks_dir / "sbin_wpasupp__0001.c").read_text(encoding="utf-8")
+
+
+def test_ingest_chunk_debug_dump_writes_files_for_matched_targets_only(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp", "bin/missing"],
+        binaries=[
+            _binary_dict("sbin/wpasupp", functions=[_ghidra_function_dict("main")])
+        ],
+        unresolved=[{"requested_path": "bin/missing", "problem": "not_found"}],
+        tree_files={
+            "sbin/wpasupp.c": "int main(void) { return 0; }\n",
+            "lib/orphan.so.c": "int f(void) { return 0; }\n",
+        },
+    )
+
+    chunk_settings = Settings(_env_file=None, stage3_chunk_debug_dump=True)
+    ingest(stage1_summary_path=stage1_path, settings=chunk_settings)
+
+    chunks_dir = tmp_path / "db" / "fw" / "stage3" / "chunks"
+    dumped_bin_ids = {p.name.split("__", 1)[0] for p in chunks_dir.glob("*.c")}
+    assert dumped_bin_ids == {"sbin_wpasupp"}
+
+
+def test_ingest_chunk_debug_dump_independent_of_raw_debug_dump(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[_binary_dict("sbin/wpasupp", functions=[_ghidra_function_dict("main")])],
+        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
+    )
+
+    chunk_only_settings = Settings(
+        _env_file=None, stage3_chunk_debug_dump=True, stage3_debug_dump=False
+    )
+    ingest(stage1_summary_path=stage1_path, settings=chunk_only_settings)
+
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert (stage3_dir / "chunks").exists()
+    assert not (stage3_dir / "debug").exists()
+
+
+def test_ingest_raw_debug_dump_independent_of_chunk_debug_dump(tmp_path):
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[_binary_dict("sbin/wpasupp")],
+        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
+    )
+
+    debug_only_settings = Settings(
+        _env_file=None, stage3_debug_dump=True, stage3_chunk_debug_dump=False
+    )
+    ingest(stage1_summary_path=stage1_path, settings=debug_only_settings)
+
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert (stage3_dir / "debug").exists()
+    assert not (stage3_dir / "chunks").exists()
+
+
+def test_ingest_both_debug_flags_together_write_both_directories(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[_binary_dict("sbin/wpasupp", functions=[_ghidra_function_dict("main")])],
+        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
+    )
+
+    both_settings = Settings(
+        _env_file=None, stage3_debug_dump=True, stage3_chunk_debug_dump=True
+    )
+    ingest(stage1_summary_path=stage1_path, settings=both_settings)
+
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert (stage3_dir / "debug").exists()
+    assert (stage3_dir / "chunks").exists()
+
+
+def test_ingest_chunk_debug_dump_never_modifies_mirror_tree(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[_binary_dict("sbin/wpasupp", functions=[_ghidra_function_dict("main")])],
+        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
+    )
+    tree_dir = tmp_path / "db" / "fw_decompiled"
+
+    def _snapshot() -> dict[str, tuple[int, float]]:
+        return {
+            str(p): (p.stat().st_size, p.stat().st_mtime)
+            for p in tree_dir.rglob("*")
+            if p.is_file()
+        }
+
+    before = _snapshot()
+    chunk_settings = Settings(_env_file=None, stage3_chunk_debug_dump=True)
+    ingest(stage1_summary_path=stage1_path, settings=chunk_settings)
+    after = _snapshot()
+
+    assert after == before
+
+
+def test_ingest_chunk_debug_missing_tree_sitter_degrades_gracefully(
+    tmp_path, monkeypatch, caplog
+):
+    """--debug-chunks must not regress for a user without the `stage3`
+    extra: the report still succeeds; the chunk dump is simply skipped,
+    with a single warning logged (not one per target)."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "tree_sitter", None)
+    monkeypatch.setitem(sys.modules, "tree_sitter_c", None)
+    from fw_audit.stage3_analysis.clean import parser as parser_module
+
+    parser_module.get_parser.cache_clear()
+
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[_binary_dict("sbin/wpasupp")],
+        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
+    )
+    chunk_settings = Settings(_env_file=None, stage3_chunk_debug_dump=True)
+
+    try:
+        with caplog.at_level("WARNING", logger="fw_audit.stage3_analysis"):
+            report = ingest(stage1_summary_path=stage1_path, settings=chunk_settings)
+    finally:
+        parser_module.get_parser.cache_clear()
+
+    assert len(report.targets) == 1
+    chunks_dir = tmp_path / "db" / "fw" / "stage3" / "chunks"
+    assert not any(chunks_dir.glob("*.c")) if chunks_dir.exists() else True
+    assert any("chunk debug dump skipped" in r.message for r in caplog.records)
+
+
 @pytest.mark.integration
 def test_ingest_against_real_committed_run():
     """End-to-end against the real committed firmware run in this repo.

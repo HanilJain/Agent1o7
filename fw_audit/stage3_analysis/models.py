@@ -1,4 +1,6 @@
-"""Stage 3's internal data shapes for Component 1 (ingest & whitelist).
+"""Stage 3's internal data shapes: ingest & whitelist (`Target`,
+`SkippedTarget`, `IngestionReport`), Step 2's function-only extraction
+(`ExtractedFunction`, `ExtractedSource`), and Step 3's chunking (`Chunk`).
 
 Frozen dataclasses, not Pydantic — per the project's immutability
 convention, and because these are internal to Stage 3, not a cross-stage
@@ -139,7 +141,7 @@ class ExtractedFunction:
 @dataclass(frozen=True)
 class ExtractedSource:
     """One binary's complete function-only extraction result — the input
-    to (not-yet-built) chunking, and what `--debug` dumps to
+    to `chunk.strategy.chunk_source`, and what `--debug` dumps to
     `stage3/debug/<bin_id>.cleaned.c`."""
 
     bin_id: str
@@ -158,3 +160,91 @@ class ExtractedSource:
         `function_definition` nodes were kept), separated by one blank
         line, each verbatim — no reformatting of any kept function body."""
         return "\n\n".join(f.text for f in self.functions)
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """One LLM-context-sized slice of a single `Target`'s function-only
+    extraction, produced by `chunk.strategy.chunk_source`'s greedy
+    accumulation over an already-ordered `tuple[ExtractedFunction, ...]`.
+    Never splits a function: every `Chunk` holds one or more *whole*
+    `ExtractedFunction`s, verbatim, in original source order.
+
+    This is Step 3's output and the eventual input to a future Stage 3
+    Component 2 JSON report (`stage3_summary.json`, not built this
+    session) — mirroring how `Stage1Summary` -> `Stage2Summary` ->
+    `ingestion_report.json` are this codebase's established file-based,
+    not live-object, cross-stage hand-off convention. `to_json_dict()`
+    below is shaped for that future report-writer now, so `Chunk` won't
+    need reshaping when it's built.
+    """
+
+    chunk_id: str
+    """`<bin_id>#<ordinal:04d>`, e.g. "sbin_wpasupp__b86e5cadc3c9#0007" —
+    `layout.chunk_filename()` swaps the `#` for `__` when this becomes a
+    debug-dump filename, since `#` is awkward (though not illegal) on
+    Windows."""
+    bin_id: str
+    rootfs_path: str
+    """POSIX, relative to the firmware's rootfs root — carried through
+    from `Target.rootfs_path` so a reader of the eventual JSON report can
+    identify which binary a chunk came from without a second lookup."""
+    source_relpath: str
+    """POSIX path relative to the decompiled tree directory — carried
+    through from `Target.source_relpath`, same rationale as
+    `rootfs_path` above."""
+    functions: tuple[ExtractedFunction, ...]
+    """The whole, verbatim `ExtractedFunction`s this chunk holds, in
+    original source order — never a partial function. Deliberately NOT
+    serialized by `to_json_dict()` below: it carries every function's
+    full `.text`, which would bloat a JSON report with the exact same
+    payload a reader gets more directly from the chunk's own dumped `.c`
+    file (or, once Step 4/queueing exists, the in-memory `Chunk` itself)
+    — the same reasoning `IngestionReport.to_json_dict()` already applies
+    to excluding `Target.functions`."""
+    start_line: int
+    """`functions[0].start_line` — both already relative to the REPAIRED
+    text per `ExtractedFunction`, not the original mirror file."""
+    end_line: int
+    """`functions[-1].end_line`."""
+    approx_tokens: int
+    """`len(self.to_text()) // 4` — a documented ESTIMATE (the common
+    "4 characters per token" rule of thumb), not a real tokenizer count;
+    good enough to size a chunk against an LLM's context window without
+    taking a tokenizer dependency this pipeline doesn't otherwise need."""
+    oversized: bool
+    """True only when a SINGLE function's own line span already exceeds
+    `stage3_max_chunk_lines` — that function becomes its own chunk rather
+    than being merged with neighbors or (never allowed) split. False for
+    every other chunk, including one that merges multiple functions right
+    up to (but not over) the hard cap."""
+
+    def to_text(self) -> str:
+        """Functions joined in original order, separated by one blank
+        line, each verbatim — no reformatting of any kept function body.
+        Same style as `ExtractedSource.to_text()`, one level down (a
+        chunk's functions are always a contiguous sub-sequence of some
+        `ExtractedSource.functions`)."""
+        return "\n\n".join(f.text for f in self.functions)
+
+    def to_json_dict(self) -> dict:
+        """Metadata only — chunk_id, bin_id, rootfs_path, source_relpath,
+        start_line, end_line, approx_tokens, function_names, oversized.
+        Deliberately excludes `functions` (and therefore every function's
+        raw `.text`) for the same reason `IngestionReport.to_json_dict()`
+        excludes `Target.functions`: it would add the chunk's entire
+        source payload to a report meant to be a compact index, for no
+        reader benefit over reading the chunk's own file. `function_names`
+        keeps the report useful for a human/LLM scanning it without the
+        full text."""
+        return {
+            "chunk_id": self.chunk_id,
+            "bin_id": self.bin_id,
+            "rootfs_path": self.rootfs_path,
+            "source_relpath": self.source_relpath,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "approx_tokens": self.approx_tokens,
+            "function_names": [f.name for f in self.functions],
+            "oversized": self.oversized,
+        }

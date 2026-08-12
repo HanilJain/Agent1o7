@@ -2,20 +2,32 @@
 
 Registered as the `fw-analyze` console script (see pyproject.toml). Usage:
 
-    fw-analyze path/to/stage1_summary.json [--only PATH ...] [--debug] [--run-id ID]
+    fw-analyze path/to/stage1_summary.json [--only PATH ...] [--debug]
+        [--debug-chunks] [--chunk-lines N] [--run-id ID]
 
-This session wires only Step 1 (ingestion & whitelisting). `ingestion_report.
-json` is always written by `ingest()` itself regardless of `--debug` — it's
-the machine-readable hand-off a future Component 2 needs every run, not a
-debug artifact. `--debug` does something narrower, purely for manual
-testing/verification: it makes `ingest()` also write a verbatim copy of
-every resolved `Target`'s source under `<db_subfolder>/stage3/debug/
-<bin_id>.c`, so you can inspect exactly which file Step 1 picked for each
-binary without hunting through the mirror tree yourself. No console output
-changes based on this flag — see `fw_audit.stage3_analysis.ingest.
-_write_debug_sources` for the actual write. `--chunk-lines` is accepted and
-threaded into `Settings` now so the CLI surface doesn't need to change
-again once Step 3 lands, but does nothing yet — the help text says so.
+`ingestion_report.json` is always written by `ingest()` itself regardless
+of any debug flag — it's the machine-readable hand-off a future Component 2
+needs every run, not a debug artifact. `--debug` and `--debug-chunks` are
+two INDEPENDENT flags, each purely for manual testing/verification, each
+either may be passed alone or together:
+
+* `--debug` makes `ingest()` write a verbatim copy of every resolved
+  `Target`'s source under `<db_subfolder>/stage3/debug/<bin_id>.c` (Step
+  1's file-resolution check) and, if the `stage3` extra is installed,
+  Step 2's function-only extraction under `<bin_id>.cleaned.c`. See
+  `fw_audit.stage3_analysis.ingest._write_debug_sources`/
+  `_write_cleaned_debug_sources`.
+* `--debug-chunks` makes `ingest()` chunk every resolved `Target`'s
+  function-only extraction (Step 3's `chunk.strategy.chunk_source`) and
+  write one file per chunk under `<db_subfolder>/stage3/chunks/
+  <chunk_id>.c`. See `fw_audit.stage3_analysis.ingest.
+  _write_chunk_debug_sources`.
+
+`--chunk-lines` sets `Settings.stage3_chunk_lines`, the soft per-chunk
+line-count target `chunk_source` accumulates against (default:
+`FWA_STAGE3_CHUNK_LINES` / 1000) — exercised via `--debug-chunks` or a
+direct `chunk_source()` call; `ingest()`'s default (no-flags) path never
+computes chunks, so passing `--chunk-lines` alone has no visible effect.
 """
 
 from __future__ import annotations
@@ -62,8 +74,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Testing/verification only: write a verbatim copy of every resolved "
-            "target's source to <db_subfolder>/stage3/debug/<bin_id>.c. Also "
-            "reserved for Step 4's future on-disk chunk-payload dump."
+            "target's source to <db_subfolder>/stage3/debug/<bin_id>.c, plus a "
+            "function-only cleaned copy. Independent of --debug-chunks."
+        ),
+    )
+    parser.add_argument(
+        "--debug-chunks",
+        action="store_true",
+        help=(
+            "Testing/verification only: chunk each target's function-only "
+            "extraction and write one file per chunk to <db_subfolder>/"
+            "stage3/chunks/<chunk_id>.c. Independent of --debug (which "
+            "dumps raw/cleaned source, never chunk payloads)."
         ),
     )
     parser.add_argument(
@@ -73,8 +95,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="N",
         help=(
             "Soft line-count limit per chunk (default: FWA_STAGE3_CHUNK_LINES / "
-            "1000). Not yet implemented (Step 3) — accepted now so the CLI "
-            "surface is stable once it is."
+            "1000), consumed by chunk_source. Exercised via --debug-chunks."
         ),
     )
     parser.add_argument(
@@ -133,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     if args.debug:
         settings = settings.model_copy(update={"stage3_debug_dump": True})
+    if args.debug_chunks:
+        settings = settings.model_copy(update={"stage3_chunk_debug_dump": True})
     if args.chunk_lines is not None:
         settings = settings.model_copy(update={"stage3_chunk_lines": args.chunk_lines})
 
@@ -152,6 +175,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.debug and report.targets:
         print(f"Debug source dump: {layout.debug_dir(stage3_dir)}/<bin_id>.c")
+    if args.debug_chunks and report.targets:
+        print(f"Chunk debug dump: {layout.chunks_dir(stage3_dir)}/<chunk_id>.c")
 
     return 1 if not report.targets else 0
 

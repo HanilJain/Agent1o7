@@ -36,6 +36,14 @@ the mirror tree, but the write itself still only ever lands under Stage
 3's own `stage3/debug/` directory. Missing the `stage3` extra degrades
 gracefully — a single warning is logged and the cleaned dump is skipped;
 the raw dump and `ingestion_report.json` are unaffected.
+
+Independently, when `settings.stage3_chunk_debug_dump` is true (the CLI's
+`--debug-chunks` flag), `ingest()` chunks every `Target`'s function-only
+extraction via `chunk.strategy.chunk_source` and writes one file per
+`Chunk` under `stage3/chunks/<chunk_id>.c`. This is a SEPARATE flag from
+`stage3_debug_dump` above — either may be set alone or together — since
+dumping chunk payloads and dumping raw/cleaned source answer different
+questions. Same missing-`stage3`-extra degradation as the cleaned dump.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ from fw_audit.config.settings import Settings, get_settings
 from fw_audit.stage2_extraction.normalize.context import build_context
 from fw_audit.stage2_extraction.stage1_io import load_stage1_summary
 from fw_audit.stage3_analysis import discover, layout
+from fw_audit.stage3_analysis.chunk.strategy import chunk_source
 from fw_audit.stage3_analysis.clean.extract import extract_functions
 from fw_audit.stage3_analysis.errors import Stage3InputError
 from fw_audit.stage3_analysis.models import IngestionReport, SkippedTarget, Target
@@ -124,6 +133,8 @@ def ingest(
     if settings.stage3_debug_dump:
         _write_debug_sources(report)
         _write_cleaned_debug_sources(report)
+    if settings.stage3_chunk_debug_dump:
+        _write_chunk_debug_sources(report, settings)
     return report
 
 
@@ -258,6 +269,67 @@ def _write_cleaned_debug_sources(report: IngestionReport) -> None:
             dest.write_text(result.to_text(), encoding="utf-8")
         except OSError:
             continue
+
+
+def _write_chunk_debug_sources(report: IngestionReport, settings: Settings) -> None:
+    """`--debug-chunks`/`FWA_STAGE3_CHUNK_DEBUG_DUMP` only: chunk each
+    `Target`'s function-only extraction (Step 2's `clean.extract.
+    extract_functions`) via `chunk.strategy.chunk_source`, then write one
+    file per `Chunk` to `stage3/chunks/<chunk_id>.c` (via `layout.
+    chunks_dir()`/`layout.chunk_filename()`).
+
+    Independent of `settings.stage3_debug_dump` — see `Settings.
+    stage3_chunk_debug_dump`'s docstring for why these are two separate
+    flags. Re-parses/re-extracts each target's source independently of
+    `_write_cleaned_debug_sources` rather than sharing its result: both
+    functions are best-effort and independently gated, and either may run
+    alone or together in the same `ingest()` call depending on which
+    flags the caller passed — sharing state between them would couple two
+    paths that each need to keep working correctly in isolation. The
+    re-parse cost is the same order of magnitude as
+    `_write_cleaned_debug_sources`'s own (one `extract_functions` call per
+    target), not a new scaling concern.
+
+    Degrades gracefully exactly like `_write_cleaned_debug_sources`:
+    `extract_functions` raises `Stage3InputError` once tree-sitter/
+    tree-sitter-c aren't installed, caught here once per call (not once
+    per target), with a single warning logged. The raw dump, cleaned
+    dump, and `ingestion_report.json` must keep working unconditionally
+    either way.
+    """
+    if not report.targets:
+        return
+    chunks_dir = layout.chunks_dir(layout.stage3_dir(report.db_subfolder))
+    try:
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    for target in report.targets:
+        try:
+            text = target.source_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            context = build_context(target.functions)
+            source = extract_functions(text, bin_id=target.bin_id, context=context)
+        except Stage3InputError as exc:
+            logger.warning("chunk debug dump skipped: %s", exc)
+            return
+        chunks = chunk_source(
+            source,
+            bin_id=target.bin_id,
+            rootfs_path=target.rootfs_path,
+            source_relpath=target.source_relpath,
+            chunk_lines=settings.stage3_chunk_lines,
+            max_chunk_lines=settings.stage3_max_chunk_lines,
+        )
+        for chunk in chunks:
+            dest = chunks_dir / layout.chunk_filename(chunk.chunk_id)
+            try:
+                dest.write_text(chunk.to_text(), encoding="utf-8")
+            except OSError:
+                continue
 
 
 __all__ = ["ingest"]
