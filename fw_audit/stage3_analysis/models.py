@@ -1,6 +1,7 @@
 """Stage 3's internal data shapes: ingest & whitelist (`Target`,
 `SkippedTarget`, `IngestionReport`), Step 2's function-only extraction
-(`ExtractedFunction`, `ExtractedSource`), and Step 3's chunking (`Chunk`).
+(`ExtractedFunction`, `ExtractedSource`), Step 3's chunking (`Chunk`), and
+Step 4's queue hand-off (`ChunkHandle`).
 
 Frozen dataclasses, not Pydantic — per the project's immutability
 convention, and because these are internal to Stage 3, not a cross-stage
@@ -170,13 +171,10 @@ class Chunk:
     Never splits a function: every `Chunk` holds one or more *whole*
     `ExtractedFunction`s, verbatim, in original source order.
 
-    This is Step 3's output and the eventual input to a future Stage 3
-    Component 2 JSON report (`stage3_summary.json`, not built this
-    session) — mirroring how `Stage1Summary` -> `Stage2Summary` ->
-    `ingestion_report.json` are this codebase's established file-based,
-    not live-object, cross-stage hand-off convention. `to_json_dict()`
-    below is shaped for that future report-writer now, so `Chunk` won't
-    need reshaping when it's built.
+    This is Step 3's output. `chunk_queue.ChunkQueue.put()` (Step 4) is
+    what turns a `Chunk` into a `ChunkHandle` (below) for queueing —
+    `to_json_dict()` here is shaped for `ChunkRecord`/`Stage3Summary`
+    (`common/schemas.py`), so neither needed reshaping once Step 4 landed.
     """
 
     chunk_id: str
@@ -248,3 +246,66 @@ class Chunk:
             "function_names": [f.name for f in self.functions],
             "oversized": self.oversized,
         }
+
+
+@dataclass(frozen=True)
+class ChunkHandle:
+    """A `Chunk`'s metadata plus a pointer to its persisted-to-disk `.c`
+    payload, handed through `chunk_queue.ChunkQueue` instead of the
+    `Chunk` itself. Never holds chunk text/functions in memory — a
+    consumer reads `chunk_path` itself, only when it actually needs the
+    text, and lets it go out of scope naturally afterward. This keeps the
+    queue's own memory footprint at O(maxsize x metadata size) regardless
+    of how many binaries or how large they are — the concern that
+    motivated persisting chunks to disk as the queue's source of truth in
+    the first place, rather than passing `Chunk` objects (each carrying
+    every one of its functions' full text) through the queue directly.
+
+    Deliberately NOT a mutable "payload slot cleared on ack" design (an
+    earlier speculative sketch of this component, written before `Chunk`
+    existed for real, proposed that shape). Frozen, like every other
+    Stage 3 dataclass, per this project's immutability convention:
+    `ChunkQueue.nack()` produces a NEW handle via `dataclasses.replace`
+    (incrementing `attempt`) rather than mutating this one in place.
+    """
+
+    chunk_id: str
+    bin_id: str
+    rootfs_path: str
+    source_relpath: str
+    chunk_path: Path
+    """Absolute host path to this chunk's persisted `.c` file, written by
+    `ChunkQueue.put()` via `layout.chunks_dir()`/`layout.chunk_filename()`
+    — the same path algebra `ingest._write_chunk_debug_sources` (Step 3's
+    manual `--debug-chunks` dump) already uses, so both a debug run and a
+    real `--queue` run land identical, deterministic filenames for the
+    same `chunk_id`."""
+    start_line: int
+    end_line: int
+    approx_tokens: int
+    oversized: bool
+    attempt: int = 0
+    """0-indexed number of the attempt this handle represents — 0 on
+    first delivery, incremented by `ChunkQueue.nack()` on each retry.
+    `attempt + 1` is always "attempts made so far" for a chunk, whether it
+    ends up acked or, after `Settings.stage3_queue_max_attempts` is
+    reached, permanently failed — see `ChunkQueue.nack()`'s docstring for
+    why that arithmetic is kept consistent between the two outcomes."""
+
+    @classmethod
+    def from_chunk(cls, chunk: Chunk, chunk_path: Path) -> ChunkHandle:
+        """Build the metadata-only handle for a `Chunk` already persisted
+        to `chunk_path`. `attempt` starts at 0 — callers needing a retried
+        handle use `dataclasses.replace(handle, attempt=...)` instead of
+        calling this again."""
+        return cls(
+            chunk_id=chunk.chunk_id,
+            bin_id=chunk.bin_id,
+            rootfs_path=chunk.rootfs_path,
+            source_relpath=chunk.source_relpath,
+            chunk_path=chunk_path,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
+            approx_tokens=chunk.approx_tokens,
+            oversized=chunk.oversized,
+        )

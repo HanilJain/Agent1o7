@@ -151,6 +151,37 @@ class Settings(BaseSettings):
     `layout.py`. Same discipline as `stage3_debug_dump`: manual
     testing/verification only, best-effort per file, never read back by
     any later step."""
+    stage3_queue_maxsize: int = Field(
+        default=6, ge=1, validation_alias="FWA_STAGE3_QUEUE_MAXSIZE"
+    )
+    """Bounded backpressure for `chunk_queue.ChunkQueue`: `put()` blocks
+    once this many un-acked chunk handles are pending. Default 6 = 2x the
+    default worker count below, so the producer stays a bit ahead of
+    consumers without ever materializing a whole firmware's chunk set in
+    memory at once — the concern that motivated persisting chunks to disk
+    as the queue's source of truth (`ChunkHandle` carries a `chunk_path`
+    pointer, never the chunk text itself) rather than passing `Chunk`
+    objects through the queue directly."""
+    stage3_queue_workers: int = Field(
+        default=3, ge=1, le=16, validation_alias="FWA_STAGE3_QUEUE_WORKERS"
+    )
+    """Concurrent consumer tasks `chunk_queue.run_queue()` spawns. Matches
+    the "three workers deep" figure `stage3_analysis/__init__.py`'s own
+    module docstring already commits to for Component 2 — this session's
+    placeholder no-op consumer runs at that same target concurrency, so
+    the plumbing (backpressure, ack/nack, sentinel-based shutdown) is
+    exercised realistically even before Component 2's real LLM agent
+    exists."""
+    stage3_queue_max_attempts: int = Field(
+        default=3, ge=1, validation_alias="FWA_STAGE3_QUEUE_MAX_ATTEMPTS"
+    )
+    """Retry cap for `ChunkQueue.nack()`: a chunk is re-queued (with
+    `ChunkHandle.attempt` incremented) up to this many total attempts
+    before `Stage3Summary` records it as permanently failed rather than
+    retried forever. Only meaningful once a consumer can actually fail
+    (the no-op placeholder consumer never does) — reserved for Component
+    2's real LLM calls, which can fail transiently (timeouts, rate
+    limits) in ways this session's placeholder cannot."""
 
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names

@@ -71,6 +71,7 @@ def test_parse_args_defaults():
     assert args.debug is False
     assert args.debug_chunks is False
     assert args.chunk_lines is None
+    assert args.queue is False
     assert args.run_id is None
 
 
@@ -93,6 +94,11 @@ def test_parse_args_debug_chunks_flag():
 def test_parse_args_chunk_lines():
     args = _parse_args(["s.json", "--chunk-lines", "500"])
     assert args.chunk_lines == 500
+
+
+def test_parse_args_queue_flag():
+    args = _parse_args(["s.json", "--queue"])
+    assert args.queue is True
 
 
 def test_main_without_debug_writes_no_debug_dump(tmp_path: Path, capsys):
@@ -192,6 +198,53 @@ def test_main_debug_independent_of_debug_chunks(tmp_path: Path, capsys):
     stage3_dir = tmp_path / "db" / "fw" / "stage3"
     assert (stage3_dir / "debug").exists()
     assert not (stage3_dir / "chunks").exists()
+
+
+def test_main_without_queue_writes_no_stage3_summary(tmp_path: Path, capsys):
+    summary_path = _setup_single_target_run(tmp_path, source_text="int main(void) { return 0; }\n")
+
+    code = main([str(summary_path)])
+
+    assert code == 0
+    assert not (tmp_path / "db" / "fw" / "stage3" / "stage3_summary.json").is_file()
+    captured = capsys.readouterr()
+    assert "Queue:" not in captured.out
+    assert "Stage 3 summary" not in captured.out
+
+
+def test_main_queue_writes_stage3_summary_and_chunk_files(tmp_path: Path, capsys):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_single_target_run(tmp_path, source_text="int main(void) { return 0; }\n")
+
+    code = main([str(summary_path), "--queue"])
+
+    assert code == 0
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    summary_path_out = stage3_dir / "stage3_summary.json"
+    assert summary_path_out.is_file()
+    written = json.loads(summary_path_out.read_text(encoding="utf-8"))
+    assert written["total_chunks"] == 1
+    assert written["total_acked"] == 1
+    assert any((stage3_dir / "chunks").glob("*.c"))
+    captured = capsys.readouterr()
+    assert "Queue: 1 chunks, 1 acked, 0 failed" in captured.out
+    assert "Stage 3 summary" in captured.out
+    assert str(summary_path_out) in captured.out
+
+
+def test_main_queue_independent_of_debug_and_debug_chunks(tmp_path: Path, capsys):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_single_target_run(tmp_path, source_text="int main(void) { return 0; }\n")
+
+    code = main([str(summary_path), "--queue"])
+
+    assert code == 0
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert not (stage3_dir / "debug").exists()
+    # --queue persists chunks unconditionally (the queue's own source of
+    # truth), independent of --debug-chunks -- see chunk_queue.py's and
+    # layout.chunks_dir()'s docstrings for why both may write here.
+    assert any((stage3_dir / "chunks").glob("*.c"))
 
 
 def test_main_debug_never_modifies_stage2_or_mirror_tree(tmp_path: Path, capsys):
@@ -317,11 +370,11 @@ def test_main_exit_code_0_and_prints_targets_skipped_aliases(tmp_path: Path, cap
     assert "lib/orphan.so.c" in captured.out
 
 
-def test_main_debug_debug_chunks_and_chunk_lines_flags_accepted(tmp_path: Path, capsys):
-    """--debug/--debug-chunks/--chunk-lines all parse and thread into
-    Settings together without erroring, even against a zero-target run
-    (Step 4/queueing doesn't consume any of this yet, but the CLI surface
-    must accept all three flags at once)."""
+def test_main_debug_debug_chunks_queue_and_chunk_lines_flags_accepted(tmp_path: Path, capsys):
+    """--debug/--debug-chunks/--queue/--chunk-lines all parse and run
+    together without erroring, even against a zero-target run (--queue's
+    asyncio.run(run_queue(...)) must complete cleanly -- not hang -- when
+    there's nothing to chunk)."""
     db_subfolder = tmp_path / "db" / "fw"
     stage2_dir = db_subfolder / "stage2"
     stage2_dir.mkdir(parents=True)
@@ -350,9 +403,11 @@ def test_main_debug_debug_chunks_and_chunk_lines_flags_accepted(tmp_path: Path, 
         encoding="utf-8",
     )
 
-    code = main([str(summary_path), "--debug", "--debug-chunks", "--chunk-lines", "500"])
+    code = main(
+        [str(summary_path), "--debug", "--debug-chunks", "--queue", "--chunk-lines", "500"]
+    )
 
-    assert code == 1  # zero targets, but flags themselves didn't error
+    assert code == 1  # zero targets, but flags themselves didn't error/hang
 
 
 def test_main_exit_code_1_on_zero_targets(tmp_path: Path, capsys):

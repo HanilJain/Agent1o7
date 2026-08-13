@@ -7,19 +7,23 @@ directories at the point they actually write into them.
 Layout, under `<db_subfolder>/stage3/`::
 
     ingestion_report.json
-    stage3_summary.json      (Step 4 — not written by this session's code)
+    stage3_summary.json      (written by chunk_queue.run_queue(), --queue)
     debug/<bin_id>.c              (--debug only; Step 1's raw resolved-source
                                     dump — see debug_dir/debug_source_path)
     debug/<bin_id>.cleaned.c       (--debug only; Step 2's function-only
                                     extraction — see debug_cleaned_source_path)
-    chunks/<chunk_id>.c       (--debug-chunks only; Step 3's chunk-payload
-                                dump — see chunks_dir/chunk_filename)
+    chunks/<chunk_id>.c       (Step 3's chunk-payload location — see
+                                chunks_dir/chunk_filename)
 
 `debug/` and `chunks/` are deliberately separate: `debug/` holds up to two files
 per `Target` (raw + cleaned, answering different questions — see each path
-function's docstring) while `chunks/` holds one file per Step 3 `Chunk`,
-written by `ingest._write_chunk_debug_sources` under `--debug-chunks` — an
-independent flag from `--debug`. Don't conflate them.
+function's docstring), reserved for manual testing/verification. `chunks/`
+holds one file per `Chunk`, written from TWO independent sources that land
+identical, deterministic content for the same `chunk_id`: `ingest.
+_write_chunk_debug_sources` under `--debug-chunks` (manual dump), and
+`chunk_queue.ChunkQueue.put()` under `--queue` (Step 4's production
+persistence — the queue's own source of truth, never held in memory as a
+`Chunk` object once written). Don't conflate `debug/` and `chunks/`.
 
 For everything under `<db_subfolder>/stage2/` and the sibling decompiled
 mirror tree, reuse `fw_audit.stage2_extraction.layout` directly rather than
@@ -40,7 +44,9 @@ def ingestion_report_path(stage3_dir_: Path) -> Path:
 
 
 def stage3_summary_path(stage3_dir_: Path) -> Path:
-    """Not written by Component 1 — reserved for Step 4's `Stage3Summary`."""
+    """Written by `chunk_queue.run_queue()` itself (mirroring
+    `Stage2Summary`'s own precedent of being written by its orchestrator
+    function, not only a CLI wrapper) — see `common.schemas.Stage3Summary`."""
     return stage3_dir_ / "stage3_summary.json"
 
 
@@ -69,14 +75,16 @@ def debug_cleaned_source_path(debug_dir_: Path, bin_id: str) -> Path:
 
 
 def chunks_dir(stage3_dir_: Path) -> Path:
-    """`--debug-chunks`-only dump location for chunk text, written by
-    `ingest._write_chunk_debug_sources` (`Chunk.to_text()` per chunk, one
-    file each — see `chunk.strategy.chunk_source`). Purely for manual
-    testing/verification, never read back by any later step; not part of
-    the production data path a future queueing session hands `Chunk`
-    objects (and `Chunk.to_json_dict()`) forward through directly.
-    Unrelated to `debug_dir` above, which is Step 1/2's own per-target
-    debug dump, not a per-chunk one."""
+    """Chunk-payload directory, written from two independent call sites —
+    see this module's docstring: `ingest._write_chunk_debug_sources`
+    (`--debug-chunks`, manual testing/verification only) and
+    `chunk_queue.ChunkQueue.put()` (`--queue`, Step 4's actual production
+    persistence — every `ChunkHandle` a consumer receives points here via
+    `ChunkHandle.chunk_path`, since the queue itself never holds a
+    `Chunk`'s text in memory). Both write identical, deterministic content
+    for the same `chunk_id`, so running both flags together never
+    conflicts. Unrelated to `debug_dir` above, which is Step 1/2's own
+    per-target debug dump, not a per-chunk one."""
     return stage3_dir_ / "chunks"
 
 

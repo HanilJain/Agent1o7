@@ -366,3 +366,76 @@ class Stage2Summary(BaseModel):
     errors: list[str] = Field(default_factory=list)
     started_at: datetime
     finished_at: datetime | None = None
+
+
+class ChunkRecord(BaseModel):
+    """One `stage3_analysis.models.Chunk`'s outcome after passing through
+    `stage3_analysis.chunk_queue.ChunkQueue` — its metadata, plus where
+    queue processing landed.
+
+    Mirrors `Chunk`'s own metadata fields (see `stage3_analysis.models.
+    Chunk`) as a cross-stage, JSON-serializable record, but never carries
+    the chunk's text — same reasoning `Chunk.to_json_dict()` already
+    applies: a reader gets the payload more directly from `chunk_path`
+    itself than from a bloated report."""
+
+    chunk_id: str
+    bin_id: str
+    rootfs_path: str
+    source_relpath: str
+    chunk_path: str
+    """Relative to `Stage3Summary.db_subfolder` — POSIX. Mirrors
+    `Stage2Summary`'s relocatability convention (every path relative to
+    `db_subfolder`, not host-absolute) rather than `ChunkHandle.chunk_path`
+    (an internal, in-process dataclass, which is host-absolute since it's
+    never serialized)."""
+    start_line: int
+    end_line: int
+    approx_tokens: int
+    oversized: bool
+    status: str
+    """`"acked"` or `"failed"` — whatever consumer `run_queue()` was given
+    (the no-op placeholder today; Component 2's real LLM agent once it
+    exists) either succeeded or exhausted `stage3_queue_max_attempts`.
+    Never a judgment about the chunk's CONTENT (e.g. "vulnerable") — that
+    finding-level data is Component 2's concern, not represented here."""
+    attempts: int
+
+
+class Stage3Summary(BaseModel):
+    """Stage 3 Component 1's machine-readable hand-off
+    (`stage3/stage3_summary.json`), written directly by
+    `stage3_analysis.chunk_queue.run_queue()` itself, not only by the CLI
+    — mirroring why `Stage2Summary` is written by `run_extraction()`
+    itself: a programmatic caller invoking `run_queue()` directly still
+    gets a summary.
+
+    Deliberately carries NO findings/vulnerability data — that's
+    Component 2's concern (the LLM agent pool that will eventually supply
+    a real `consumer` to `run_queue()`), not invented here. This is
+    Component 1's own accounting: what chunks were produced, what
+    happened to each as they passed through the queue (acked by whatever
+    consumer ran — the no-op placeholder this session, real analysis once
+    Component 2 exists), and where their persisted `.c` payloads live on
+    disk for a future consumer to read.
+    """
+
+    schema_version: int = 1
+    run_id: str | None = None
+    status: str
+    """`"completed"` (producer finished, queue drained normally),
+    `"no_targets"` (`IngestionReport.targets` was empty — a valid, non-
+    error outcome), or `"stage3_input_unavailable"` (tree-sitter/
+    tree-sitter-c missing — the producer stopped early; whatever chunks
+    were already queued before that point are still recorded, this is not
+    a hard failure of the run)."""
+    db_subfolder: str
+    chunks: list[ChunkRecord] = Field(default_factory=list)
+    total_chunks: int
+    total_acked: int
+    total_failed: int
+    total_tokens: int
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    started_at: datetime
+    finished_at: datetime | None = None

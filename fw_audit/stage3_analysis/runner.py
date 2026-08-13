@@ -3,7 +3,7 @@
 Registered as the `fw-analyze` console script (see pyproject.toml). Usage:
 
     fw-analyze path/to/stage1_summary.json [--only PATH ...] [--debug]
-        [--debug-chunks] [--chunk-lines N] [--run-id ID]
+        [--debug-chunks] [--chunk-lines N] [--queue] [--run-id ID]
 
 `ingestion_report.json` is always written by `ingest()` itself regardless
 of any debug flag — it's the machine-readable hand-off a future Component 2
@@ -28,17 +28,30 @@ line-count target `chunk_source` accumulates against (default:
 `FWA_STAGE3_CHUNK_LINES` / 1000) — exercised via `--debug-chunks` or a
 direct `chunk_source()` call; `ingest()`'s default (no-flags) path never
 computes chunks, so passing `--chunk-lines` alone has no visible effect.
+
+`--queue` runs Step 4 (`chunk_queue.run_queue()`) after `ingest()`: chunks
+every resolved target, persists each chunk to `<db_subfolder>/stage3/
+chunks/<chunk_id>.c` (the queue's own source of truth — unconditional,
+unlike `--debug-chunks`'s manual dump), drains them through an in-process
+`asyncio.Queue` with `Settings.stage3_queue_workers` concurrent consumers,
+and writes `<db_subfolder>/stage3/stage3_summary.json`. Since Component 2
+(the real LLM agent pool) isn't built yet, this uses a no-op placeholder
+consumer — proves the queue/backpressure/retry/shutdown mechanism works,
+does no actual vulnerability analysis. `main()` stays synchronous except
+for this one flag, bridged via a single `asyncio.run(...)` call.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
 from pathlib import Path
 
 from fw_audit.config.settings import get_settings
 from fw_audit.stage3_analysis import layout
+from fw_audit.stage3_analysis.chunk_queue import run_queue
 from fw_audit.stage3_analysis.errors import Stage3InputError
 from fw_audit.stage3_analysis.ingest import ingest
 from fw_audit.stage3_analysis.models import IngestionReport
@@ -96,6 +109,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Soft line-count limit per chunk (default: FWA_STAGE3_CHUNK_LINES / "
             "1000), consumed by chunk_source. Exercised via --debug-chunks."
+        ),
+    )
+    parser.add_argument(
+        "--queue",
+        action="store_true",
+        help=(
+            "Run Step 4: chunk every resolved target, persist each chunk to "
+            "<db_subfolder>/stage3/chunks/<chunk_id>.c, drain them through an "
+            "asyncio.Queue with a no-op placeholder consumer (Component 2's "
+            "real LLM agent pool isn't built yet), and write "
+            "<db_subfolder>/stage3/stage3_summary.json."
         ),
     )
     parser.add_argument(
@@ -177,6 +201,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Debug source dump: {layout.debug_dir(stage3_dir)}/<bin_id>.c")
     if args.debug_chunks and report.targets:
         print(f"Chunk debug dump: {layout.chunks_dir(stage3_dir)}/<chunk_id>.c")
+
+    if args.queue:
+        summary = asyncio.run(run_queue(report, settings=settings, run_id=args.run_id))
+        print(
+            f"\nQueue: {summary.total_chunks} chunks, {summary.total_acked} acked, "
+            f"{summary.total_failed} failed"
+        )
+        print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
 
     return 1 if not report.targets else 0
 
