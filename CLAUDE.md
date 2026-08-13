@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**fw-audit** — an agentic firmware vulnerability detection system for router firmware. A six-stage pipeline: ingestion → feature extraction → analysis core (clean/chunk/queue) → agentic analysis → sandboxed verification → reporting. Built on **LangGraph** (stateful agent orchestration), **LangChain** (multi-provider LLM abstraction), and **Docker** (sandboxed extraction).
+**fw-audit** — an agentic firmware vulnerability detection system for router firmware. A six-stage pipeline: ingestion → feature extraction (decompile/normalize/clean) → analysis core (chunk/queue) → agentic analysis → sandboxed verification → reporting. Built on **LangGraph** (stateful agent orchestration), **LangChain** (multi-provider LLM abstraction), and **Docker** (sandboxed extraction).
 
-**Current status:** Stages 1–3 are implemented (Stage 3 includes both Component 1 — ingest/clean/chunk/queue — and Component 2 — the LLM vulnerability-analysis worker pool, `stage3_analysis/agent/`). Stages 4–6 are empty placeholder packages.
+**Current status:** Stages 1–3 are implemented. Stage 2 covers Ghidra decompilation plus BOTH normalization targets: Joern-compilable whole-program C and the LLM-facing "clean" function-only extraction (`stage2_extraction/clean/`, tree-sitter-based) — the latter moved here from Stage 3 so it's computed once and persisted, not recomputed on every Stage 3 run. Stage 3 includes both Component 1 — ingest/chunk/queue, reading Stage 2's persisted cleaned artifact — and Component 2 — the LLM vulnerability-analysis worker pool, `stage3_analysis/agent/`. Stages 4–6 are empty placeholder packages.
 
 ## Stage docs — read these first for stage-specific work
 

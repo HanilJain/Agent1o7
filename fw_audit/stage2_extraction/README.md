@@ -13,6 +13,8 @@ load stage1_summary.json + resolve rootfs
   -> decompile each resolved binary with Ghidra Headless
      (bounded concurrency; one binary's failure never sinks the run)
   -> normalize the decompiled C for Joern (whole-program, CPG-compilable)
+  -> clean the decompiled C for LLM consumption (function-only extraction,
+     persisted to cleaned/ — Stage 3's chunking reads this directly)
   -> write stage2_summary.json
 ```
 
@@ -26,7 +28,12 @@ a basename rescan, and dedupes by content hash.
 (non-standard types, `CONCATxy`/`SUBxy` intrinsics, illegal `::` switch
 labels, undeclared register vars). `normalize/` fixes this with a generated
 prelude header (types → `typedef`, intrinsics → `#define`) plus small
-span-aware text passes for what a declaration can't express.
+span-aware text passes for what a declaration can't express. Stage 2
+delivers TWO normalization targets from the same raw C: `normalize/joern/`
+(CPG-compilable, prelude inlined) and `cleaned/` (LLM-facing, function-only
+— every top-level declaration/prelude/thunk-wall stripped, keeping only
+real function bodies; see `clean/`'s module docstring for the real-data
+finding that motivated it).
 
 ## Files
 
@@ -35,7 +42,8 @@ span-aware text passes for what a declaration can't express.
 | `stage1_io.py`, `resolve.py` | Load Stage 1's hand-off, resolve untrusted paths to verified bytes. |
 | `layout.py` | Output-tree path algebra. |
 | `ghidra/command.py`, `ghidra/client.py` | Compose and run the `pyghidraRun -H` invocation. |
-| `normalize/` | Prelude generation, tokenizer, passes, pipeline, report. |
+| `normalize/` | Prelude generation, tokenizer, passes, pipeline (Joern + clean), report. |
+| `clean/` | tree-sitter function-only extraction — the LLM-target output written to `cleaned/` (needs the `stage2` extra, pinned `tree-sitter==0.23.2`/`tree-sitter-c==0.23.2`). |
 | `extract.py` | `run_extraction()` orchestrator. |
 | `runner.py` | `fw-extract` CLI entry point. |
 
@@ -55,8 +63,10 @@ fw-extract data/db/<firmware-stem>/stage1_summary.json --only bin/httpd  # repea
 
 `data/db/<firmware-stem>/stage2/`: `resolution_report.json`,
 `binaries/<bin_id>/raw/`, `binaries/<bin_id>/normalized/joern/whole.c`,
+`binaries/<bin_id>/cleaned/{whole.c,functions.json}` (LLM-target, Stage 3
+reads this — absent for a binary if the `stage2` extra wasn't installed),
 `stage2_summary.json`. Plus a sibling flat mirror tree
-`data/db/<firmware-stem>_decompiled/` for human browsing.
+`data/db/<firmware-stem>_decompiled/` for human browsing (Joern output only).
 
 ## Docker image
 
@@ -84,9 +94,14 @@ isn't apt-installable on Debian bookworm).
 
 ```bash
 pytest -m "not integration" tests/test_stage2_extract.py tests/test_stage2_resolve.py \
-  tests/test_ghidra_client.py tests/test_ghidra_command.py tests/test_normalizer*.py
-pytest -m integration tests/test_stage2_integration.py   # needs the Ghidra image only
+  tests/test_ghidra_client.py tests/test_ghidra_command.py tests/test_normalizer*.py \
+  tests/test_stage2_clean_extract.py tests/test_stage2_layout.py
+pytest -m integration tests/test_stage2_integration.py tests/test_stage2_clean_extract.py
 ```
+
+Cleaning needs the `stage2` extra (`pip install -e ".[stage2]"`); tests
+needing it are gated with `pytest.importorskip("tree_sitter_c")` so the
+rest of the suite stays green without it.
 
 See the [project CLAUDE.md](../../CLAUDE.md) and
 [project README.md](../../README.md) for cross-cutting setup.

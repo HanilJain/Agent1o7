@@ -18,6 +18,11 @@ Layout, under `<db_subfolder>/stage2/`::
       raw/decompiled/{whole.c, whole.h}
       normalized/joern/whole.c
       normalized/normalization_report.json
+      cleaned/whole.c            <- LLM-target function-only extraction,
+                                     concatenated in source order (see
+                                     stage2_extraction.clean)
+      cleaned/functions.json     <- per-function {name, start_line, end_line}
+                                     index, spans relative to cleaned/whole.c
 
 Additionally, as a SIBLING of `<db_subfolder>` (an alternate flat view of
 the normalized Joern C, keyed by rootfs path rather than bin_id, with `.c`
@@ -118,6 +123,24 @@ def normalized_joern_whole_c(bin_dir: Path) -> Path:
 
 def normalization_report_path(bin_dir: Path) -> Path:
     return normalized_dir(bin_dir) / "normalization_report.json"
+
+
+def cleaned_dir(bin_dir: Path) -> Path:
+    return bin_dir / "cleaned"
+
+
+def cleaned_whole_c(bin_dir: Path) -> Path:
+    """Every kept function's cleaned text, concatenated in source order
+    (`ExtractedSource.to_text()`) — see `DecompilationArtifacts.cleaned_c`."""
+    return cleaned_dir(bin_dir) / "whole.c"
+
+
+def cleaned_functions_json(bin_dir: Path) -> Path:
+    """The per-function index needed to slice `cleaned_whole_c` back into
+    individual functions without re-running tree-sitter — see
+    `DecompilationArtifacts.cleaned_index_json` and
+    `stage2_extraction.clean.index`."""
+    return cleaned_dir(bin_dir) / "functions.json"
 
 
 def relative_to_db_subfolder(path: Path, db_subfolder: Path) -> str:

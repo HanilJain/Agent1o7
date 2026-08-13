@@ -17,6 +17,7 @@ from fw_audit.config.settings import Settings
 from fw_audit.stage3_analysis.chunk_queue import ChunkQueue, produce_chunks, run_queue
 from fw_audit.stage3_analysis.ingest import ingest
 from fw_audit.stage3_analysis.models import Chunk, ChunkHandle, ExtractedFunction
+from tests.conftest import write_cleaned_artifact
 
 
 def _chunk(
@@ -240,9 +241,18 @@ def _setup_run(
     source_text: str,
     bin_id: str = "bin_busybox",
     rootfs_path: str = "bin/busybox",
+    with_cleaned_artifact: bool = True,
 ) -> Path:
     """One whitelisted, resolved target whose mirror-tree file holds
-    `source_text`. Mirrors test_stage3_runner.py's `_setup_single_target_run`."""
+    `source_text`. Mirrors test_stage3_runner.py's `_setup_single_target_run`.
+
+    `with_cleaned_artifact=True` (the default) writes a real Stage-2-style
+    `cleaned/whole.c` + `functions.json` for `bin_id` (via
+    `write_cleaned_artifact`, using the actual production extraction code)
+    from `source_text`, and records it in the binary's `artifacts` — what
+    `produce_chunks` now reads instead of re-parsing. Pass `False` to
+    simulate a binary Stage 2 skipped cleaning for (e.g. missing
+    tree-sitter there)."""
     db_subfolder = tmp_path / "db" / "fw"
     stage2_dir = db_subfolder / "stage2"
     stage2_dir.mkdir(parents=True)
@@ -250,6 +260,10 @@ def _setup_run(
     rel_dir = "/".join(rootfs_path.split("/")[:-1])
     (tree_dir / rel_dir).mkdir(parents=True, exist_ok=True)
     (tree_dir / f"{rootfs_path}.c").write_text(source_text, encoding="utf-8")
+
+    cleaned_artifacts = (
+        write_cleaned_artifact(stage2_dir, bin_id, source_text) if with_cleaned_artifact else {}
+    )
 
     summary_path = db_subfolder / "stage1_summary.json"
     summary_path.write_text(
@@ -281,7 +295,10 @@ def _setup_run(
                         "size_bytes": len(source_text.encode("utf-8")),
                         "status": "succeeded",
                         "function_count": 1,
-                        "artifacts": {"decompiled_tree_c": f"{rootfs_path}.c"},
+                        "artifacts": {
+                            "decompiled_tree_c": f"{rootfs_path}.c",
+                            **cleaned_artifacts,
+                        },
                     }
                 ],
                 "started_at": datetime.now(UTC).isoformat(),
@@ -369,28 +386,25 @@ async def test_run_queue_zero_targets_produces_empty_summary_no_hang(tmp_path):
     assert summary.total_chunks == 0
 
 
-async def test_run_queue_tree_sitter_missing_degrades_gracefully(tmp_path, monkeypatch, caplog):
-    import sys
-
-    monkeypatch.setitem(sys.modules, "tree_sitter", None)
-    monkeypatch.setitem(sys.modules, "tree_sitter_c", None)
-    from fw_audit.stage3_analysis.clean import parser as parser_module
-
-    parser_module.get_parser.cache_clear()
-
-    summary_path = _setup_run(tmp_path, source_text="int main(void) { return 0; }\n")
+async def test_run_queue_no_cleaned_artifact_degrades_gracefully(tmp_path, caplog):
+    """A binary Stage 2 skipped cleaning for (e.g. `tree-sitter`/
+    `tree-sitter-c` wasn't installed there) must not crash the queue —
+    `produce_chunks` skips that one target with a warning; with only one
+    target total, that means zero chunks and `stage3_input_unavailable`
+    (see `_build_summary`'s status logic: EVERY target had nothing to
+    chunk)."""
+    summary_path = _setup_run(
+        tmp_path, source_text="int main(void) { return 0; }\n", with_cleaned_artifact=False
+    )
     report = ingest(stage1_summary_path=summary_path)
     settings = Settings(_env_file=None)
 
-    try:
-        with caplog.at_level("WARNING", logger="fw_audit.stage3_analysis"):
-            summary = await asyncio.wait_for(run_queue(report, settings=settings), timeout=2.0)
-    finally:
-        parser_module.get_parser.cache_clear()
+    with caplog.at_level("WARNING", logger="fw_audit.stage3_analysis"):
+        summary = await asyncio.wait_for(run_queue(report, settings=settings), timeout=2.0)
 
     assert summary.status == "stage3_input_unavailable"
     assert summary.total_chunks == 0
-    assert any("queue producer stopped" in w for w in summary.warnings)
+    assert any("no cleaned artifact recorded" in w for w in summary.warnings)
 
 
 async def test_run_queue_consumer_that_fails_then_succeeds_retries_via_nack(tmp_path):

@@ -73,10 +73,20 @@ class NormalizationReport:
     against real Ghidra metadata or degraded to `EMPTY_CONTEXT` (e.g.
     because `metadata.json` was missing or failed to parse)."""
     joern_whole_c: NormalizationResult | None = None
+    cleaned_whole_c: NormalizationResult | None = None
+    """The `build_clean_pipeline()` pass's effect on `raw/decompiled/
+    whole.c`, BEFORE `clean.extract.extract_functions`'s function-only
+    filter runs on top of it — `.text` here is an intermediate, not what
+    ends up in `cleaned/whole.c` (which is `ExtractedSource.to_text()`,
+    the filtered/concatenated result). `None` if cleaning didn't run for
+    this binary (see `DecompiledBinary.warnings`)."""
 
     def to_json_dict(self) -> dict:
         return {
             "bin_id": self.bin_id,
             "context_summary": dict(self.context_summary),
             "joern_whole_c": self.joern_whole_c.to_json_dict() if self.joern_whole_c else None,
+            "cleaned_whole_c": self.cleaned_whole_c.to_json_dict()
+            if self.cleaned_whole_c
+            else None,
         }

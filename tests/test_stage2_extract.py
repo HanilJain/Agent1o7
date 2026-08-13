@@ -435,6 +435,151 @@ async def test_thunk_stub_becomes_extern_declaration_in_delivered_output(
 
 
 # --------------------------------------------------------------------- #
+# cleaned/ — the LLM-target function-only extraction (moved into Stage 2
+# from Stage 3, persisted so it's no longer recomputed on every Stage 3 run).
+# --------------------------------------------------------------------- #
+
+
+async def test_cleaned_artifact_written_with_relative_paths(
+    tmp_path, synthetic_elf_bytes, fake_executor, monkeypatch
+):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_stage1(
+        tmp_path, binaries=[{"path": "bin/a"}], elf_bytes=synthetic_elf_bytes
+    )
+
+    def on_run(command, files):
+        _write_metadata(_host_out_dir(command, files))
+        return None
+
+    _patch_ghidra_executor(monkeypatch, fake_executor(on_run))
+
+    summary = await run_extraction(
+        stage1_summary_path=summary_path, settings=Settings(_env_file=None)
+    )
+
+    binary = summary.binaries[0]
+    assert binary.artifacts.cleaned_c is not None
+    assert binary.artifacts.cleaned_index_json is not None
+    assert not Path(binary.artifacts.cleaned_c).is_absolute()
+    assert not Path(binary.artifacts.cleaned_index_json).is_absolute()
+
+    cleaned_c_path = Path(summary.db_subfolder) / binary.artifacts.cleaned_c
+    index_path = Path(summary.db_subfolder) / binary.artifacts.cleaned_index_json
+    assert cleaned_c_path.is_file()
+    assert index_path.is_file()
+
+    cleaned_text = cleaned_c_path.read_text(encoding="utf-8")
+    assert "main" in cleaned_text
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["bin_id"] == binary.bin_id
+    assert len(index["functions"]) == binary.cleaned_function_count
+    for entry in index["functions"]:
+        assert set(entry.keys()) == {"name", "start_line", "end_line"}
+
+
+async def test_cleaned_function_count_and_dropped_line_count_populated(
+    tmp_path, synthetic_elf_bytes, fake_executor, monkeypatch
+):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_stage1(
+        tmp_path, binaries=[{"path": "bin/a"}], elf_bytes=synthetic_elf_bytes
+    )
+
+    def on_run(command, files):
+        _write_metadata(_host_out_dir(command, files))
+        return None
+
+    _patch_ghidra_executor(monkeypatch, fake_executor(on_run))
+
+    summary = await run_extraction(
+        stage1_summary_path=summary_path, settings=Settings(_env_file=None)
+    )
+
+    binary = summary.binaries[0]
+    assert binary.cleaned_function_count == 1  # the fixture's one `main`
+    assert binary.dropped_line_count >= 0
+
+
+async def test_cleaned_index_spans_slice_back_to_identical_function_text(
+    tmp_path, synthetic_elf_bytes, fake_executor, monkeypatch
+):
+    """The critical invariant: every recorded span must slice `cleaned/
+    whole.c` back to exactly the function it names -- what `stage3_
+    analysis.cleaned_io.load_cleaned_source` relies on."""
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_stage1(
+        tmp_path, binaries=[{"path": "bin/a"}], elf_bytes=synthetic_elf_bytes
+    )
+
+    def on_run(command, files):
+        _write_metadata_with_thunk(_host_out_dir(command, files))
+        return None
+
+    _patch_ghidra_executor(monkeypatch, fake_executor(on_run))
+
+    summary = await run_extraction(
+        stage1_summary_path=summary_path, settings=Settings(_env_file=None)
+    )
+
+    binary = summary.binaries[0]
+    cleaned_c_path = Path(summary.db_subfolder) / binary.artifacts.cleaned_c
+    index_path = Path(summary.db_subfolder) / binary.artifacts.cleaned_index_json
+
+    lines = cleaned_c_path.read_text(encoding="utf-8").split("\n")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["functions"]  # the fixture has real functions to check
+    for entry in index["functions"]:
+        sliced = "\n".join(lines[entry["start_line"] - 1 : entry["end_line"]])
+        assert entry["name"] in sliced
+
+
+async def test_cleaning_missing_tree_sitter_degrades_gracefully(
+    tmp_path, synthetic_elf_bytes, fake_executor, monkeypatch
+):
+    """Cleaning must not fail the whole Stage 2 run when `tree-sitter`/
+    `tree-sitter-c` (the `stage2` extra) aren't installed -- the Joern
+    artifact and stage2_summary.json still succeed, only the cleaned
+    artifact is skipped for that binary, with a warning recorded in
+    `Stage2Summary.warnings` (best-effort, same discipline as a mirror-write
+    failure -- not routed through `logging`)."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "tree_sitter", None)
+    monkeypatch.setitem(sys.modules, "tree_sitter_c", None)
+    from fw_audit.stage2_extraction.clean import parser as parser_module
+
+    parser_module.get_parser.cache_clear()
+
+    summary_path = _setup_stage1(
+        tmp_path, binaries=[{"path": "bin/a"}], elf_bytes=synthetic_elf_bytes
+    )
+
+    def on_run(command, files):
+        _write_metadata(_host_out_dir(command, files))
+        return None
+
+    _patch_ghidra_executor(monkeypatch, fake_executor(on_run))
+
+    try:
+        summary = await run_extraction(
+            stage1_summary_path=summary_path, settings=Settings(_env_file=None)
+        )
+    finally:
+        parser_module.get_parser.cache_clear()
+
+    assert summary.status == ExtractionStatus.COMPLETED
+    binary = summary.binaries[0]
+    assert binary.status == DecompilationStatus.SUCCEEDED
+    assert binary.artifacts.cleaned_c is None
+    assert binary.artifacts.cleaned_index_json is None
+    # The Joern artifact is unaffected -- cleaning is a sibling, not a dependency.
+    assert binary.artifacts.normalized_joern_c is not None
+    assert any("cleaning skipped" in w for w in summary.warnings)
+
+
+# --------------------------------------------------------------------- #
 # normalized/normalization_report.json — the per-pass audit trail.
 # --------------------------------------------------------------------- #
 

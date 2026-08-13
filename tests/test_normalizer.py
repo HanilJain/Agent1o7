@@ -17,7 +17,9 @@ import pytest
 from fw_audit.stage2_extraction.normalize import passes
 from fw_audit.stage2_extraction.normalize.context import EMPTY_CONTEXT, BinaryContext, build_context
 from fw_audit.stage2_extraction.normalize.pipeline import (
+    CLEAN_PIPELINE,
     JOERN_PIPELINE,
+    build_clean_pipeline,
     build_joern_pipeline,
     normalize,
 )
@@ -486,6 +488,52 @@ def test_pipeline_constants_match_factory_defaults():
     `EMPTY_CONTEXT` case) — this pins that relationship so it can never
     silently drift apart."""
     assert [p.name for p in JOERN_PIPELINE] == [p.name for p in build_joern_pipeline()]
+
+
+def test_clean_pipeline_constant_matches_factory_default():
+    """`CLEAN_PIPELINE` is the LLM-target sibling of `JOERN_PIPELINE`,
+    same guard against drifting from `build_clean_pipeline()`'s own
+    default."""
+    assert [p.name for p in CLEAN_PIPELINE] == [p.name for p in build_clean_pipeline()]
+
+
+def test_clean_pipeline_shares_head_and_body_passes_with_joern():
+    """`build_clean_pipeline` reuses `_head_passes`/`_body_passes`/
+    `_tail_passes` verbatim (see `pipeline.py`'s module docstring) —
+    the two pipelines must differ ONLY in their three target-specific
+    passes (warnings/prelude/halt), never in the shared ones, and must
+    stay the same LENGTH (one warnings + one prelude + one halt pass
+    each)."""
+    joern_names = [p.name for p in build_joern_pipeline()]
+    clean_names = [p.name for p in build_clean_pipeline()]
+    assert len(joern_names) == len(clean_names)
+
+    shared = {
+        "normalize_line_endings",
+        "strip_calling_conventions",
+        "fix_illegal_array_declarations",
+        "fix_illegal_switch_labels",
+        "replace_thunk_bodies",
+        "declare_register_vars",
+        "collapse_redundant_casts",
+        "dedupe_type_definitions",
+        "dedupe_global_declarations",
+        "drop_conflicting_builtin_decls",
+        "collapse_blank_lines",
+    }
+    assert shared <= set(joern_names)
+    assert shared <= set(clean_names)
+
+
+def test_clean_pipeline_does_not_inline_prelude_or_rewrite_halt_baddata():
+    """The clean pipeline's whole reason for a no-op prelude/halt pass:
+    an LLM reader needs neither `ghidra_types.h` inlined (the function-only
+    filter downstream discards it anyway) nor the Joern-specific
+    `halt_baddata()` rewrite."""
+    text = "void f(void)\n{\n  halt_baddata();\n}\n"
+    result = normalize(text, build_clean_pipeline())
+    assert "FW_AUDIT_GHIDRA_TYPES_H" not in result.text
+    assert "halt_baddata()" in result.text
 
 
 # --------------------------------------------------------------------- #

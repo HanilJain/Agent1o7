@@ -52,11 +52,9 @@ from pathlib import Path
 
 from fw_audit.common.schemas import ChunkRecord, Stage3Summary
 from fw_audit.config.settings import Settings
-from fw_audit.stage2_extraction.normalize.context import build_context
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.chunk.strategy import chunk_source
-from fw_audit.stage3_analysis.clean.extract import extract_functions
-from fw_audit.stage3_analysis.errors import Stage3InputError
+from fw_audit.stage3_analysis.cleaned_io import load_cleaned_source
 from fw_audit.stage3_analysis.models import Chunk, ChunkHandle, IngestionReport
 
 logger = logging.getLogger("fw_audit.stage3_analysis")
@@ -210,36 +208,45 @@ async def _worker(queue: ChunkQueue, consumer: Consumer) -> None:
 async def produce_chunks(
     report: IngestionReport, settings: Settings, queue: ChunkQueue
 ) -> list[str]:
-    """For each `Target` in `report.targets`: read its source, build a
-    `BinaryContext`, `extract_functions()`, `chunk_source()` (using
-    `settings.stage3_chunk_lines`/`stage3_max_chunk_lines`), and
-    `queue.put()` every resulting `Chunk`. `queue.close()` ALWAYS runs
-    (via `finally`) so spawned consumers never hang waiting for a
-    sentinel that never comes, even if this stops early.
+    """For each `Target` in `report.targets`: load Stage 2's persisted
+    cleaned artifact (`cleaned_io.load_cleaned_source` — no re-parsing,
+    unlike the former in-memory `extract_functions()` call this replaced),
+    `chunk_source()` (using `settings.stage3_chunk_lines`/
+    `stage3_max_chunk_lines`), and `queue.put()` every resulting `Chunk`.
+    `queue.close()` ALWAYS runs (via `finally`) so spawned consumers never
+    hang waiting for a sentinel that never comes, even if this stops early.
 
-    Degrades exactly like `ingest.py`'s existing debug writers:
-    `Stage3InputError` (tree-sitter/tree-sitter-c missing) is caught ONCE
-    per call, not once per target — tree-sitter absence is process-wide,
-    not per-binary. Returns the warnings accumulated (empty list if none),
-    for the caller to fold into `Stage3Summary`.
+    A `Target` with no `cleaned_source_path`/`cleaned_index_path` (Stage 2
+    skipped cleaning for it) is skipped individually with a warning —
+    unlike the old process-wide `Stage3InputError` short-circuit (missing
+    tree-sitter used to abort every remaining target at once), a missing
+    artifact for one binary says nothing about any other's, since Stage 2
+    now decides cleaning availability per binary, not process-wide.
+    Returns the warnings accumulated (empty list if none), for the caller
+    to fold into `Stage3Summary`.
     """
     warnings: list[str] = []
     try:
         if not report.targets:
             return warnings
         for target in report.targets:
-            try:
-                text = target.source_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            try:
-                context = build_context(target.functions)
-                source = extract_functions(text, bin_id=target.bin_id, context=context)
-            except Stage3InputError as exc:
-                msg = f"queue producer stopped: {exc}"
+            if target.cleaned_source_path is None or target.cleaned_index_path is None:
+                msg = (
+                    f"chunking skipped for {target.bin_id}: no cleaned artifact recorded "
+                    "(Stage 2 may have skipped cleaning for this binary)"
+                )
                 logger.warning(msg)
                 warnings.append(msg)
-                break
+                continue
+            try:
+                source = load_cleaned_source(
+                    target.cleaned_source_path, target.cleaned_index_path
+                )
+            except (OSError, ValueError) as exc:
+                msg = f"chunking skipped for {target.bin_id}: {exc}"
+                logger.warning(msg)
+                warnings.append(msg)
+                continue
             chunks = chunk_source(
                 source,
                 bin_id=target.bin_id,
@@ -320,7 +327,13 @@ def _build_summary(
 ) -> Stage3Summary:
     if not report.targets:
         status = "no_targets"
-    elif warnings:
+    elif warnings and not queue.produced:
+        # Every target hit a missing/unreadable cleaned artifact — the
+        # process-wide analog of the old "tree-sitter not installed"
+        # short-circuit, just detected per-target now that Stage 2 decides
+        # cleaning availability per binary rather than once for the whole
+        # process. A run where SOME targets chunked fine despite a few
+        # skips is "completed" (with warnings), not this.
         status = "stage3_input_unavailable"
     else:
         status = "completed"

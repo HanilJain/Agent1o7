@@ -1,16 +1,18 @@
 # fw-audit — Agentic Firmware Vulnerability Detection System
 
 A six-stage agentic pipeline for automated router-firmware vulnerability
-auditing: ingestion → feature extraction → analysis core (clean/chunk/queue)
-→ agentic analysis → sandboxed verification → reporting. Built on
-**LangGraph** (stateful agent orchestration), **LangChain** (unified LLM
-abstraction), and **Docker** (sandboxed extraction).
+auditing: ingestion → feature extraction (decompile + normalize + clean)
+→ analysis core (chunk/queue) → agentic analysis → sandboxed verification →
+reporting. Built on **LangGraph** (stateful agent orchestration),
+**LangChain** (unified LLM abstraction), and **Docker** (sandboxed
+extraction).
 
-**Current status:** Stage 1 (Ingestion), Stage 2 (Feature Extraction), and
-Stage 3 (Analysis Core — both Component 1's ingest/clean/chunk/queue and
-Component 2's LLM vulnerability-analysis worker pool) are implemented.
-Stages 4–6 are scaffolded as empty sub-packages
-(`fw_audit/stage4_analysis/` … `fw_audit/stage6_reporting/`).
+**Current status:** Stage 1 (Ingestion), Stage 2 (Feature Extraction —
+including the LLM-facing "clean" function-only extraction), and Stage 3
+(Analysis Core — both Component 1's ingest/chunk/queue and Component 2's
+LLM vulnerability-analysis worker pool) are implemented. Stages 4–6 are
+scaffolded as empty sub-packages (`fw_audit/stage4_analysis/` …
+`fw_audit/stage6_reporting/`).
 
 ## Stage documentation
 
@@ -40,9 +42,10 @@ cross-stage schemas) — this file covers setup, layout, and pointers.
   (LLM, zero execution rights) reads the resulting `tree.txt` and shortlists
   binaries worth deeper analysis.
 - **Stage 2** is fully deterministic (no LLM) — it decompiles Stage 1's
-  shortlist with Ghidra Headless and normalizes the output into
-  Joern-compilable whole-program C.
-- **Stage 3** cleans that C down to function-only text, chunks it along
+  shortlist with Ghidra Headless and delivers TWO normalization targets
+  from the same raw C: Joern-compilable whole-program C, and LLM-facing
+  function-only text (persisted to `cleaned/`, tree-sitter-based).
+- **Stage 3** reads Stage 2's persisted cleaned text, chunks it along
   function boundaries, queues the chunks through an in-process
   `asyncio.Queue`, and runs each through an LLM vulnerability analyst,
   producing validated findings per chunk.

@@ -5,8 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fw_audit.common.schemas import (
+    DecompilationArtifacts,
     DecompilationStatus,
     DecompiledBinary,
+    ExtractedFunction,
+    ExtractedSource,
     ExtractionStatus,
     Stage1Summary,
     Stage2Summary,
@@ -71,3 +74,60 @@ def test_stage2_summary_round_trips():
     restored = Stage2Summary.model_validate(dumped)
     assert restored.binaries[0].bin_id == "bin_httpd__abc123def456"
     assert restored.status == ExtractionStatus.COMPLETED
+
+
+def test_decompiled_binary_round_trips_cleaned_artifact_fields():
+    binary = DecompiledBinary(
+        bin_id="bin_httpd__abc123def456",
+        rootfs_path="bin/httpd",
+        requested_path="bin/httpd",
+        sha256="a" * 64,
+        size_bytes=1024,
+        status=DecompilationStatus.SUCCEEDED,
+        cleaned_function_count=12,
+        dropped_line_count=340,
+        artifacts=DecompilationArtifacts(
+            cleaned_c="stage2/binaries/bin_httpd__abc123def456/cleaned/whole.c",
+            cleaned_index_json="stage2/binaries/bin_httpd__abc123def456/cleaned/functions.json",
+        ),
+    )
+    restored = DecompiledBinary.model_validate(binary.model_dump(mode="json"))
+
+    assert restored.cleaned_function_count == 12
+    assert restored.dropped_line_count == 340
+    assert restored.artifacts.cleaned_c == binary.artifacts.cleaned_c
+    assert restored.artifacts.cleaned_index_json == binary.artifacts.cleaned_index_json
+
+
+def test_decompiled_binary_cleaned_fields_default_to_zero_and_none():
+    """An old summary written before cleaning existed — additive fields
+    only, `schema_version` stays 1 (same precedent as `decompiled_tree_dir`)."""
+    binary = DecompiledBinary(
+        bin_id="bin_httpd__abc123def456",
+        rootfs_path="bin/httpd",
+        requested_path="bin/httpd",
+        sha256="a" * 64,
+        size_bytes=1024,
+        status=DecompilationStatus.SUCCEEDED,
+    )
+    assert binary.cleaned_function_count == 0
+    assert binary.dropped_line_count == 0
+    assert binary.artifacts.cleaned_c is None
+    assert binary.artifacts.cleaned_index_json is None
+
+
+def test_extracted_source_round_trips_and_to_text():
+    source = ExtractedSource(
+        bin_id="bin_httpd",
+        functions=(
+            ExtractedFunction(name="a", start_line=1, end_line=3, text="int a(void)\n{\n}"),
+            ExtractedFunction(name="b", start_line=5, end_line=7, text="int b(void)\n{\n}"),
+        ),
+        total_lines=10,
+        dropped_line_count=4,
+    )
+    restored = ExtractedSource.model_validate(source.model_dump(mode="json"))
+
+    assert restored.to_text() == source.to_text()
+    assert [f.name for f in restored.functions] == ["a", "b"]
+    assert restored.dropped_line_count == 4

@@ -9,6 +9,10 @@ from pathlib import Path
 import pytest
 
 from fw_audit.stage2_extraction.layout import (
+    binary_dir,
+    cleaned_dir,
+    cleaned_functions_json,
+    cleaned_whole_c,
     decompiled_tree_dir,
     decompiled_tree_file,
     is_contained,
@@ -88,6 +92,15 @@ def test_is_contained_rejects_traversal(tmp_path, rootfs_rel):
     candidate = decompiled_tree_file(parent, rootfs_rel)
 
     assert is_contained(candidate, parent) is False
+
+
+def test_cleaned_paths_nest_under_binary_dir(tmp_path):
+    stage2_dir = tmp_path / "stage2"
+    bin_dir = binary_dir(stage2_dir, "sbin_wpasupp__b86e5cadc3c9")
+
+    assert cleaned_dir(bin_dir) == bin_dir / "cleaned"
+    assert cleaned_whole_c(bin_dir) == bin_dir / "cleaned" / "whole.c"
+    assert cleaned_functions_json(bin_dir) == bin_dir / "cleaned" / "functions.json"
 
 
 def test_is_contained_same_drive_letter_literal_stays_contained(tmp_path):

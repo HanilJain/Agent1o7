@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from fw_audit.stage3_analysis.runner import _parse_args, main
+from tests.conftest import write_cleaned_artifact
 
 
 def _setup_single_target_run(tmp_path: Path, *, source_text: str) -> Path:
@@ -22,6 +23,8 @@ def _setup_single_target_run(tmp_path: Path, *, source_text: str) -> Path:
     tree_dir = tmp_path / "db" / "fw_decompiled"
     (tree_dir / "bin").mkdir(parents=True)
     (tree_dir / "bin" / "busybox.c").write_text(source_text, encoding="utf-8")
+
+    cleaned_artifacts = write_cleaned_artifact(stage2_dir, "bin_busybox", source_text)
 
     summary_path = db_subfolder / "stage1_summary.json"
     summary_path.write_text(
@@ -53,7 +56,10 @@ def _setup_single_target_run(tmp_path: Path, *, source_text: str) -> Path:
                         "size_bytes": len(source_text.encode("utf-8")),
                         "status": "succeeded",
                         "function_count": 1,
-                        "artifacts": {"decompiled_tree_c": "bin/busybox.c"},
+                        "artifacts": {
+                            "decompiled_tree_c": "bin/busybox.c",
+                            **cleaned_artifacts,
+                        },
                     }
                 ],
                 "started_at": "2026-01-01T00:00:00Z",

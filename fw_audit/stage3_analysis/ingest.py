@@ -27,23 +27,25 @@ Reason codes recorded in `SkippedTarget.reason`, extending
 When `settings.stage3_debug_dump` is true (the CLI's `--debug` flag threads
 this through), `ingest()` additionally writes a verbatim copy of every
 `Target`'s resolved source under `stage3/debug/<bin_id>.c` — purely for
-manual testing/verification that Step 1 picked the right file — and, if
-`tree-sitter`/`tree-sitter-c` are installed (the `stage3` extra), Step 2's
-function-only extraction of that same source under
+manual testing/verification that Step 1 picked the right file — and a
+copy of Stage 2's persisted cleaned artifact (`cleaned/whole.c`) under
 `stage3/debug/<bin_id>.cleaned.c`. Both are the ONE exception to "never
 writes into stage2/ or the mirror tree" in the sense that they read from
-the mirror tree, but the write itself still only ever lands under Stage
-3's own `stage3/debug/` directory. Missing the `stage3` extra degrades
-gracefully — a single warning is logged and the cleaned dump is skipped;
-the raw dump and `ingestion_report.json` are unaffected.
+Stage 2's output, but the write itself still only ever lands under Stage
+3's own `stage3/debug/` directory. A `Target` with no recorded cleaned
+artifact (Stage 2 skipped cleaning — e.g. the `stage2` extra wasn't
+installed there) degrades gracefully — a warning is logged and the
+cleaned dump is skipped for that target; the raw dump and
+`ingestion_report.json` are unaffected.
 
 Independently, when `settings.stage3_chunk_debug_dump` is true (the CLI's
-`--debug-chunks` flag), `ingest()` chunks every `Target`'s function-only
-extraction via `chunk.strategy.chunk_source` and writes one file per
-`Chunk` under `stage3/chunks/<chunk_id>.c`. This is a SEPARATE flag from
+`--debug-chunks` flag), `ingest()` chunks every `Target`'s cleaned source
+(loaded via `stage3_analysis.cleaned_io`, NOT re-parsed) via
+`chunk.strategy.chunk_source` and writes one file per `Chunk` under
+`stage3/chunks/<chunk_id>.c`. This is a SEPARATE flag from
 `stage3_debug_dump` above — either may be set alone or together — since
 dumping chunk payloads and dumping raw/cleaned source answer different
-questions. Same missing-`stage3`-extra degradation as the cleaned dump.
+questions. Same missing-cleaned-artifact degradation as the cleaned dump.
 """
 
 from __future__ import annotations
@@ -54,12 +56,10 @@ from pathlib import Path
 
 from fw_audit.common.schemas import DecompilationStatus, DecompiledBinary
 from fw_audit.config.settings import Settings, get_settings
-from fw_audit.stage2_extraction.normalize.context import build_context
 from fw_audit.stage2_extraction.stage1_io import load_stage1_summary
 from fw_audit.stage3_analysis import discover, layout
 from fw_audit.stage3_analysis.chunk.strategy import chunk_source
-from fw_audit.stage3_analysis.clean.extract import extract_functions
-from fw_audit.stage3_analysis.errors import Stage3InputError
+from fw_audit.stage3_analysis.cleaned_io import load_cleaned_source, resolve_cleaned_paths
 from fw_audit.stage3_analysis.models import IngestionReport, SkippedTarget, Target
 from fw_audit.stage3_analysis.stage2_io import (
     load_stage2_summary,
@@ -102,11 +102,12 @@ def ingest(
     whitelist = build_whitelist(stage1, only)
     join_result = join_targets(whitelist, stage2)
 
+    db_subfolder = Path(stage1.db_subfolder)
     targets: list[Target] = []
     skipped: list[SkippedTarget] = list(join_result.skipped)
 
     for binary in join_result.matched:
-        target, skip = _resolve_target(binary, tree_dir)
+        target, skip = _resolve_target(binary, tree_dir, db_subfolder)
         if target is not None:
             targets.append(target)
         else:
@@ -119,7 +120,6 @@ def ingest(
         sorted(p.relative_to(tree_dir).as_posix() for p in all_tree_files if p not in claimed)
     )
 
-    db_subfolder = Path(stage1.db_subfolder)
     report = IngestionReport(
         db_subfolder=db_subfolder,
         decompiled_tree_dir=tree_dir,
@@ -139,12 +139,17 @@ def ingest(
 
 
 def _resolve_target(
-    binary: DecompiledBinary, tree_dir: Path
+    binary: DecompiledBinary, tree_dir: Path, db_subfolder: Path
 ) -> tuple[Target | None, SkippedTarget | None]:
     """One matched Stage 2 binary -> `(Target, None)` or `(None, SkippedTarget)`.
 
     Never raises: any problem here is reported, not propagated, per this
-    module's failure contract."""
+    module's failure contract. A missing cleaned artifact (Stage 2 skipped
+    cleaning for this binary) does NOT skip the target — `source_path`
+    (the raw mirror file) is still valid for `--debug`'s raw dump and
+    orphan accounting; `Target.cleaned_source_path`/`cleaned_index_path`
+    simply stay `None`, and cleaning-dependent steps (the cleaned debug
+    dump, chunking) skip that one target on their own, separately."""
     if binary.status not in _USABLE_STATUSES:
         return None, SkippedTarget(
             requested_path=binary.requested_path,
@@ -176,6 +181,9 @@ def _resolve_target(
             detail=str(source_path),
         )
 
+    cleaned_paths = resolve_cleaned_paths(binary, db_subfolder)
+    cleaned_source_path, cleaned_index_path = cleaned_paths if cleaned_paths else (None, None)
+
     target = Target(
         bin_id=binary.bin_id,
         rootfs_path=binary.rootfs_path,
@@ -187,7 +195,8 @@ def _resolve_target(
         size_bytes=size_bytes,
         status=binary.status,
         function_count=binary.function_count,
-        functions=tuple(binary.functions),
+        cleaned_source_path=cleaned_source_path,
+        cleaned_index_path=cleaned_index_path,
     )
     return target, None
 
@@ -233,16 +242,17 @@ def _write_debug_sources(report: IngestionReport) -> None:
 
 
 def _write_cleaned_debug_sources(report: IngestionReport) -> None:
-    """`--debug`/`FWA_STAGE3_DEBUG_DUMP` only: write each `Target`'s
-    function-only extraction (Step 2's `clean.extract.extract_functions`)
-    to `stage3/debug/<bin_id>.cleaned.c` — additive to the raw dump
+    """`--debug`/`FWA_STAGE3_DEBUG_DUMP` only: copy each `Target`'s
+    Stage-2-persisted cleaned artifact (`cleaned/whole.c`) to
+    `stage3/debug/<bin_id>.cleaned.c` — additive to the raw dump
     `_write_debug_sources` already wrote, never replacing it.
 
-    Degrades gracefully if `tree-sitter`/`tree-sitter-c` (the `stage3`
-    extra) aren't installed: `extract_functions` raises `Stage3InputError`
-    from `clean.parser.get_parser()` in that case, caught here once per
-    call (not once per target — no point re-attempting a known-missing
-    import 2,000 times) with a single warning logged. The raw dump and
+    A `Target` with no `cleaned_source_path` (Stage 2 skipped cleaning for
+    it — `tree-sitter`/`tree-sitter-c`, the `stage2` extra, wasn't
+    installed there) is skipped individually with a warning, per-target —
+    unlike the old re-parsing version of this function, a missing cleaned
+    artifact for ONE binary says nothing about any other binary's, so
+    there's no reason to abandon the whole loop early. The raw dump and
     `ingestion_report.json` must keep working unconditionally either way.
     """
     if not report.targets:
@@ -254,46 +264,49 @@ def _write_cleaned_debug_sources(report: IngestionReport) -> None:
         return
 
     for target in report.targets:
-        try:
-            text = target.source_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        if target.cleaned_source_path is None:
+            logger.warning(
+                "cleaned debug dump skipped for %s: no cleaned artifact recorded "
+                "(Stage 2 may have skipped cleaning for this binary)",
+                target.bin_id,
+            )
             continue
         try:
-            context = build_context(target.functions)
-            result = extract_functions(text, bin_id=target.bin_id, context=context)
-        except Stage3InputError as exc:
-            logger.warning("cleaned debug dump skipped: %s", exc)
-            return
+            cleaned_text = target.cleaned_source_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            continue
         dest = layout.debug_cleaned_source_path(debug_dir, target.bin_id)
         try:
-            dest.write_text(result.to_text(), encoding="utf-8")
+            dest.write_text(cleaned_text, encoding="utf-8")
         except OSError:
             continue
 
 
 def _write_chunk_debug_sources(report: IngestionReport, settings: Settings) -> None:
     """`--debug-chunks`/`FWA_STAGE3_CHUNK_DEBUG_DUMP` only: chunk each
-    `Target`'s function-only extraction (Step 2's `clean.extract.
-    extract_functions`) via `chunk.strategy.chunk_source`, then write one
-    file per `Chunk` to `stage3/chunks/<chunk_id>.c` (via `layout.
-    chunks_dir()`/`layout.chunk_filename()`).
+    `Target`'s Stage-2-persisted cleaned artifact (loaded via
+    `cleaned_io.load_cleaned_source`, not re-parsed) via `chunk.strategy.
+    chunk_source`, then write one file per `Chunk` to
+    `stage3/chunks/<chunk_id>.c` (via `layout.chunks_dir()`/
+    `layout.chunk_filename()`).
 
     Independent of `settings.stage3_debug_dump` — see `Settings.
     stage3_chunk_debug_dump`'s docstring for why these are two separate
-    flags. Re-parses/re-extracts each target's source independently of
+    flags. Loads each target's cleaned source independently of
     `_write_cleaned_debug_sources` rather than sharing its result: both
     functions are best-effort and independently gated, and either may run
     alone or together in the same `ingest()` call depending on which
     flags the caller passed — sharing state between them would couple two
     paths that each need to keep working correctly in isolation. The
-    re-parse cost is the same order of magnitude as
-    `_write_cleaned_debug_sources`'s own (one `extract_functions` call per
-    target), not a new scaling concern.
+    reload cost is cheap (two file reads, no parsing) unlike the old
+    re-parsing version of this function.
 
-    Degrades gracefully exactly like `_write_cleaned_debug_sources`:
-    `extract_functions` raises `Stage3InputError` once tree-sitter/
-    tree-sitter-c aren't installed, caught here once per call (not once
-    per target), with a single warning logged. The raw dump, cleaned
+    A `Target` with no `cleaned_source_path`/`cleaned_index_path` (Stage 2
+    skipped cleaning for it) is skipped individually with a warning,
+    per-target — not a whole-run abandonment, since a missing artifact for
+    one binary says nothing about any other's. The raw dump, cleaned
     dump, and `ingestion_report.json` must keep working unconditionally
     either way.
     """
@@ -306,16 +319,18 @@ def _write_chunk_debug_sources(report: IngestionReport, settings: Settings) -> N
         return
 
     for target in report.targets:
-        try:
-            text = target.source_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        if target.cleaned_source_path is None or target.cleaned_index_path is None:
+            logger.warning(
+                "chunk debug dump skipped for %s: no cleaned artifact recorded "
+                "(Stage 2 may have skipped cleaning for this binary)",
+                target.bin_id,
+            )
             continue
         try:
-            context = build_context(target.functions)
-            source = extract_functions(text, bin_id=target.bin_id, context=context)
-        except Stage3InputError as exc:
-            logger.warning("chunk debug dump skipped: %s", exc)
-            return
+            source = load_cleaned_source(target.cleaned_source_path, target.cleaned_index_path)
+        except (OSError, ValueError) as exc:
+            logger.warning("chunk debug dump skipped for %s: %s", target.bin_id, exc)
+            continue
         chunks = chunk_source(
             source,
             bin_id=target.bin_id,

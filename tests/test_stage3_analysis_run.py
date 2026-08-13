@@ -21,6 +21,7 @@ from fw_audit.stage3_analysis.agent.orchestrator import (
     run_analysis,
 )
 from fw_audit.stage3_analysis.ingest import ingest
+from tests.conftest import write_cleaned_artifact
 
 
 def _setup_run(
@@ -38,6 +39,8 @@ def _setup_run(
     rel_dir = "/".join(rootfs_path.split("/")[:-1])
     (tree_dir / rel_dir).mkdir(parents=True, exist_ok=True)
     (tree_dir / f"{rootfs_path}.c").write_text(source_text, encoding="utf-8")
+
+    cleaned_artifacts = write_cleaned_artifact(stage2_dir, bin_id, source_text)
 
     summary_path = db_subfolder / "stage1_summary.json"
     summary_path.write_text(
@@ -69,7 +72,10 @@ def _setup_run(
                         "size_bytes": len(source_text.encode("utf-8")),
                         "status": "succeeded",
                         "function_count": 1,
-                        "artifacts": {"decompiled_tree_c": f"{rootfs_path}.c"},
+                        "artifacts": {
+                            "decompiled_tree_c": f"{rootfs_path}.c",
+                            **cleaned_artifacts,
+                        },
                     }
                 ],
                 "started_at": datetime.now(UTC).isoformat(),

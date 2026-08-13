@@ -6,11 +6,13 @@ Sanitizes Ghidra's decompiled C output — non-standard types (`undefined4`,
 `ZEXT48`), illegal syntax (`::` switch-case labels, `TYPE[N] name;` array
 declarations), undeclared register variables (`in_FS_OFFSET`, `unaff_EBX`,
 `extraout_EAX`), self-forwarding Ghidra thunk/PLT stub bodies, and
-duplicate/conflicting global declarations — into whole-program C compilable
-by a CPG builder like Joern (`pipeline.py::JOERN_PIPELINE`/
-`build_joern_pipeline`). This is the only normalization target Stage 2
-produces; LLM-facing preparation of decompiled code is a separate concern
-handled by a later stage, not by this module.
+duplicate/conflicting global declarations — shared repair work behind TWO
+delivery targets: whole-program C compilable by a CPG builder like Joern
+(`pipeline.py::JOERN_PIPELINE`/`build_joern_pipeline`), and LLM-facing
+function-only text (`pipeline.py::CLEAN_PIPELINE`/`build_clean_pipeline`,
+consumed by the sibling `stage2_extraction.clean` package — see that
+package's module docstring for the tree-sitter filtering step this module
+itself never performs).
 
 Three-part design, each doing only what it's suited for:
 

@@ -16,6 +16,7 @@ from fw_audit.common.schemas import ExtractionStatus
 from fw_audit.config.settings import Settings
 from fw_audit.stage3_analysis.errors import Stage3InputError
 from fw_audit.stage3_analysis.ingest import ingest
+from tests.conftest import write_cleaned_artifact
 
 
 def _setup_run(
@@ -25,6 +26,7 @@ def _setup_run(
     binaries: list[dict] | None = None,
     unresolved: list[dict] | None = None,
     tree_files: dict[str, str] | None = None,
+    cleaned_texts: dict[str, str] | None = None,
     decompiled_tree_dir: str | None = None,
     db_name: str = "fw",
 ) -> Path:
@@ -33,10 +35,18 @@ def _setup_run(
     stage1_summary.json path.
 
     `tree_files` maps a rootfs-relative-with-`.c`-appended path (e.g.
-    "sbin/wpasupp.c") to its text content, written under the mirror tree.
-    `decompiled_tree_dir` overrides the recorded field name (default: the
-    real `<db_name>_decompiled` sibling), letting tests exercise the
-    recompute-fallback path.
+    "sbin/wpasupp.c") to its text content, written under the mirror tree
+    (the RAW mirror file — `--debug`'s raw dump, orphan accounting).
+    `cleaned_texts` maps a `bin_id` to source text to run through the real
+    `stage2_extraction.clean` extraction (via `write_cleaned_artifact`),
+    writing `stage2/binaries/<bin_id>/cleaned/{whole.c,functions.json}`
+    and merging the resulting `cleaned_c`/`cleaned_index_json` into that
+    binary's `artifacts` dict in `binaries` — a binary with no entry here
+    ends up with no cleaned artifact recorded, exactly like a real Stage 2
+    run that skipped cleaning for it (missing `tree-sitter`). `decompiled_
+    tree_dir` overrides the recorded field name (default: the real
+    `<db_name>_decompiled` sibling), letting tests exercise the recompute-
+    fallback path.
     """
     db_subfolder = tmp_path / "db" / db_name
     stage2_dir = db_subfolder / "stage2"
@@ -50,6 +60,13 @@ def _setup_run(
         target = tree_dir / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+
+    binaries = binaries or []
+    for bin_id, source_text in (cleaned_texts or {}).items():
+        fragment = write_cleaned_artifact(stage2_dir, bin_id, source_text)
+        for b in binaries:
+            if b.get("bin_id") == bin_id:
+                b.setdefault("artifacts", {}).update(fragment)
 
     stage1_summary_path = db_subfolder / "stage1_summary.json"
     stage1_summary_path.write_text(
@@ -78,7 +95,7 @@ def _setup_run(
                     decompiled_tree_dir if decompiled_tree_dir is not None else tree_dir.name
                 ),
                 "ghidra_image": "fw-audit-ghidra:latest",
-                "binaries": binaries or [],
+                "binaries": binaries,
                 "unresolved": unresolved or [],
                 "started_at": datetime.now(UTC).isoformat(),
             }
@@ -215,20 +232,6 @@ def test_ingest_direct_whitelist_match(tmp_path):
     assert report.skipped == ()
 
 
-def test_ingest_target_functions_populated_from_matched_binary(tmp_path):
-    stage1_path = _setup_run(
-        tmp_path,
-        identified_paths=["sbin/wpasupp"],
-        binaries=[_binary_dict("sbin/wpasupp", functions=[_ghidra_function_dict("main")])],
-        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
-    )
-
-    report = ingest(stage1_summary_path=stage1_path)
-
-    assert len(report.targets) == 1
-    assert [f.name for f in report.targets[0].functions] == ["main"]
-
-
 def test_ingest_without_debug_dump_writes_no_debug_dir(tmp_path):
     stage1_path = _setup_run(
         tmp_path,
@@ -317,6 +320,10 @@ def test_ingest_debug_dump_never_modifies_mirror_tree(tmp_path):
 
 
 def test_ingest_debug_writes_cleaned_dump_when_tree_sitter_available(tmp_path):
+    """`--debug`'s cleaned dump now COPIES Stage 2's persisted `cleaned/
+    whole.c` (via `Target.cleaned_source_path`) rather than re-parsing —
+    `cleaned_texts` here runs the real `stage2_extraction.clean` extraction
+    once, up front, exactly as `extract.py::_clean_whole_c` would."""
     pytest.importorskip("tree_sitter_c")
     source = (
         "typedef unsigned char undefined1;\n\n"
@@ -328,6 +335,7 @@ def test_ingest_debug_writes_cleaned_dump_when_tree_sitter_available(tmp_path):
         identified_paths=["sbin/wpasupp"],
         binaries=[_binary_dict("sbin/wpasupp", functions=[_ghidra_function_dict("add")])],
         tree_files={"sbin/wpasupp.c": source},
+        cleaned_texts={"sbin_wpasupp": source},
     )
 
     debug_settings = Settings(_env_file=None, stage3_debug_dump=True)
@@ -358,18 +366,14 @@ def test_ingest_without_debug_writes_no_cleaned_dump(tmp_path):
     assert not debug_dir.exists()
 
 
-def test_ingest_debug_missing_tree_sitter_degrades_gracefully(tmp_path, monkeypatch, caplog):
-    """--debug must not regress for a user without the `stage3` extra: the
-    raw dump and the report still succeed; only the cleaned dump is
-    skipped, with a single warning logged (not one per target)."""
-    import sys
-
-    monkeypatch.setitem(sys.modules, "tree_sitter", None)
-    monkeypatch.setitem(sys.modules, "tree_sitter_c", None)
-    from fw_audit.stage3_analysis.clean import parser as parser_module
-
-    parser_module.get_parser.cache_clear()
-
+def test_ingest_debug_no_cleaned_artifact_degrades_gracefully(tmp_path, caplog):
+    """`--debug` must not regress for a binary Stage 2 skipped cleaning for
+    (e.g. `tree-sitter`/`tree-sitter-c`, the `stage2` extra, wasn't
+    installed there): the raw dump and the report still succeed; only the
+    cleaned dump is skipped for that target, with a warning logged. Stage 3
+    itself no longer touches tree-sitter at all — this is simulated simply
+    by NOT providing `cleaned_texts` for this bin_id, exactly like a real
+    binary whose `DecompiledBinary.artifacts.cleaned_c` is `None`."""
     stage1_path = _setup_run(
         tmp_path,
         identified_paths=["sbin/wpasupp"],
@@ -378,18 +382,15 @@ def test_ingest_debug_missing_tree_sitter_degrades_gracefully(tmp_path, monkeypa
     )
     debug_settings = Settings(_env_file=None, stage3_debug_dump=True)
 
-    try:
-        with caplog.at_level("WARNING", logger="fw_audit.stage3_analysis"):
-            report = ingest(stage1_summary_path=stage1_path, settings=debug_settings)
-    finally:
-        parser_module.get_parser.cache_clear()
+    with caplog.at_level("WARNING", logger="fw_audit.stage3_analysis"):
+        report = ingest(stage1_summary_path=stage1_path, settings=debug_settings)
 
     assert len(report.targets) == 1
     raw = tmp_path / "db" / "fw" / "stage3" / "debug" / "sbin_wpasupp.c"
     assert raw.is_file()
     cleaned = tmp_path / "db" / "fw" / "stage3" / "debug" / "sbin_wpasupp.cleaned.c"
     assert not cleaned.is_file()
-    assert any("cleaned debug dump skipped" in r.message for r in caplog.records)
+    assert any("no cleaned artifact recorded" in r.message for r in caplog.records)
 
 
 def test_ingest_matches_via_alias_busybox_applet(tmp_path):
@@ -671,6 +672,7 @@ def test_ingest_chunk_debug_dump_writes_one_file_per_chunk(tmp_path):
             )
         ],
         tree_files={"sbin/wpasupp.c": source},
+        cleaned_texts={"sbin_wpasupp": source},
     )
 
     # chunk_lines=50 (the minimum allowed): each padded function's own span
@@ -700,6 +702,7 @@ def test_ingest_chunk_debug_dump_writes_files_for_matched_targets_only(tmp_path)
             "sbin/wpasupp.c": "int main(void) { return 0; }\n",
             "lib/orphan.so.c": "int f(void) { return 0; }\n",
         },
+        cleaned_texts={"sbin_wpasupp": "int main(void) { return 0; }\n"},
     )
 
     chunk_settings = Settings(_env_file=None, stage3_chunk_debug_dump=True)
@@ -791,20 +794,12 @@ def test_ingest_chunk_debug_dump_never_modifies_mirror_tree(tmp_path):
     assert after == before
 
 
-def test_ingest_chunk_debug_missing_tree_sitter_degrades_gracefully(
-    tmp_path, monkeypatch, caplog
-):
-    """--debug-chunks must not regress for a user without the `stage3`
-    extra: the report still succeeds; the chunk dump is simply skipped,
-    with a single warning logged (not one per target)."""
-    import sys
-
-    monkeypatch.setitem(sys.modules, "tree_sitter", None)
-    monkeypatch.setitem(sys.modules, "tree_sitter_c", None)
-    from fw_audit.stage3_analysis.clean import parser as parser_module
-
-    parser_module.get_parser.cache_clear()
-
+def test_ingest_chunk_debug_no_cleaned_artifact_degrades_gracefully(tmp_path, caplog):
+    """`--debug-chunks` must not regress for a binary Stage 2 skipped
+    cleaning for: the report still succeeds; the chunk dump is simply
+    skipped for that target, with a warning logged. Simulated by NOT
+    providing `cleaned_texts` for this bin_id — see the sibling
+    `test_ingest_debug_no_cleaned_artifact_degrades_gracefully` above."""
     stage1_path = _setup_run(
         tmp_path,
         identified_paths=["sbin/wpasupp"],
@@ -813,16 +808,13 @@ def test_ingest_chunk_debug_missing_tree_sitter_degrades_gracefully(
     )
     chunk_settings = Settings(_env_file=None, stage3_chunk_debug_dump=True)
 
-    try:
-        with caplog.at_level("WARNING", logger="fw_audit.stage3_analysis"):
-            report = ingest(stage1_summary_path=stage1_path, settings=chunk_settings)
-    finally:
-        parser_module.get_parser.cache_clear()
+    with caplog.at_level("WARNING", logger="fw_audit.stage3_analysis"):
+        report = ingest(stage1_summary_path=stage1_path, settings=chunk_settings)
 
     assert len(report.targets) == 1
     chunks_dir = tmp_path / "db" / "fw" / "stage3" / "chunks"
     assert not any(chunks_dir.glob("*.c")) if chunks_dir.exists() else True
-    assert any("chunk debug dump skipped" in r.message for r in caplog.records)
+    assert any("no cleaned artifact recorded" in r.message for r in caplog.records)
 
 
 @pytest.mark.integration

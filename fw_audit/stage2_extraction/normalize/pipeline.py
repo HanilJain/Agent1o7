@@ -27,10 +27,11 @@ Ordering is deliberate:
 
 `build_joern_pipeline` takes the three passes that are inherently
 target-specific (warning-comment handling, prelude insertion, and the
-`halt_baddata()` rewrite) as parameters rather than hardcoding them,
-so a future target-specific pipeline (e.g. LLM-facing preparation, planned
-for a later stage) can reuse `_head_passes`/`_body_passes`/`_tail_passes`
-without duplicating the shared pass list.
+`halt_baddata()` rewrite) as parameters rather than hardcoding them, so a
+second target-specific pipeline can reuse `_head_passes`/`_body_passes`/
+`_tail_passes` without duplicating the shared pass list — see
+`build_clean_pipeline` below, the LLM-facing sibling that does exactly
+this.
 
 `replace_thunk_bodies` and `dedupe_global_declarations` additionally need a
 per-binary `normalize.context.BinaryContext` — see `build_joern_pipeline`
@@ -188,6 +189,66 @@ def build_joern_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedP
 #: it by name keeps working unchanged; `test_pipeline.py` asserts it can
 #: never silently drift from `build_joern_pipeline()`'s own default.
 JOERN_PIPELINE: tuple[NamedPass, ...] = build_joern_pipeline()
+
+
+_NOOP_PRELUDE_PASS = NamedPass(
+    "noop_prelude",
+    lambda text: text,
+    "no-op: the LLM/cleaning target discards the prelude wholesale once "
+    "clean.extract's function-only filter runs, so inlining ghidra_types.h "
+    "here would only spend tokens on text that never survives",
+)
+
+_NOOP_HALT_PASS = NamedPass(
+    "noop_halt_baddata",
+    lambda text: text,
+    "no-op: rewrite_halt_baddata_for_joern exists only to satisfy Joern's "
+    "CDT-based C frontend, which doesn't accept halt_baddata(); an LLM "
+    "reads the original Ghidra intrinsic call just fine",
+)
+
+
+def build_clean_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedPass, ...]:
+    """The LLM/cleaning-targeted pipeline, bound to `context` exactly like
+    `build_joern_pipeline`. Reuses `_head_passes`/`_body_passes`/
+    `_tail_passes` verbatim (see this module's docstring, lines 28-33,
+    which anticipated exactly this pipeline) with three target-specific
+    substitutions:
+
+    * `warnings_pass` — same as Joern's (`strip_all_ghidra_warnings`);
+      warning comments are noise for an LLM reader too.
+    * `prelude_pass` — a no-op: `clean.extract.extract_functions`'s
+      function-only filter discards every declaration anyway, so
+      inlining `ghidra_types.h` here would burn tokens on text that
+      never survives.
+    * `halt_pass` — a no-op: `rewrite_halt_baddata_for_joern` exists only
+      to make Joern's CDT-based C frontend accept `halt_baddata()`; an
+      LLM has no such requirement.
+
+    This runs BEFORE `stage2_extraction.clean.extract.extract_functions`
+    (see `extract.py::_clean_whole_c`) — unlike the Joern pipeline, whose
+    output is delivered as-is, this pipeline's output is an intermediate
+    that still contains every declaration `extract_functions` will filter
+    out; that's expected and does not need `EMIT_TYPE_DEFINITIONS`-style
+    tuning, since none of it survives into `cleaned/whole.c`.
+    """
+    return _build_pipeline(
+        warnings_pass=NamedPass(
+            "strip_all_ghidra_warnings",
+            passes.strip_all_ghidra_warnings,
+            "remove every Ghidra WARNING comment",
+        ),
+        prelude_pass=_NOOP_PRELUDE_PASS,
+        halt_pass=_NOOP_HALT_PASS,
+        context=context,
+    )
+
+
+#: Kept for the same reason `JOERN_PIPELINE` is: a real meaning of its own
+#: ("the cleaning pipeline to run when there is no `BinaryContext`"), and
+#: so `test_pipeline_constants_match_factory_defaults` can guard it against
+#: drifting from `build_clean_pipeline()`'s own default the same way.
+CLEAN_PIPELINE: tuple[NamedPass, ...] = build_clean_pipeline()
 
 
 def _count_changed_lines(before: str, after: str) -> int:

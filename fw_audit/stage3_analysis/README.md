@@ -1,8 +1,10 @@
 # Stage 3 — Analysis Core
 
 Bridges Stage 2's decompiled output to LLM-backed vulnerability analysis.
-**Component 1** (ingest → clean → chunk → queue) and **Component 2** (the
-LLM vulnerability-analysis worker pool, `agent/`) are both implemented.
+**Component 1** (ingest → chunk → queue) and **Component 2** (the LLM
+vulnerability-analysis worker pool, `agent/`) are both implemented. Step
+2 — Clean — moved into Stage 2 (`stage2_extraction.clean`); Stage 3 reads
+its persisted output rather than running tree-sitter itself.
 
 ## What it does
 
@@ -10,9 +12,12 @@ LLM vulnerability-analysis worker pool, `agent/`) are both implemented.
   Stage 2's verified index (`whitelist.py`), locates each match in the
   decompiled mirror tree (`discover.py`), and produces an `IngestionReport`
   of `Target`s (analyzable) and `SkippedTarget`s (with a reason code).
-- **Step 2 — Clean** (`clean/`): tree-sitter function-only extraction,
-  discarding type/struct/prelude boilerplate Stage 2's Joern-normalization
-  left in.
+- **Step 2 — Read cleaned artifact** (`cleaned_io.py`): loads Stage 2's
+  persisted `cleaned/whole.c` + `cleaned/functions.json` for each `Target`
+  and reconstructs an `ExtractedSource` by slicing line ranges — no
+  tree-sitter, no re-parsing. A `Target` whose Stage 2 run skipped cleaning
+  (e.g. the `stage2` extra wasn't installed there) is skipped individually
+  with a warning, not a whole-run failure.
 - **Step 3 — Chunk** (`chunk/strategy.py`): greedily groups an
   `ExtractedSource`'s functions into ~1000-line chunks, never splitting a
   function; an oversized single function becomes its own chunk.
@@ -53,9 +58,11 @@ into `stage2/` or the mirror tree.
 
 ## Debugging
 
-- The `stage3` extra (`tree-sitter`/`tree-sitter-c`, pinned to `0.23.2`) is
-  required for cleaning/chunking — missing it degrades gracefully (raw dump
-  only, with a warning), never crashes.
+- Stage 3 itself needs no `tree-sitter` extra — cleaning happens in Stage 2.
+  A `Target` with no cleaned artifact recorded (Stage 2 skipped cleaning for
+  it, e.g. the `stage2` extra wasn't installed there) degrades gracefully
+  per-target (raw dump still succeeds, cleaned/chunk dump skipped with a
+  warning), never crashes.
 - `--analyze` requires an LLM credential (`ANTHROPIC_API_KEY` or
   `FWA_STAGE3_ANALYST_MODEL` for an offline Ollama run) — fails fast with
   `AnalystModelUnavailableError` otherwise, before any chunk is processed.

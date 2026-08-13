@@ -269,6 +269,21 @@ class DecompilationArtifacts(BaseModel):
     "relative to db_subfolder" docstring above, because the mirror tree is
     a sibling of db_subfolder, not inside it. See
     `stage2_extraction.layout.decompiled_tree_dir`."""
+    cleaned_c: str | None = None
+    """`binaries/<bin_id>/cleaned/whole.c` — every kept function's cleaned
+    text, concatenated in source order (see `ExtractedSource.to_text()`).
+    `None` if cleaning didn't run for this binary (e.g. `tree-sitter`/
+    `tree-sitter-c` — the `stage2` extra — wasn't installed); see
+    `DecompiledBinary.warnings` for why. Stage 3's chunking reads this
+    together with `cleaned_index_json` instead of re-parsing the raw C."""
+    cleaned_index_json: str | None = None
+    """`binaries/<bin_id>/cleaned/functions.json` — the per-function index
+    (name, start_line, end_line) needed to slice `cleaned_c` back into
+    individual functions without re-running tree-sitter. Line numbers are
+    relative to `cleaned_c` itself (the CONCATENATED output), not the raw
+    or repaired input — a function's span here is NOT the same span
+    `clean.extract.extract_functions` originally computed against the
+    repaired-but-unfiltered text; see `clean.extract.respan_for_concatenated_text`."""
 
 
 class DecompiledBinary(BaseModel):
@@ -300,6 +315,16 @@ class DecompiledBinary(BaseModel):
     functions: list[GhidraFunction] = Field(default_factory=list)
     imports: list[BinarySymbol] = Field(default_factory=list)
     exports: list[BinarySymbol] = Field(default_factory=list)
+    cleaned_function_count: int = 0
+    """Number of functions kept by Stage 2's cleaning step (`len(artifacts.
+    cleaned_c`'s function index)`) — 0 if cleaning didn't run. Not
+    necessarily equal to `function_count`: cleaning drops thunks, externs,
+    and anything that isn't a top-level `function_definition`."""
+    dropped_line_count: int = 0
+    """Lines of the repaired-but-unfiltered raw C that cleaning dropped
+    (prelude, type declarations, thunk-wall externs, scaffolding comments)
+    — `ExtractedSource.dropped_line_count`, persisted here since the
+    in-memory `ExtractedSource` itself doesn't survive past Stage 2."""
     artifacts: DecompilationArtifacts = Field(default_factory=DecompilationArtifacts)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
@@ -361,6 +386,54 @@ class Stage2Summary(BaseModel):
     finished_at: datetime | None = None
 
 
+class ExtractedFunction(BaseModel):
+    """One `function_definition` AST node kept by Stage 2's
+    `clean.extract.extract_functions`, verbatim except for the repair
+    passes that ran before parsing (`normalize.pipeline.
+    build_clean_pipeline`).
+
+    A cross-stage wire contract (Stage 2 writes `cleaned/functions.json`
+    entries shaped like this, sans `text`; Stage 3 reconstructs full
+    instances by slicing `cleaned/whole.c`) — hence living here in
+    `common.schemas` next to `Stage2Summary`, unlike Stage 3's other
+    internal shapes (`Target`, `Chunk`, ...), which stay plain dataclasses
+    in `stage3_analysis.models` per that module's own docstring."""
+
+    name: str
+    start_line: int
+    """1-indexed. Relative to whichever text this instance was extracted
+    from — see the call site (`extract_functions` vs. a persisted index
+    reconstruction) for which text that is; the two are NOT the same
+    document (see `DecompilationArtifacts.cleaned_index_json`'s docstring)."""
+    end_line: int
+    text: str
+    """Verbatim function source (declarator + body), never reformatted."""
+
+
+class ExtractedSource(BaseModel):
+    """One binary's complete function-only extraction result — the input
+    to `stage3_analysis.chunk.strategy.chunk_source`."""
+
+    bin_id: str
+    functions: tuple[ExtractedFunction, ...] = ()
+    total_lines: int = 0
+    """Line count of the repaired-but-unfiltered text extraction ran
+    against — the baseline `dropped_line_count` is measured against."""
+    dropped_line_count: int = 0
+    """`total_lines` minus every kept function's own line span — lines that
+    were prelude, type declarations, thunk-wall externs, or scaffolding
+    comments, none of which survive into `functions`."""
+
+    def to_text(self) -> str:
+        """Functions joined in original source order, separated by one
+        blank line, each verbatim — no reformatting of any kept function
+        body. This is exactly the byte content written to
+        `cleaned/whole.c`, and per-function spans in `cleaned/functions.
+        json` are computed against THIS output, not the input `extract_
+        functions` parsed — see `clean.extract.respan_for_concatenated_text`."""
+        return "\n\n".join(f.text for f in self.functions)
+
+
 class ChunkRecord(BaseModel):
     """One `stage3_analysis.models.Chunk`'s outcome after passing through
     `stage3_analysis.chunk_queue.ChunkQueue` — its metadata, plus where
@@ -416,12 +489,14 @@ class Stage3Summary(BaseModel):
     schema_version: int = 1
     run_id: str | None = None
     status: str
-    """`"completed"` (producer finished, queue drained normally),
+    """`"completed"` (producer finished, queue drained normally — may
+    still carry per-target `warnings` for individual skipped binaries),
     `"no_targets"` (`IngestionReport.targets` was empty — a valid, non-
-    error outcome), or `"stage3_input_unavailable"` (tree-sitter/
-    tree-sitter-c missing — the producer stopped early; whatever chunks
-    were already queued before that point are still recorded, this is not
-    a hard failure of the run)."""
+    error outcome), or `"stage3_input_unavailable"` (EVERY target had no
+    usable Stage 2 cleaned artifact to chunk — e.g. `tree-sitter`/
+    `tree-sitter-c`, the `stage2` extra, wasn't installed when Stage 2
+    ran; zero chunks were produced. This is not a hard failure of the
+    run — `warnings` names why for each target)."""
     db_subfolder: str
     chunks: list[ChunkRecord] = Field(default_factory=list)
     total_chunks: int

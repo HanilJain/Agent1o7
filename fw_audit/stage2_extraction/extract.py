@@ -25,6 +25,7 @@ from pathlib import Path
 from fw_audit.common.schemas import (
     DecompilationStatus,
     DecompiledBinary,
+    ExtractedSource,
     ExtractionStatus,
     Stage2Summary,
     UnresolvedBinaryRecord,
@@ -32,10 +33,17 @@ from fw_audit.common.schemas import (
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.executors.base import Executor
 from fw_audit.stage2_extraction import layout
+from fw_audit.stage2_extraction.clean.errors import CleanUnavailableError
+from fw_audit.stage2_extraction.clean.extract import (
+    extract_functions,
+    respan_for_concatenated_text,
+)
+from fw_audit.stage2_extraction.clean.index import to_index_json_dict
 from fw_audit.stage2_extraction.ghidra.client import decompile_binary, ghidra_executor
-from fw_audit.stage2_extraction.normalize.context import build_context
+from fw_audit.stage2_extraction.normalize.context import BinaryContext, build_context
 from fw_audit.stage2_extraction.normalize.pipeline import (
     NamedPass,
+    build_clean_pipeline,
     build_joern_pipeline,
     normalize,
 )
@@ -353,20 +361,26 @@ def _normalize_one(
     decompiled_tree: Path | None,
     warnings: list[str],
 ) -> DecompiledBinary:
-    """Normalize one binary's raw Ghidra output for the Joern target, write
-    every artifact, and return the binary with `artifacts` updated.
+    """Normalize one binary's raw Ghidra output for both delivery targets
+    (Joern's CPG-compilable whole-program C, and Stage 3/4's LLM-facing
+    function-only extraction), write every artifact, and return the binary
+    with `artifacts`/counters updated.
 
     Builds a `BinaryContext` from `binary.functions` (already parsed from
     `metadata.json` by `ghidra/client.py` — no extra file read here) so the
-    two context-bound passes (thunk-stub replacement, global-declaration
-    dedup) see this binary's real thunk/external/function-name sets rather
-    than degrading to `EMPTY_CONTEXT`."""
+    context-bound passes (thunk-stub replacement, global-declaration dedup)
+    see this binary's real thunk/external/function-name sets rather than
+    degrading to `EMPTY_CONTEXT`."""
     context = build_context(binary.functions)
     joern_pipeline = build_joern_pipeline(context)
     artifacts_update: dict[str, str] = {}
+    counters_update: dict[str, int] = {}
 
     joern_result = _normalize_whole_c(
         binary, bin_dir, workspace, joern_pipeline, decompiled_tree, artifacts_update, warnings
+    )
+    cleaned_result = _clean_whole_c(
+        binary, bin_dir, workspace, context, artifacts_update, counters_update, warnings
     )
 
     report = NormalizationReport(
@@ -377,13 +391,16 @@ def _normalize_one(
             "externals": len(context.external_names),
         },
         joern_whole_c=joern_result,
+        cleaned_whole_c=cleaned_result,
     )
     _write_normalization_report(bin_dir, report, warnings)
 
-    if not artifacts_update:
+    if not artifacts_update and not counters_update:
         return binary
-    new_artifacts = binary.artifacts.model_copy(update=artifacts_update)
-    return binary.model_copy(update={"artifacts": new_artifacts})
+    updates: dict[str, object] = dict(counters_update)
+    if artifacts_update:
+        updates["artifacts"] = binary.artifacts.model_copy(update=artifacts_update)
+    return binary.model_copy(update=updates)
 
 
 def _normalize_whole_c(
@@ -411,6 +428,66 @@ def _normalize_whole_c(
         mirrored = _write_mirror(decompiled_tree, binary.rootfs_path, result.text, warnings)
         if mirrored is not None:
             artifacts_update["decompiled_tree_c"] = mirrored
+    return result
+
+
+def _clean_whole_c(
+    binary: DecompiledBinary,
+    bin_dir: Path,
+    workspace: Path,
+    context: BinaryContext,
+    artifacts_update: dict[str, str],
+    counters_update: dict[str, int],
+    warnings: list[str],
+) -> NormalizationResult | None:
+    """Run the LLM-target cleaning pipeline over `raw/decompiled/whole.c`,
+    extract function-only text with tree-sitter, and write `cleaned/
+    whole.c` + `cleaned/functions.json`.
+
+    Reads the SAME raw input `_normalize_whole_c` does (`raw/decompiled/
+    whole.c`), not its Joern output — the two targets are siblings, not a
+    pipeline of each other, per `normalize.pipeline.build_clean_pipeline`'s
+    docstring.
+
+    Never fails the run: a missing `tree-sitter`/`tree-sitter-c` (the
+    `stage2` extra) is caught here and recorded as a warning, same non-fatal
+    discipline as `_write_mirror`/`_write_normalization_report` — the Joern
+    artifact and `stage2_summary.json` are written regardless. Returns
+    `None` (no report entry) if there was no raw C to clean, or cleaning
+    was skipped/failed.
+    """
+    whole_c = layout.raw_decompiled_whole_c(bin_dir)
+    if not whole_c.is_file():
+        return None
+
+    raw_text = whole_c.read_text(encoding="utf-8", errors="replace")
+    clean_pipeline = build_clean_pipeline(context)
+    result = normalize(raw_text, clean_pipeline)
+
+    try:
+        source: ExtractedSource = extract_functions(result.text, bin_id=binary.bin_id)
+    except CleanUnavailableError as exc:
+        warnings.append(f"cleaning skipped for {binary.bin_id!r}: {exc}")
+        return result
+
+    respanned = respan_for_concatenated_text(source.functions)
+    source = source.model_copy(update={"functions": respanned})
+
+    cleaned_dir = layout.cleaned_dir(bin_dir)
+    cleaned_dir.mkdir(parents=True, exist_ok=True)
+    cleaned_c_path = layout.cleaned_whole_c(bin_dir)
+    cleaned_c_path.write_text(source.to_text(), encoding="utf-8")
+    index_path = layout.cleaned_functions_json(bin_dir)
+    index_path.write_text(
+        json.dumps(to_index_json_dict(source), indent=2), encoding="utf-8"
+    )
+
+    artifacts_update["cleaned_c"] = layout.relative_to_db_subfolder(cleaned_c_path, workspace)
+    artifacts_update["cleaned_index_json"] = layout.relative_to_db_subfolder(
+        index_path, workspace
+    )
+    counters_update["cleaned_function_count"] = len(source.functions)
+    counters_update["dropped_line_count"] = source.dropped_line_count
     return result
 
 

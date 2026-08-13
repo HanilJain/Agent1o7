@@ -1,6 +1,5 @@
 """Stage 3's internal data shapes: ingest & whitelist (`Target`,
-`SkippedTarget`, `IngestionReport`), Step 2's function-only extraction
-(`ExtractedFunction`, `ExtractedSource`), Step 3's chunking (`Chunk`), and
+`SkippedTarget`, `IngestionReport`), Step 3's chunking (`Chunk`), and
 Step 4's queue hand-off (`ChunkHandle`).
 
 Frozen dataclasses, not Pydantic — per the project's immutability
@@ -8,6 +7,13 @@ convention, and because these are internal to Stage 3, not a cross-stage
 wire contract like `common.schemas`. If a future step needs to publish a
 `Stage3Summary` alongside `stage2_summary.json`, that belongs in
 `fw_audit.common.schemas` next to `Stage2Summary`, not here.
+
+`ExtractedFunction`/`ExtractedSource` (Step 2's function-only extraction
+shapes) moved to `fw_audit.common.schemas` — they ARE a cross-stage wire
+contract now that Stage 2 writes them to `cleaned/functions.json` and
+Stage 3 reads them back (`stage3_analysis.cleaned_io`); re-exported here
+so `chunk/strategy.py`'s `from fw_audit.stage3_analysis.models import
+ExtractedFunction, ExtractedSource` keeps working unchanged.
 """
 
 from __future__ import annotations
@@ -15,7 +21,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fw_audit.common.schemas import DecompilationStatus, GhidraFunction
+from fw_audit.common.schemas import (
+    DecompilationStatus,
+    ExtractedFunction,
+    ExtractedSource,
+)
+
+__all__ = [
+    "Target",
+    "SkippedTarget",
+    "IngestionReport",
+    "ExtractedFunction",
+    "ExtractedSource",
+    "Chunk",
+    "ChunkHandle",
+]
 
 
 @dataclass(frozen=True)
@@ -37,20 +57,25 @@ class Target:
     hash (e.g. busybox applets)."""
     sha256: str
     source_path: Path
-    """Absolute host path to the decompiled-C mirror file."""
+    """Absolute host path to the decompiled-C mirror file — the RAW
+    (Joern-normalized) whole-program C, used only for `--debug`'s raw dump
+    and orphan accounting. NOT what cleaning/chunking read; see
+    `cleaned_source_path` below."""
     source_relpath: str
     """POSIX path relative to the decompiled tree directory."""
     size_bytes: int
     status: DecompilationStatus
     function_count: int
-    functions: tuple[GhidraFunction, ...] = ()
-    """The matched `DecompiledBinary.functions` list, carried through so
-    `clean.extract.extract_functions` can build a `BinaryContext` (see
-    `stage2_extraction.normalize.context.build_context`) without re-reading
-    `stage2_summary.json` — zero extra I/O, since `ingest.py` already has
-    this in memory at `Target` construction time. Deliberately NOT included
-    in `IngestionReport.to_json_dict()`'s per-target serialization: it would
-    add ~2,000 `GhidraFunction` dicts to the report for no reader benefit."""
+    cleaned_source_path: Path | None = None
+    """Absolute host path to Stage 2's persisted `cleaned/whole.c` for this
+    binary (`stage2_extraction.layout.cleaned_whole_c`), or `None` if
+    Stage 2 recorded no cleaned artifact for it (cleaning was skipped —
+    e.g. the `stage2` extra wasn't installed there). See
+    `stage3_analysis.cleaned_io.resolve_cleaned_paths`."""
+    cleaned_index_path: Path | None = None
+    """Absolute host path to Stage 2's persisted `cleaned/functions.json`
+    for this binary — always set together with `cleaned_source_path` (both
+    `None` or both a path, never one without the other)."""
 
 
 @dataclass(frozen=True)
@@ -118,49 +143,6 @@ class IngestionReport:
             "orphans": list(self.orphans),
             "warnings": list(self.warnings),
         }
-
-
-@dataclass(frozen=True)
-class ExtractedFunction:
-    """One `function_definition` AST node kept by `clean.extract.
-    extract_functions`, verbatim except for the repair passes that ran
-    before parsing (thunk-stub replacement, register-var declaration,
-    blank-line collapsing)."""
-
-    name: str
-    start_line: int
-    """1-indexed, relative to the REPAIRED text `extract_functions` parsed
-    — NOT the original mirror file. `collapse_blank_lines` changes line
-    counts, so a 1:1 mapping back to the raw file isn't preserved; this is
-    the same "or note the offset" allowance the project's broader chunking
-    design already carries."""
-    end_line: int
-    text: str
-    """Verbatim function source (declarator + body), never reformatted."""
-
-
-@dataclass(frozen=True)
-class ExtractedSource:
-    """One binary's complete function-only extraction result — the input
-    to `chunk.strategy.chunk_source`, and what `--debug` dumps to
-    `stage3/debug/<bin_id>.cleaned.c`."""
-
-    bin_id: str
-    functions: tuple[ExtractedFunction, ...]
-    total_lines: int
-    """Line count of the repaired text, before extraction — the baseline
-    `dropped_line_count` is measured against."""
-    dropped_line_count: int
-    """`total_lines` minus every kept function's own line span — lines that
-    were prelude, type declarations, thunk-wall externs, or scaffolding
-    comments, none of which survive into `functions`."""
-
-    def to_text(self) -> str:
-        """Functions joined in original source order (tree-sitter's
-        `root_node.children` preserves node order, and only
-        `function_definition` nodes were kept), separated by one blank
-        line, each verbatim — no reformatting of any kept function body."""
-        return "\n\n".join(f.text for f in self.functions)
 
 
 @dataclass(frozen=True)
