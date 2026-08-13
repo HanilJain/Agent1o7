@@ -240,10 +240,6 @@ class GhidraFunction(BaseModel):
     is_external: bool = False
     calls: list[str] = Field(default_factory=list)
     called_by: list[str] = Field(default_factory=list)
-    c_relpath: str | None = None
-    """Per-function raw decompiled C, relative to db_subfolder."""
-    asm_relpath: str | None = None
-    """Per-function raw disassembly, relative to db_subfolder."""
     decompiled: bool = True
     decompile_error: str | None = None
 
@@ -264,9 +260,6 @@ class DecompilationArtifacts(BaseModel):
 
     raw_c: str | None = None
     raw_header: str | None = None
-    raw_functions_dir: str | None = None
-    disasm_listing: str | None = None
-    disasm_functions_dir: str | None = None
     metadata_json: str | None = None
     normalized_joern_c: str | None = None
     ghidra_log: str | None = None

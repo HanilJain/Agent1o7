@@ -28,10 +28,10 @@ against `/bin/ls`) for exactly that check.
 
 Failure policy: this script exits non-zero ONLY if the program object
 itself could not be obtained (import failure). Every other error —
-per-function decompile failure, disassembly of one function failing, a
-missing symbol table entry — is caught, recorded in `metadata.json`'s
-`analysis.decompile_failures` / `.skipped_functions`, and does not abort
-the run. `metadata.json` is written from a `finally` block with
+whole-program decompile failure, a missing symbol table entry — is caught,
+recorded in `metadata.json`'s `analysis.decompile_failures` /
+`.skipped_functions`, and does not abort the run. `metadata.json` is
+written from a `finally` block with
 `status: "partial"` on an unhandled exception past the import step, so the
 host never faces a missing metadata.json file — command-ok-but-no-file is
 therefore always a real bug in `ghidra/client.py`'s caller, never a
@@ -62,13 +62,9 @@ DECOMPILE_TIMEOUT_SECONDS = int(_args[2])
 EMIT_STRINGS = _args[3].strip().lower() in ("1", "true", "yes")
 
 DECOMPILED_DIR = os.path.join(OUT_DIR, "decompiled")
-DECOMPILED_FUNCTIONS_DIR = os.path.join(DECOMPILED_DIR, "functions")
-DISASM_DIR = os.path.join(OUT_DIR, "disasm")
-DISASM_FUNCTIONS_DIR = os.path.join(DISASM_DIR, "functions")
 METADATA_PATH = os.path.join(OUT_DIR, "metadata.json")
 
-for _d in (DECOMPILED_FUNCTIONS_DIR, DISASM_FUNCTIONS_DIR):
-    os.makedirs(_d, exist_ok=True)
+os.makedirs(DECOMPILED_DIR, exist_ok=True)
 
 
 def _log(message: str) -> None:
@@ -162,7 +158,12 @@ def _configure_cpp_exporter(exporter) -> None:
 
 
 # --------------------------------------------------------------------- #
-# Decompiled C export (whole-program, then per-function)
+# Decompiled C export — whole-program only. Deliberately no per-function
+# export and no disassembly export: nothing downstream reads either, and
+# a router binary's 10,000+ functions would mean 10,000+ redundant
+# CppExporter invocations for files nobody consumes. `metadata["functions"]`
+# still carries per-function METADATA (name, signature, call graph) from
+# the Program DB — that doesn't require decompilation or a written file.
 # --------------------------------------------------------------------- #
 
 
@@ -179,72 +180,13 @@ def _export_whole_program(program, exporter) -> tuple[bool, str | None]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _export_function_c(program, exporter, func) -> tuple[str | None, str | None]:
-    """Returns (relative_c_path_or_None, error_or_None)."""
-    from java.io import File
-    from ghidra.program.model.address import AddressSet
-
-    filename = f"{_addr_str(func.getEntryPoint())}_{_safe_name(func.getName())}.c"
-    out_path = os.path.join(DECOMPILED_FUNCTIONS_DIR, filename)
-    try:
-        ok = exporter.export(
-            File(out_path), program, AddressSet(func.getBody()), monitor  # noqa: F821
-        )
-        if not ok:
-            return None, "CppExporter.export returned False"
-        return os.path.join("decompiled", "functions", filename), None
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-
-
 # --------------------------------------------------------------------- #
-# Disassembly export (hand-rolled, not Ghidra's AsciiExporter — this format
-# is what Stage 3's LLM retrieval and Stage 4's cross-referencing consume,
-# and keeping LAB_/DAT_/FUN_/PTR_/s_ symbols visible is the point).
+# Function metadata (Program DB / ReferenceManager — no decompilation or
+# file export needed for any of this)
 # --------------------------------------------------------------------- #
 
 
-def _write_function_disasm(program, func, out_path: str) -> None:
-    listing = program.getListing()
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"; {func.getName()} @ {_addr_str(func.getEntryPoint())}\n")
-        f.write(f"; signature: {func.getSignature(True)}\n\n")
-        for instr in listing.getInstructions(func.getBody(), True):
-            addr = _addr_str(instr.getAddress())
-            raw_bytes = instr.getBytes()
-            hex_bytes = " ".join(f"{b & 0xFF:02x}" for b in raw_bytes)
-            f.write(f"{addr}  {hex_bytes:<24}  {instr}\n")
-
-
-def _write_whole_listing(program) -> None:
-    listing = program.getListing()
-    out_path = os.path.join(DISASM_DIR, "listing.asm")
-    with open(out_path, "w", encoding="utf-8") as f:
-        for instr in listing.getInstructions(True):
-            addr = _addr_str(instr.getAddress())
-            raw_bytes = instr.getBytes()
-            hex_bytes = " ".join(f"{b & 0xFF:02x}" for b in raw_bytes)
-            f.write(f"{addr}  {hex_bytes:<24}  {instr}\n")
-
-
-# --------------------------------------------------------------------- #
-# Function metadata (Program DB / ReferenceManager — no decompilation
-# needed for any of this, which is why it's populated even for functions
-# that fail to decompile)
-# --------------------------------------------------------------------- #
-
-
-def _function_record(func, decompiled: bool, c_relpath: str | None, error: str | None) -> dict:
-    asm_filename = f"{_addr_str(func.getEntryPoint())}_{_safe_name(func.getName())}.asm"
-    asm_relpath = None
-    try:
-        _write_function_disasm(
-            func.getProgram(), func, os.path.join(DISASM_FUNCTIONS_DIR, asm_filename)
-        )
-        asm_relpath = os.path.join("disasm", "functions", asm_filename)
-    except Exception as exc:  # pragma: no cover - per-function, never fatal
-        _log(f"WARNING: disassembly write failed for {func.getName()}: {exc}")
-
+def _function_record(func) -> dict:
     try:
         calls = [f.getName() for f in func.getCalledFunctions(monitor)]  # noqa: F821
     except Exception:
@@ -267,10 +209,8 @@ def _function_record(func, decompiled: bool, c_relpath: str | None, error: str |
         "parameter_count": func.getParameterCount(),
         "calls": calls,
         "called_by": called_by,
-        "c_relpath": c_relpath,
-        "asm_relpath": asm_relpath,
-        "decompiled": decompiled,
-        "error": error,
+        "decompiled": True,
+        "error": None,
     }
 
 
@@ -391,19 +331,7 @@ def main() -> None:
         metadata["analysis"]["skipped_functions"] = [f.getName() for f in skipped]
 
         for func in to_process:
-            c_relpath, error = _export_function_c(program, exporter, func)
-            if error is not None:
-                metadata["analysis"]["decompile_failures"].append(
-                    {"function": func.getName(), "error": error}
-                )
-            metadata["functions"].append(
-                _function_record(func, decompiled=(error is None), c_relpath=c_relpath, error=error)
-            )
-
-        try:
-            _write_whole_listing(program)
-        except Exception as exc:  # pragma: no cover - defensive
-            _log(f"WARNING: whole-listing disassembly failed: {exc}")
+            metadata["functions"].append(_function_record(func))
 
         imports, exports = _imports_and_exports(program)
         metadata["imports"] = imports

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +43,7 @@ from fw_audit.stage2_extraction.normalize.report import (
     NormalizationReport,
     NormalizationResult,
 )
+from fw_audit.stage2_extraction.progress import ProgressBar
 from fw_audit.stage2_extraction.resolve import ResolvedBinary, resolve_binaries
 from fw_audit.stage2_extraction.stage1_io import (
     Stage2InputError,
@@ -50,6 +52,8 @@ from fw_audit.stage2_extraction.stage1_io import (
 )
 
 __all__ = ["Stage2InputError", "run_extraction"]
+
+logger = logging.getLogger(__name__)
 
 _SUCCEEDED_STATUSES = (DecompilationStatus.SUCCEEDED, DecompilationStatus.PARTIAL)
 
@@ -61,11 +65,17 @@ async def run_extraction(
     settings: Settings | None = None,
     only: tuple[str, ...] = (),
     dry_run: bool = False,
+    progress: bool = True,
 ) -> Stage2Summary:
     """Run Stage 2 end to end and return (and persist) the `Stage2Summary`.
 
     Raises `Stage2InputError` ONLY from the load phase — everything after
     that is per-binary isolated and folded into the returned summary.
+
+    `progress` controls the stderr progress bar/milestone logging (see
+    `progress.py`) — on by default for the CLI, but a programmatic caller
+    (Stage 3, tests) that doesn't want stderr output during its own run can
+    pass `progress=False`.
     """
     settings = settings or get_settings()
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -73,6 +83,7 @@ async def run_extraction(
     warnings: list[str] = []
     errors: list[str] = []
 
+    logger.info("stage2[%s]: loading stage1 summary and resolving rootfs", run_id)
     stage1_summary = load_stage1_summary(stage1_summary_path)
     rootfs_resolution = resolve_rootfs_dir(stage1_summary)
     rootfs_dir = rootfs_resolution.rootfs_dir
@@ -116,6 +127,11 @@ async def run_extraction(
         warnings.append("Stage 1 identified no binaries; nothing to decompile.")
         return _finish(ExtractionStatus.COMPLETED, [], [])
 
+    logger.info(
+        "stage2[%s]: resolving %d identified binaries",
+        run_id,
+        len(stage1_summary.identified_binaries),
+    )
     resolution = resolve_binaries(
         stage1_summary.identified_binaries,
         rootfs_dir,
@@ -161,6 +177,12 @@ async def run_extraction(
             "(docker build -f docker/Dockerfile.ghidra -t fw-audit-ghidra:latest .)."
         )
 
+    logger.info(
+        "stage2[%s]: decompiling %d binaries (concurrency=%d)",
+        run_id,
+        len(resolved_list),
+        settings.stage2_concurrency,
+    )
     decompiled = await _decompile_all(
         tuple(resolved_list),
         run_id=run_id,
@@ -169,9 +191,12 @@ async def run_extraction(
         stage2_dir=stage2_dir,
         settings=settings,
         executor=executor,
+        progress=progress,
     )
+
+    logger.info("stage2[%s]: normalizing %d decompiled binaries", run_id, len(decompiled))
     decompiled, mirror_warnings = _normalize_all(
-        decompiled, stage2_dir, db_subfolder, decompiled_tree=decompiled_tree
+        decompiled, stage2_dir, db_subfolder, decompiled_tree=decompiled_tree, progress=progress
     )
     warnings.extend(mirror_warnings)
 
@@ -187,6 +212,7 @@ async def run_extraction(
     else:
         status = ExtractionStatus.COMPLETED
 
+    logger.info("stage2[%s]: done — status=%s", run_id, status.value)
     return _finish(status, decompiled, unresolved)
 
 
@@ -199,6 +225,7 @@ async def _decompile_all(
     stage2_dir: Path,
     settings: Settings,
     executor: Executor,
+    progress: bool = True,
 ) -> list[DecompiledBinary]:
     """Fan out with a hard concurrency cap — N concurrent JVMs each reserve
     `settings.ghidra_max_mem`, so unbounded fan-out (e.g. via LangGraph's
@@ -207,12 +234,13 @@ async def _decompile_all(
     never-raises by contract, but defended here regardless) becomes a
     failed `DecompiledBinary`, never a crashed run."""
     semaphore = asyncio.Semaphore(settings.stage2_concurrency)
+    bar = ProgressBar(len(resolved), label="stage2 decompile") if progress else None
 
     async def _one(item: ResolvedBinary) -> DecompiledBinary:
         bin_id = layout.bin_id(item.rootfs_rel, item.sha256)
         async with semaphore:
             try:
-                return await decompile_binary(
+                result = await decompile_binary(
                     item,
                     run_id=run_id,
                     bin_id=bin_id,
@@ -223,7 +251,7 @@ async def _decompile_all(
                     executor=executor,
                 )
             except Exception as exc:  # pragma: no cover - defensive, last line of isolation
-                return DecompiledBinary(
+                result = DecompiledBinary(
                     bin_id=bin_id,
                     rootfs_path=item.rootfs_rel,
                     requested_path=item.requested,
@@ -234,8 +262,15 @@ async def _decompile_all(
                     status=DecompilationStatus.FAILED,
                     errors=[f"unhandled exception: {type(exc).__name__}: {exc}"],
                 )
+            if bar is not None:
+                bar.advance(f"{item.rootfs_rel} [{result.status.value}]")
+            return result
 
-    return list(await asyncio.gather(*(_one(item) for item in resolved)))
+    try:
+        return list(await asyncio.gather(*(_one(item) for item in resolved)))
+    finally:
+        if bar is not None:
+            bar.close()
 
 
 def _write_mirror(
@@ -273,6 +308,7 @@ def _normalize_all(
     workspace: Path,
     *,
     decompiled_tree: Path | None = None,
+    progress: bool = True,
 ) -> tuple[list[DecompiledBinary], list[str]]:
     """Pure CPU, no executor — runs after every Ghidra call has completed.
     A binary that never produced raw C (any non-succeeded/partial status)
@@ -288,15 +324,24 @@ def _normalize_all(
     """
     updated: list[DecompiledBinary] = []
     all_warnings: list[str] = []
-    for binary in decompiled:
-        if binary.status not in _SUCCEEDED_STATUSES:
+    bar = ProgressBar(len(decompiled), label="stage2 normalize") if progress else None
+    try:
+        for binary in decompiled:
+            if binary.status not in _SUCCEEDED_STATUSES:
+                updated.append(binary)
+                if bar is not None:
+                    bar.advance(f"{binary.rootfs_path} [skipped]")
+                continue
+            bin_dir = layout.binary_dir(stage2_dir, binary.bin_id)
+            binary = _normalize_one(
+                binary, bin_dir, workspace, decompiled_tree=decompiled_tree, warnings=all_warnings
+            )
             updated.append(binary)
-            continue
-        bin_dir = layout.binary_dir(stage2_dir, binary.bin_id)
-        binary = _normalize_one(
-            binary, bin_dir, workspace, decompiled_tree=decompiled_tree, warnings=all_warnings
-        )
-        updated.append(binary)
+            if bar is not None:
+                bar.advance(binary.rootfs_path)
+    finally:
+        if bar is not None:
+            bar.close()
     return updated, all_warnings
 
 

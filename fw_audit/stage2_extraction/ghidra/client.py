@@ -90,8 +90,6 @@ async def decompile_binary(
     bin_dir = layout.binary_dir(stage2_dir, bin_id)
     for d in (
         layout.raw_dir(bin_dir),
-        layout.raw_decompiled_functions_dir(bin_dir),
-        layout.raw_disasm_functions_dir(bin_dir),
         layout.ghidra_log_dir(bin_dir),
     ):
         d.mkdir(parents=True, exist_ok=True)
@@ -192,9 +190,6 @@ def _artifacts(bin_dir: Path, workspace: Path) -> DecompilationArtifacts:
     return DecompilationArtifacts(
         raw_c=_rel_if_exists(layout.raw_decompiled_whole_c(bin_dir)),
         raw_header=_rel_if_exists(layout.raw_decompiled_whole_h(bin_dir)),
-        raw_functions_dir=_rel_if_exists(layout.raw_decompiled_functions_dir(bin_dir)),
-        disasm_listing=_rel_if_exists(layout.raw_disasm_listing(bin_dir)),
-        disasm_functions_dir=_rel_if_exists(layout.raw_disasm_functions_dir(bin_dir)),
         metadata_json=_rel_if_exists(layout.raw_metadata_path(bin_dir)),
         normalized_joern_c=None,  # populated by normalize_all, not this module
         ghidra_log=_rel_if_exists(layout.ghidra_log_path(bin_dir)),
@@ -246,8 +241,6 @@ def _from_metadata(
                     is_external=f.get("is_external", False),
                     calls=f.get("calls", []),
                     called_by=f.get("called_by", []),
-                    c_relpath=f.get("c_relpath"),
-                    asm_relpath=f.get("asm_relpath"),
                     decompiled=f.get("decompiled", True),
                     decompile_error=f.get("error"),
                 )

@@ -15,8 +15,7 @@ Layout, under `<db_subfolder>/stage2/`::
       binary_info.json
       ghidra/{headless_stdout.txt, ghidra.log, ghidra_script.log}
       raw/metadata.json
-      raw/decompiled/{whole.c, whole.h, functions/<addr>_<name>.c}
-      raw/disasm/{listing.asm, functions/<addr>_<name>.asm}
+      raw/decompiled/{whole.c, whole.h}
       normalized/joern/whole.c
       normalized/normalization_report.json
 
@@ -35,12 +34,6 @@ from __future__ import annotations
 import re
 from pathlib import Path, PurePosixPath
 
-#: Windows' 260-char MAX_PATH is easy to exceed with
-#: `stage2/binaries/<bin_id>/raw/decompiled/functions/<addr>_<longname>.c`;
-#: the address prefix alone keeps filenames unique, so truncating the name
-#: is lossless for that purpose.
-MAX_FUNCTION_NAME_LEN = 64
-
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.]+")
 
 
@@ -53,14 +46,6 @@ def bin_id(rootfs_rel: str, sha256: str) -> str:
     """
     safe_rel = _SAFE_NAME_RE.sub("_", rootfs_rel.strip("/")).strip("_")
     return f"{safe_rel}__{sha256[:12]}"
-
-
-def safe_function_filename(name: str, entry_point: str, suffix: str) -> str:
-    """`<entry_point>_<name>.<suffix>`, name truncated to stay well under
-    Windows' MAX_PATH when nested under `raw/decompiled/functions/`."""
-    safe_name = _SAFE_NAME_RE.sub("_", name)[:MAX_FUNCTION_NAME_LEN] or "anon"
-    safe_entry = _SAFE_NAME_RE.sub("_", entry_point)
-    return f"{safe_entry}_{safe_name}.{suffix}"
 
 
 def stage2_summary_path(stage2_dir: Path) -> Path:
@@ -117,22 +102,6 @@ def raw_decompiled_whole_c(bin_dir: Path) -> Path:
 
 def raw_decompiled_whole_h(bin_dir: Path) -> Path:
     return raw_decompiled_dir(bin_dir) / "whole.h"
-
-
-def raw_decompiled_functions_dir(bin_dir: Path) -> Path:
-    return raw_decompiled_dir(bin_dir) / "functions"
-
-
-def raw_disasm_dir(bin_dir: Path) -> Path:
-    return raw_dir(bin_dir) / "disasm"
-
-
-def raw_disasm_listing(bin_dir: Path) -> Path:
-    return raw_disasm_dir(bin_dir) / "listing.asm"
-
-
-def raw_disasm_functions_dir(bin_dir: Path) -> Path:
-    return raw_disasm_dir(bin_dir) / "functions"
 
 
 def normalized_dir(bin_dir: Path) -> Path:
