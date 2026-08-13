@@ -74,3 +74,36 @@ def test_docker_settings_defaults():
     settings = Settings(_env_file=None)
     assert settings.docker_bin == "docker"
     assert settings.docker_image == "fw-audit-sandbox:latest"
+
+
+def test_llm_provider_defaults():
+    settings = Settings(_env_file=None)
+    assert settings.openai_api_key is None
+    assert settings.openai_base_url is None
+    assert settings.ollama_num_ctx == 32768
+    assert settings.ollama_num_predict == 4096
+    assert settings.llm_model is None
+    assert settings.stage3_analyst_model is None
+
+
+def test_openai_base_url_override(monkeypatch):
+    settings = Settings(_env_file=None, OPENAI_BASE_URL="http://localhost:8000/v1")
+    assert settings.openai_base_url == "http://localhost:8000/v1"
+
+
+def test_llm_model_override_from_env():
+    settings = Settings(_env_file=None, FWA_LLM_MODEL="anthropic:claude-sonnet-4-5")
+    assert settings.llm_model == "anthropic:claude-sonnet-4-5"
+
+
+def test_stage3_analyst_model_override_from_env():
+    settings = Settings(_env_file=None, FWA_STAGE3_ANALYST_MODEL="ollama:qwen2.5-coder:1.5b")
+    assert settings.stage3_analyst_model == "ollama:qwen2.5-coder:1.5b"
+
+
+def test_stage3_llm_worker_defaults():
+    settings = Settings(_env_file=None)
+    assert settings.stage3_llm_timeout_seconds == 300
+    assert settings.stage3_llm_retry_backoff_seconds == 2.0
+    assert settings.stage3_max_chunk_tokens == 100_000
+    assert settings.stage3_repair_attempts == 1

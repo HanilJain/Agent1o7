@@ -1,146 +1,75 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. It is the **consolidated project-level** doc — cross-cutting architecture, setup, and a router to per-stage docs. It intentionally does **not** carry stage-internal detail (file-by-file breakdowns, exact CLI flags, per-stage debugging) anymore — that lives in each stage's own `CLAUDE.md`/`README.md`, linked below.
 
 ## Project
 
 **fw-audit** — an agentic firmware vulnerability detection system for router firmware. A six-stage pipeline: ingestion → feature extraction → analysis core (clean/chunk/queue) → agentic analysis → sandboxed verification → reporting. Built on **LangGraph** (stateful agent orchestration), **LangChain** (multi-provider LLM abstraction), and **Docker** (sandboxed extraction).
 
-**Current status:** Stages 1 and 2 (`fw_audit/stage1_ingestion/`, `fw_audit/stage2_extraction/`) are implemented. Stage 3 (`fw_audit/stage3_analysis/`) Component 1 is complete: ingest/whitelist (Step 1), tree-sitter function-only extraction (Step 2, `clean/`), chunking (Step 3, `chunk/`), and queueing (Step 4, `chunk_queue.py` — an in-process `asyncio.Queue` + worker pool, no external broker) are all implemented. Component 2 — the actual LLM agent pool that drains the queue and produces vulnerability findings — is not yet built; Step 4 currently exercises the queue with a no-op placeholder consumer. Stages 4–6 are empty placeholder packages (`fw_audit/stage4_analysis/` … `fw_audit/stage6_reporting/`).
+**Current status:** Stages 1–3 are implemented (Stage 3 includes both Component 1 — ingest/clean/chunk/queue — and Component 2 — the LLM vulnerability-analysis worker pool, `stage3_analysis/agent/`). Stages 4–6 are empty placeholder packages.
 
-## Commands
+## Stage docs — read these first for stage-specific work
+
+**Before touching a stage, executing one of its commands, adding a feature to it, or linking it to another stage, read that stage's own `CLAUDE.md` — not this file's old per-stage sections (removed) and not the whole repo structure.** Each stage doc is self-contained and kept under 500 words: what every file does, how to invoke it, expected input/output, and debugging commands with known errors.
+
+| Stage | Package | Docs |
+|---|---|---|
+| 1 — Ingestion & Pre-processing | `fw_audit/stage1_ingestion/` | [CLAUDE.md](fw_audit/stage1_ingestion/CLAUDE.md) · [README.md](fw_audit/stage1_ingestion/README.md) |
+| 2 — Feature Extraction | `fw_audit/stage2_extraction/` | [CLAUDE.md](fw_audit/stage2_extraction/CLAUDE.md) · [README.md](fw_audit/stage2_extraction/README.md) |
+| 3 — Analysis Core (+ agentic analysis) | `fw_audit/stage3_analysis/` | [CLAUDE.md](fw_audit/stage3_analysis/CLAUDE.md) · [README.md](fw_audit/stage3_analysis/README.md) |
+| 4 — (reserved, empty) | `fw_audit/stage4_analysis/` | [CLAUDE.md](fw_audit/stage4_analysis/CLAUDE.md) · [README.md](fw_audit/stage4_analysis/README.md) |
+| 5 — Sandboxed Verification (empty) | `fw_audit/stage5_verification/` | [CLAUDE.md](fw_audit/stage5_verification/CLAUDE.md) · [README.md](fw_audit/stage5_verification/README.md) |
+| 6 — Reporting (empty) | `fw_audit/stage6_reporting/` | [CLAUDE.md](fw_audit/stage6_reporting/CLAUDE.md) · [README.md](fw_audit/stage6_reporting/README.md) |
+
+Adding a new stage: create its package, give it a `runner.py` CLI entry registered in `pyproject.toml`, and write its `CLAUDE.md`/`README.md` pair following the same template (file table, invoke, input, output, debugging) before adding a row above.
+
+## Quick command reference
 
 ```bash
-# Setup
-python -m venv .venv
-.venv/Scripts/activate                # Windows (this repo's dev environment)
-pip install -e ".[dev]"               # core + test tooling
-pip install -e ".[all,dev]"           # + every LLM provider SDK
-pip install -e ".[anthropic,dev]"     # or selectively per provider (ollama/anthropic/google)
+python -m venv .venv && .venv/Scripts/activate   # Windows
+pip install -e ".[dev]"                            # or ".[all,dev]" for every LLM provider
 
-# Build the Stage 1 sandbox image (required before running real extraction)
-docker build -f docker/Dockerfile -t fw-audit-sandbox:latest .
-# Build the Stage 2 Ghidra image (separate — see "Two Docker images" below)
-docker build -f docker/Dockerfile.ghidra -t fw-audit-ghidra:latest .
+fw-ingest path/to/firmware.bin                       # Stage 1 — see its CLAUDE.md for flags
+fw-extract data/db/<stem>/stage1_summary.json        # Stage 2 — see its CLAUDE.md for flags
+fw-analyze data/db/<stem>/stage1_summary.json        # Stage 3 — see its CLAUDE.md for flags
 
-# Run Stage 1
-fw-ingest path/to/firmware.bin
-fw-ingest path/to/firmware.bin --tplink               # explicit TP-Link decrypt flag
-fw-ingest path/to/firmware.bin --db-subfolder my-run   # override DB folder name
-
-# Run Stage 2 (consumes Stage 1's stage1_summary.json)
-fw-extract data/db/<firmware-stem>/stage1_summary.json
-fw-extract data/db/<firmware-stem>/stage1_summary.json --dry-run       # resolve only, no Ghidra
-fw-extract data/db/<firmware-stem>/stage1_summary.json --only bin/httpd  # repeatable
-
-# Run Stage 3 (consumes Stage 2's stage2_summary.json; ingest/whitelist always runs — clean/chunk are exercised via the debug flags below, queue via --queue)
-fw-analyze data/db/<firmware-stem>/stage1_summary.json
-fw-analyze data/db/<firmware-stem>/stage1_summary.json --only bin/httpd  # repeatable
-fw-analyze data/db/<firmware-stem>/stage1_summary.json --debug           # dump raw+cleaned source per target
-fw-analyze data/db/<firmware-stem>/stage1_summary.json --debug-chunks --chunk-lines 500  # dump chunk payloads
-fw-analyze data/db/<firmware-stem>/stage1_summary.json --queue           # chunk, persist, and drain via the queue (no-op consumer — Component 2 not built yet), writes stage3_summary.json
-
-# Tests
-pytest -m "not integration"           # unit tests — no Docker daemon or LLM needed
-pytest -m integration                 # end-to-end against a real firmware image / Ghidra image
-pytest                                 # everything (integration tests skip if not set up)
-pytest tests/test_graph_integration.py -v              # single file
-pytest tests/test_graph_integration.py::test_name -v   # single test
-FWA_TEST_FIRMWARE=/path/to/real.bin pytest -m integration -v -s  # integration against a real image
-
-# Lint / type-check (configured in pyproject.toml, no dedicated script)
-ruff check .
-mypy fw_audit
+pytest -m "not integration"   # unit tests, no Docker/LLM required
+pytest -m integration         # end-to-end, needs Docker image(s) + real firmware
+ruff check . && mypy fw_audit
 ```
 
-Copy `.env.example` to `.env` before running anything for real. The Identifier Agent is mandatory (no heuristic fallback) — configure at least one LLM provider (Ollama locally, or `ANTHROPIC_API_KEY`/`GOOGLE_API_KEY` + the matching extra) or `fw-ingest` hard-fails at the identify step.
+Copy `.env.example` to `.env` before running anything for real. Both the Stage 1 Identifier Agent and the Stage 3 vulnerability analyst are **mandatory LLM agents, no heuristic fallback** — configure `ANTHROPIC_API_KEY` (production default: Anthropic Claude Sonnet, `ModelTier.HIGH_REASONING`) or point at local Ollama for offline testing. See "LLM routing" below.
 
-**Current dev/testing default — local Ollama only:** this environment has no cloud LLM key configured. `ollama pull qwen2.5-coder:1.5b` is installed and is the model **every** agentic role should be wired to for now — see "LLM routing" below for how `AgentRole`/`ModelTier`/`ModelSpec` route to it. When adding a *new* agentic task/role during this phase, route it to `ModelTier.FAST_LOCAL` (already pinned to `qwen2.5-coder:1.5b`, `format="json"` forced — see the comment on that spec) rather than introducing a second local model or defaulting to a cloud tier that will hard-fail here. This is temporary: once an `ANTHROPIC_API_KEY`/`GOOGLE_API_KEY` is added for production, `ROLE_TO_TIER` entries should be flipped back to `HIGH_REASONING`/`BALANCED` as appropriate — don't design new code so it can *only* work with the local model.
-
-## Architecture
-
-### Stage 1's privilege split (the core design constraint)
-
-Stage 1 enforces a hard boundary between two components — **neither one both executes code AND reasons over content with an LLM**:
-
-- **Extraction Script** (`stage1_ingestion/extraction/`) — plain script, no LLM, full sandbox execution rights. Runs: unzip → binwalk (attempt 1) → *(if `--tplink` and attempt 1 failed)* tp-link-decrypt → binwalk (attempt 2) → unsquashfs → `tree.txt`. Everything lands in `data/db/<firmware-stem>/`.
-- **Identifier Agent** (`stage1_ingestion/identifier/`) — LLM agent, zero execution/filesystem access. Reads `tree.txt` text only and returns a JSON list of `IdentifiedBinary` (path + reason) worth deeper analysis. This JSON is Stage 1's *only* output that bypasses the Database and goes straight to Stage 2 — Stage 2 fetches and verifies the actual binary bytes itself using the `path`, which is **untrusted, unvalidated LLM output** (see `IdentifiedBinary.path`'s docstring in `common/schemas.py`).
-
-When modifying Stage 1, preserve this split: never give the Identifier Agent execution/filesystem access, never make the Extraction Script call an LLM.
-
-### The `tplink_decrypt` trigger policy
-
-Encoded as conditional edges in `stage1_ingestion/graph.py` (`_after_binwalk_1`/`_after_binwalk_2`), not scattered as ad-hoc `if`s, specifically so the four rules can't be silently violated by an edit to one node:
-
-1. Never runs unless the user explicitly passes `--tplink`.
-2. Even when flagged, only runs if binwalk attempt 1 did **not** succeed.
-3. When triggered, decrypt runs **before** binwalk is re-run.
-4. If attempt 1 succeeds, decrypt is skipped entirely — regardless of the flag.
-
-If nothing succeeds, Stage 1 hard-fails via the `fail_unsupported` node rather than degrading silently.
-
-### Stage 2 — Feature Extraction (`fw_audit/stage2_extraction/`)
-
-Turns Stage 1's shortlist into decompiled, normalized artifacts via Ghidra Headless. **Fully deterministic — no LLM anywhere in it** — so it's a plain async pipeline (`extract.py::run_extraction()`), not a LangGraph, unlike every other stage.
-
-- **`stage1_io.py`** — loads `stage1_summary.json` and resolves the rootfs root binaries are relative to, via a fallback chain (`rootfs_dir` field → `tree.txt` line 1 → `<db_subfolder>/tree.txt`) because older summaries may predate the `rootfs_dir` field (see Stage 1's `state.py`).
-- **`resolve.py`** — turns each untrusted `IdentifiedBinary.path` into verified host bytes: normalizes separators, manually walks symlinks *re-rooted inside the rootfs* (never `Path.resolve()`, which would follow an absolute symlink onto the host), falls back to a basename rescan, rejects non-ELF hits, and dedupes by content hash (the busybox-applet case — N shortlisted paths that are byte-identical decompile once, not N times). **Never raises** — an unresolvable path becomes a recorded `unresolved` entry, not a failed run.
-- **`ghidra/`** — `command.py` composes the `pyghidraRun -H` invocation as a pure string (no I/O, no `fw_audit.executors` import); `client.py` runs it via the `Executor` abstraction and turns the result + the export script's `metadata.json` into a `DecompiledBinary`. Points a `DockerExecutor` at a *separate* image (`FWA_GHIDRA_IMAGE`, default `fw-audit-ghidra:latest`) via the same `settings.model_copy(...)` idiom `DockerExecutor` itself uses — no `Executor` ABC change. **Must be `pyghidraRun -H`, not bare `analyzeHeadless`** — confirmed against a real build that the latter fails a `.py` `-postScript` with "Ghidra was not started with PyGhidra. Python is not available"; PyGhidra needs the JVM started *by* Python (via JPype), not the reverse.
-- **`normalize/`** — the Post-Decompilation Handler / C Normalizer. Sanitizes Ghidra's decompiled C (non-standard types, `CONCATxy`/`SUBxy`/`ZEXTxy`/`SEXTxy` intrinsics, illegal `::` switch labels, undeclared `in_*`/`unaff_*`/`extraout_*` register vars) into whole-program C for Joern (`JOERN_PIPELINE`/`build_joern_pipeline`) — the only normalization target Stage 2 produces. LLM-facing preparation of decompiled code is a separate concern, handled by Stage 3 (`stage3_analysis/`) rather than here — Stage 2's own `pipeline.py` docstring names this explicitly: `build_joern_pipeline` parameterizes its target-specific passes "so a future target-specific pipeline (e.g. LLM-facing preparation, planned for a later stage) can reuse [the shared pass groups] without duplicating the shared pass list." A generated prelude header (`prelude.py::PRELUDE_HEADER`) turns every non-standard *type* into a `typedef` and every intrinsic *macro* into a `#define` — zero rewriting risk; `passes.py` handles only what a declaration can't express (illegal tokens, undeclared identifiers, duplicate definitions), as pure `(str) -> str` functions run through `spans.py`'s tokenizer so they never touch a string/char literal or comment. `normalize(normalize(x)) == normalize(x)` is a hard invariant, tested directly.
-- **`extract.py`** — the orchestrator: `load → resolve → decompile (bounded by `FWA_STAGE2_CONCURRENCY`, default 1 — each Ghidra JVM reserves `FWA_GHIDRA_MAX_MEM`) → normalize → summarize`. Only the load phase can fail the run outright (`Stage2InputError`); every binary's decompile/normalize failure becomes a `DecompiledBinary(status=FAILED)` and the run continues. The normalize step also mirrors each binary's normalized whole-program C into a flat, rootfs-mirroring tree (`layout.decompiled_tree_dir` — a *sibling* of `db_subfolder`, `.c` appended to each binary's filename); see the `Stage2Summary` note below for the one path-relativity exception this causes.
-
-### Stage 3 — Analysis Core (`fw_audit/stage3_analysis/`)
-
-Bridges Stage 2's decompiled output to the future agentic analysis stage. Four steps — **ingest → clean → chunk → queue** — all implemented; this is Component 1's complete scope (see `stage3_analysis/__init__.py`'s own docstring for the Component 1/Component 2 boundary). Component 2 (the LLM agent pool that drains the queue and returns vulnerability findings) is a separate, not-yet-built piece — see the plan doc referenced in git history if resuming this work. Renamed from the original `stage3_rag` placeholder: this package is not a retrieval layer, it's the Joern-to-LLM conversion bridge Stage 2's `normalize/` explicitly defers to "a later stage" (see above).
-
-- **`stage2_io.py`** — loads `stage2_summary.json` and resolves the decompiled-mirror-tree directory, via a fallback chain (`decompiled_tree_dir` field → recomputed sibling name) for the same reason Stage 2's `stage1_io.py` needs one: the field didn't always exist. Mirrors that module's structure and `Stage3InputError` contract one stage over.
-- **`whitelist.py`** — pure, zero I/O: joins Stage 1's `identified_binaries` (intent) against Stage 2's `binaries[]` (verified index) by normalized path, matching on `requested_path`, `rootfs_path`, or any `aliases` entry (the busybox-applet case).
-- **`discover.py`** — the only filesystem-touching module besides `stage2_io`/`ingest.py`: locates each matched binary's `.c` file in the mirror tree via `artifacts.decompiled_tree_c` (falling back to recomputing the expected path), with `stage2_extraction.layout.is_contained` as a traversal guard before ever calling `stat()` — `decompiled_tree_c` ultimately derives from Stage 1's untrusted LLM path.
-- **`ingest.py`** — the Step 1 orchestrator: `IngestionReport` with a `Target` per analyzable binary and a `SkippedTarget` (with a machine-readable reason code) per whitelisted binary that couldn't be resolved. **Never raises past the load phase** — same discipline as `stage2_extraction.resolve`, a bad/missing binary is expected input, not a bug. Writes `stage3/ingestion_report.json` itself, not only from the CLI. Also hosts two independently-gated, best-effort debug writers (neither touches production behavior): `_write_cleaned_debug_sources` (Step 2, `--debug`/`stage3_debug_dump`) and `_write_chunk_debug_sources` (Step 3, `--debug-chunks`/`stage3_chunk_debug_dump`) — both re-run `clean.extract.extract_functions` independently rather than sharing state, since either flag may be passed alone.
-- **`clean/`** — Step 2's function-only extraction. `clean/parser.py::get_parser()` lazily builds a cached `tree_sitter.Parser` from `tree_sitter_c` (the optional `stage3` extra — **pinned to matched `tree-sitter==0.23.2`/`tree-sitter-c==0.23.2`**; a mismatched pair, e.g. 0.26.0 + 0.24.2, corrupts `Node` fields and crashes on real multi-MB input — verified, don't bump either without re-verifying), raising `Stage3InputError` with an actionable install message if missing. `clean/extract.py::extract_functions(text, *, bin_id, context) -> ExtractedSource` repairs text with 3 of Stage 2's normalize passes (thunk-body replacement, register-var declaration, blank-line collapsing), parses with tree-sitter, and keeps only top-level `function_definition` nodes — discarding all type/struct/prelude boilerplate (on real `sbin/wpasupp`: ~198K raw lines → 2,093 functions, zero boilerplate).
-- **`chunk/`** — Step 3's chunking. `chunk/strategy.py::chunk_source(source, *, bin_id, rootfs_path, source_relpath, chunk_lines, max_chunk_lines) -> tuple[Chunk, ...]` greedily accumulates an `ExtractedSource`'s already-ordered functions into `Chunk`s targeting `chunk_lines` lines (soft, `Settings.stage3_chunk_lines`, default 1000, user-configurable via `--chunk-lines`/`FWA_STAGE3_CHUNK_LINES`), **never splitting a function**: a chunk closes only after the function that crosses the soft limit completes; a single function whose own span exceeds `max_chunk_lines` (hard cap, `Settings.stage3_max_chunk_lines`, default 4000) becomes its own `oversized=True` chunk instead. Pure and in-memory — no `tree-sitter` dependency (never re-parses; consumes `ExtractedFunction` boundaries Step 2 already computed) and no filesystem I/O of its own; bounded to one binary's chunk data at a time (callers invoke it once per `Target`, same granularity as `extract_functions`). `Chunk.to_json_dict()` is metadata-only (excludes raw function text, mirroring `IngestionReport.to_json_dict()`'s exclusion of `Target.functions`).
-- **`chunk_queue.py`** — Step 4's queueing, an in-process `asyncio.Queue`, deliberately not Redis or any external broker (no message-queue dependency or long-running-service infra exists anywhere in this project; the queue and its consumers run inline within one `fw-analyze --queue` invocation). `ChunkQueue.put(chunk)` persists `chunk.to_text()` to `layout.chunks_dir()`/`layout.chunk_filename()` and enqueues a `ChunkHandle` (metadata + `chunk_path` pointer) instead of the `Chunk` itself — the queue never holds chunk text in memory, bounding its footprint to `O(maxsize x metadata)` regardless of firmware size. `ack()`/`nack()` give retry semantics (`nack()` re-queues with `attempt` incremented, up to `Settings.stage3_queue_max_attempts`, then records permanent failure) — `ChunkHandle` is frozen like every other Stage 3 dataclass; retries are built via `dataclasses.replace`, never mutation. `close()` calls `asyncio.Queue.join()` before pushing sentinels — load-bearing, not defensive: without it, a chunk retried after the producer finishes its own `put()` calls would land behind the sentinel and never be seen by its worker. `produce_chunks()` (clean + chunk + enqueue every target, degrading gracefully if tree-sitter is missing) and `run_queue()` (spawns the producer and `Settings.stage3_queue_workers` consumers concurrently, writes `stage3_summary.json` via `common.schemas.Stage3Summary`) are Component 1's complete Step 4. `run_queue(..., consumer=...)` is Component 2's intended extension point — omitted, it uses a no-op placeholder consumer that proves the plumbing works without doing real analysis.
-- **Never writes into `stage2/` or the decompiled mirror tree** — every module here only reads Stage 2's output and writes into its own `<db_subfolder>/stage3/` directory.
-
-### Two Docker images, deliberately separate
-
-`docker/Dockerfile` (Stage 1's sandbox) and `docker/Dockerfile.ghidra` (Stage 2's) are **not merged**: Stage 1 starts its container 6+ times per firmware, so bundling ~2GB of JDK+Ghidra into that image would tax every one of those starts for zero benefit; the Stage 1 image's `tpl-builder` stage is also a known-flaky, network-heavy build (see "Known limitations" below) that Stage 2 must not inherit. Stage 2's runtime stage is built on `eclipse-temurin:21-jdk-jammy`, not `debian:bookworm-slim` — OpenJDK 21 is not installable via apt on Debian bookworm (confirmed against a real build: absent from both the regular archive and `bookworm-backports`), and Temurin's official image sidesteps that entirely.
+## Cross-cutting architecture (applies across stages)
 
 ### The Executor abstraction (`fw_audit/executors/`)
 
-A uniform interface (`Executor.run(command, files=workspace)`) so callers never know which backend answers a command — selected via `FWA_EXECUTOR_BACKEND` through `manager.get_executor()`:
+A uniform interface (`Executor.run(command, files=workspace)`) so callers never know which backend answers a command — selected via `FWA_EXECUTOR_BACKEND` through `manager.get_executor()`: **`DockerExecutor`** (default, production — plain Docker, `--network=none`, used by Stage 1's deterministic Extraction Script and Stage 2's Ghidra invocations against separate images), **`SandboxExecutor`** (reserved, **not implemented** — intended for future *LLM-controlled* execution, Stage 5 territory), **`LocalExecutor`** (host subprocess, tests/dev only, never production). An unrecognized backend name raises `ValueError` rather than silently degrading isolation.
 
-- **`DockerExecutor`** (default, `"docker"`) — plain Docker containers for the Extraction Script's fixed, deterministic command sequence, isolated with `--network=none`. This is production.
-- **`SandboxExecutor`** (`"sandbox"`) — reserved, **not implemented**. Intended for future *LLM-controlled* execution (an agent writing/running its own code — Stage 4/5 territory). Stage 1 never touches it, since the Identifier Agent has zero execution rights by design. Don't wire Stage 1 to this.
-- **`LocalExecutor`** (`"local"`) — host subprocess, tests/dev only. Never used for untrusted firmware in production.
+### Two Docker images, deliberately separate
 
-An unrecognized backend name raises `ValueError` rather than silently falling back to a weaker isolation level.
+`docker/Dockerfile` (Stage 1's sandbox) and `docker/Dockerfile.ghidra` (Stage 2's) are not merged — Stage 1 starts its container 6+ times per firmware, so bundling ~2GB of JDK+Ghidra would tax every start for no benefit, and Stage 1's `tpl-builder` stage is a known-flaky build Stage 2 must not inherit. See each stage's own docs for build commands and known traps.
 
 ### LLM routing (`fw_audit/config/llm_config.py`)
 
-Agents request an `AgentRole` (e.g. `STAGE1_BINARY_IDENTIFIER`), which resolves through `ROLE_TO_TIER` to a `ModelTier` (`FAST_LOCAL` / `BALANCED` / `HIGH_REASONING`), which resolves through `TIER_TO_SPEC` to a concrete `ModelSpec` (provider + model). Add new agents by adding a role there rather than hardcoding a model name at the call site. Provider SDKs (`langchain-ollama`/`langchain-anthropic`/`langchain-google-genai`) are imported lazily inside each `_build_*` function, so installing only one extra is enough to use that provider.
-
-**For now, `FAST_LOCAL` = Ollama `qwen2.5-coder:1.5b`** (local, offline, `format="json"` forced — a 1.5B model needs Ollama's constrained decoding to reliably emit valid structured output; verified empirically, see the comment on that `ModelSpec`). `STAGE1_BINARY_IDENTIFIER` is currently routed to `FAST_LOCAL` rather than its originally-designed `HIGH_REASONING` (Anthropic) because no cloud key is configured in this dev environment — this is a stand-in for development/testing, not the intended production routing. It's one call per firmware, so once a cloud key is added, flip that entry back to `HIGH_REASONING` for better accuracy on the untrusted-path-list judgment Stage 2 depends on. Any new agentic role added while still in this local-only phase should default to `FAST_LOCAL` too, so the whole pipeline stays runnable offline until API keys are wired in.
+Agents request an `AgentRole` (`STAGE1_BINARY_IDENTIFIER`, `STAGE3_VULN_ANALYST`, ...), which resolves through `ROLE_TO_TIER` to a `ModelTier`, which resolves through `TIER_TO_SPEC` to a `ModelSpec` (provider + model). Add new agentic roles by adding a role here (default `HIGH_REASONING` unless there's a reason not to) — never hardcode a model at the call site. Construction goes through `langchain.chat_models.init_chat_model` via a single `get_llm()`; `resolve_spec(role)` checks `Settings.stage3_analyst_model` (`FWA_STAGE3_ANALYST_MODEL`, role-specific) then `Settings.llm_model` (`FWA_LLM_MODEL`, global) before falling back to the tier tables — both `"<provider>:<model>"` strings. Provider SDKs are resolved lazily; installing one extra (`.[anthropic]`, `.[ollama]`, ...) is enough.
 
 ### Config (`fw_audit/config/settings.py`)
 
-Single `Settings` (pydantic-settings) object, cached via `get_settings()`. No module should reach for `os.environ` directly — add new config here. Convention: LLM credentials use their conventional env-var names (`ANTHROPIC_API_KEY`, `OLLAMA_BASE_URL`); app-specific settings use the `FWA_` prefix.
+Single `Settings` (pydantic-settings) object, cached via `get_settings()`. No module reaches for `os.environ` directly — add new config here. LLM credentials use conventional env-var names (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_BASE_URL`); app-specific settings use the `FWA_` prefix.
 
-### Cross-stage schemas (`fw_audit/common/schemas.py`)
+### Cross-stage schemas (`fw_audit/common/schemas.py`, `fw_audit/common/findings.py`)
 
-Pydantic models forming the data contracts passed between stages (`FirmwareMetadata`, `ExtractionArtifact`, `ELFInfo`, `IdentifiedBinary`, `Stage1Summary`, `DecompiledBinary`, `Stage2Summary`, ...). Later stages should import these rather than re-deriving ad-hoc dicts. Note the Component 1/2 split reflected here too: `ELFInfo` is purely descriptive (from the Extraction Script, no judgment), `IdentifiedBinary` is strictly `{"path": str}` — no separate `extension`/`reason` field; when an extension is needed it's derived on demand from `path` via `extension_from_path`, kept as the single source of truth rather than a second field that could drift out of sync.
-
-`Stage2Summary` fixes a defect `Stage1Summary` has: every path inside it is **relative to `db_subfolder`**, not host-absolute, so the Database directory stays relocatable — and it's written by `run_extraction()` itself, not only by the `fw-extract` CLI, so a programmatic caller (Stage 3) gets a summary too. ONE documented exception: `decompiled_tree_dir` (and by extension `DecompiledBinary.artifacts.decompiled_tree_c`) is relative to `db_subfolder`'s *parent*, not `db_subfolder` itself — the decompiled-C mirror tree (`layout.decompiled_tree_dir`) is required to live as a sibling of the run dir, so it cannot be expressed relative to `db_subfolder` without raising. See that field's docstring for the reconstruction formula.
+`schemas.py` carries the pipeline-plumbing contracts passed between stages (`FirmwareMetadata`, `IdentifiedBinary`, `Stage1Summary`, `DecompiledBinary`, `Stage2Summary`, `Stage3Summary`, ...) — later stages import these rather than re-deriving ad-hoc dicts. `findings.py` carries Stage 3 Component 2's `AnalysisReport`/`Finding`/`AnalysisRunSummary` — the exact structured-output contract, kept separate from `schemas.py` to avoid bloating it further. `Stage2Summary` paths are relative to `db_subfolder`, with one documented exception (`decompiled_tree_dir` — see its docstring).
 
 ### Why `fw_audit/` wraps everything
 
-`fw_audit/` is the single top-level package (rather than bare `config/`, `common/`, `stage1_ingestion/` at repo root) specifically to avoid Python import-name collisions with generic module names.
+The single top-level package (rather than bare `config/`, `common/`, `stage1_ingestion/` at repo root) avoids Python import-name collisions with generic module names.
 
 ## Testing notes
 
-The unit suite mocks both boundaries Stage 1 depends on: `tests/conftest.py::FakeExecutor` stands in for Docker, and the Identifier Agent is monkeypatched — so `pytest -m "not integration"` stays green with no Docker daemon and no LLM provider configured. Stage 2's unit suite mocks the same way (`FakeExecutor` pointed at `ghidra_executor`) and additionally needs no LLM at all. Integration tests need a real firmware image (drop under `tests/fixtures/` or point `FWA_TEST_FIRMWARE` at one), the relevant Docker image(s) built, and — for Stage 1 only — an LLM provider configured. `tests/test_stage2_integration.py::test_decompiles_a_real_elf` needs only the Ghidra image (decompiles `/bin/ls` copied out of the image itself — no firmware fixture required).
+The unit suite mocks both boundaries each stage depends on (`tests/conftest.py::FakeExecutor` for Docker, monkeypatched agents for LLM calls), so `pytest -m "not integration"` stays green with no Docker daemon and no LLM provider configured. Integration tests need real firmware/Docker images — see each stage's own docs for exact requirements and commands.
 
-## Known limitations
+## Git/workflow conventions
 
-- TP-Link RSA-key extraction (`tp-link-decrypt`) currently fails to build against TP-Link's presently-served firmware samples (upstream firmware-content mismatch, not a defect here). The Docker image falls back to a stub that reports this clearly; `--tplink` runs hard-fail with an honest message until revisited. Everything else in the sandbox image (binwalk, squashfs-tools, sasquatch, unzip) works independently of this.
-- `docker/Dockerfile.ghidra` builds successfully and `tests/test_stage2_integration.py::test_decompiles_a_real_elf` passes against real Ghidra 12.1.2 (verified: decompiles `/bin/ls`, 386 functions, normalized Joern output free of `undefined`-family types and `::`). The `GHIDRA_SHA256` currently baked in was computed from an actual downloaded release asset, not pasted — re-verify the same way after any `GHIDRA_VERSION` bump. Three build-time traps already fixed here, worth knowing if you touch this file: OpenJDK 21 isn't installable via apt on Debian bookworm at all (base image is `eclipse-temurin:21-jdk-jammy` instead, not `debian:bookworm-slim`); PyGhidra/JPype must be installed from Ghidra's own bundled wheels (`Ghidra/Features/PyGhidra/pypkg/dist/`) via `pip install --no-index -f <dist_dir> pyghidra`, not a guessed PyPI version pin (Ghidra 12.1.2 bundles pyghidra 3.1.0 + JPype1 1.5.2, not whatever version a stale pin might specify); and every headless invocation — the smoke test in this Dockerfile, and `ghidra/command.py`'s per-binary invocation — MUST go through `pyghidraRun -H`, not bare `analyzeHeadless`, or PyGhidra `.py` scripts fail with "Ghidra was not started with PyGhidra".
+Commit or push only when asked. Branch off `main` before committing. Follow the stage doc for the stage you're changing before making cross-stage edits — most feature work touches exactly one stage's package plus, at most, `common/schemas.py` or `common/findings.py`.

@@ -7,13 +7,17 @@ directories at the point they actually write into them.
 Layout, under `<db_subfolder>/stage3/`::
 
     ingestion_report.json
-    stage3_summary.json      (written by chunk_queue.run_queue(), --queue)
+    stage3_summary.json       (written by chunk_queue.run_queue(), --queue)
+    analysis_summary.json     (written by agent.orchestrator.run_analysis(),
+                                --analyze — Component 2's own run summary)
     debug/<bin_id>.c              (--debug only; Step 1's raw resolved-source
                                     dump — see debug_dir/debug_source_path)
     debug/<bin_id>.cleaned.c       (--debug only; Step 2's function-only
                                     extraction — see debug_cleaned_source_path)
     chunks/<chunk_id>.c       (Step 3's chunk-payload location — see
                                 chunks_dir/chunk_filename)
+    findings/<chunk_id>.json  (Component 2's per-chunk AnalysisReport — see
+                                findings_dir/finding_filename)
 
 `debug/` and `chunks/` are deliberately separate: `debug/` holds up to two files
 per `Target` (raw + cleaned, answering different questions — see each path
@@ -96,3 +100,24 @@ def chunk_filename(chunk_id: str) -> str:
     Step 3 uses as a human-readable separator for something that isn't
     awkward in a Windows filename."""
     return f"{chunk_id.replace('#', '__')}.c"
+
+
+def findings_dir(stage3_dir_: Path) -> Path:
+    """Component 2's per-chunk `AnalysisReport` JSON directory, written by
+    `agent.consumer.AnalysisConsumer` as each chunk is acked. Separate from
+    `chunks_dir` above (the INPUT payload a consumer reads) — this is the
+    OUTPUT a consumer produces."""
+    return stage3_dir_ / "findings"
+
+
+def finding_filename(chunk_id: str) -> str:
+    """Same `#` -> `__` substitution as `chunk_filename`, `.json` instead
+    of `.c` — keeps a finding's filename trivially derivable from its
+    chunk's filename."""
+    return f"{chunk_id.replace('#', '__')}.json"
+
+
+def analysis_summary_path(stage3_dir_: Path) -> Path:
+    """Written by `agent.orchestrator.run_analysis()` itself, mirroring
+    `stage3_summary_path`'s precedent — see `common.findings.AnalysisRunSummary`."""
+    return stage3_dir_ / "analysis_summary.json"

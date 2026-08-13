@@ -12,9 +12,12 @@ license = { text = "MIT" }
 authors = [{ name = "SUTD Agent1o7" }]
 
 # Core runtime deps: keep the always-required set small.
+# `langchain` (the meta-package) owns `langchain.chat_models.init_chat_model`,
+# the provider-agnostic model factory `fw_audit.config.llm_config` builds on.
 dependencies = [
-    "langgraph>=0.2.0",
-    "langchain-core>=0.3.0",
+    "langgraph>=1.0.0",
+    "langchain>=1.0.0",
+    "langchain-core>=1.0.0",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
@@ -22,13 +25,17 @@ dependencies = [
 
 [project.optional-dependencies]
 # Install only the LLM providers you actually use.
-ollama = ["langchain-ollama>=0.2.0"]
-anthropic = ["langchain-anthropic>=0.2.0"]
+ollama = ["langchain-ollama>=1.0.0"]
+anthropic = ["langchain-anthropic>=1.0.0"]
 google = ["langchain-google-genai>=2.0.0"]
+# OpenAI-compatible endpoints: OpenAI itself, and any locally-hosted server that
+# speaks the OpenAI API (vLLM, LM Studio) via `Settings.openai_base_url`.
+openai = ["langchain-openai>=1.0.0"]
 all = [
-    "langchain-ollama>=0.2.0",
-    "langchain-anthropic>=0.2.0",
+    "langchain-ollama>=1.0.0",
+    "langchain-anthropic>=1.0.0",
     "langchain-google-genai>=2.0.0",
+    "langchain-openai>=1.0.0",
 ]
 # Stage 3's tree-sitter-based function extraction (fw_audit.stage3_analysis.clean).
 # Optional: --debug degrades gracefully (raw dump only, with a warning) without this.

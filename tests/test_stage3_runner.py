@@ -72,6 +72,8 @@ def test_parse_args_defaults():
     assert args.debug_chunks is False
     assert args.chunk_lines is None
     assert args.queue is False
+    assert args.analyze is False
+    assert args.model is None
     assert args.run_id is None
 
 
@@ -99,6 +101,16 @@ def test_parse_args_chunk_lines():
 def test_parse_args_queue_flag():
     args = _parse_args(["s.json", "--queue"])
     assert args.queue is True
+
+
+def test_parse_args_analyze_flag():
+    args = _parse_args(["s.json", "--analyze"])
+    assert args.analyze is True
+
+
+def test_parse_args_model_override():
+    args = _parse_args(["s.json", "--analyze", "--model", "ollama:qwen2.5-coder:1.5b"])
+    assert args.model == "ollama:qwen2.5-coder:1.5b"
 
 
 def test_main_without_debug_writes_no_debug_dump(tmp_path: Path, capsys):
@@ -449,3 +461,70 @@ def test_main_exit_code_1_on_zero_targets(tmp_path: Path, capsys):
     assert code == 1
     captured = capsys.readouterr()
     assert "Machine-readable report:" in captured.out
+
+
+def test_main_analyze_runs_agent_consumer_and_prints_findings(tmp_path: Path, capsys, monkeypatch):
+    from fw_audit.common.findings import AnalysisReport
+
+    async def fake_analyze_chunk(text, *, chunk_id, rootfs_path, settings, function_names=()):
+        return AnalysisReport(chunk_id=chunk_id, findings=[], checked_categories=[])
+
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk", fake_analyze_chunk
+    )
+
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    code = main([str(summary_path), "--analyze"])
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Analysis (" in captured.out
+    assert "Findings:" in captured.out
+    assert "Analysis summary:" in captured.out
+
+    analysis_summary_path = tmp_path / "db" / "fw" / "stage3" / "analysis_summary.json"
+    assert analysis_summary_path.is_file()
+
+
+def test_main_analyze_model_override_is_applied(tmp_path: Path, monkeypatch):
+    from fw_audit.common.findings import AnalysisReport
+
+    captured_model = {}
+
+    async def fake_analyze_chunk(text, *, chunk_id, rootfs_path, settings, function_names=()):
+        captured_model["value"] = settings.stage3_analyst_model
+        return AnalysisReport(chunk_id=chunk_id, findings=[], checked_categories=[])
+
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk", fake_analyze_chunk
+    )
+
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    code = main(
+        [str(summary_path), "--analyze", "--model", "ollama:qwen2.5-coder:1.5b"]
+    )
+
+    assert code == 0
+    assert captured_model["value"] == "ollama:qwen2.5-coder:1.5b"
+
+
+def test_main_analyze_missing_credential_exits_2(tmp_path: Path, capsys, monkeypatch):
+    def _raise(role, settings=None):
+        raise ValueError("ANTHROPIC_API_KEY is not set.")
+
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.orchestrator.resolve_usable_spec", _raise
+    )
+
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    code = main([str(summary_path), "--analyze"])
+
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "analyst model unavailable" in captured.err

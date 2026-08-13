@@ -45,9 +45,63 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GOOGLE_API_KEY", "GEMINI_API_KEY"),
     )
+    openai_api_key: str | None = Field(default=None, validation_alias="OPENAI_API_KEY")
+    openai_base_url: str | None = Field(default=None, validation_alias="OPENAI_BASE_URL")
+    """Override the OpenAI API endpoint. Unset = real OpenAI. Point this at a
+    local OpenAI-compatible server (vLLM, LM Studio, ...) to run the "openai"
+    provider fully offline without a new ModelProvider member."""
     ollama_base_url: str = Field(
         default="http://localhost:11434", validation_alias="OLLAMA_BASE_URL"
     )
+    ollama_num_ctx: int = Field(
+        default=32768, ge=1, validation_alias="FWA_OLLAMA_NUM_CTX"
+    )
+    """Ollama's server-side default context window is only 2048 tokens,
+    which silently truncates prompts for any non-trivial firmware/chunk —
+    see the long comment in `config.llm_config` for the empirical basis.
+    Applied to every Ollama-backed spec, not just one hardcoded tier."""
+    ollama_num_predict: int = Field(
+        default=4096, ge=1, validation_alias="FWA_OLLAMA_NUM_PREDICT"
+    )
+    """Hard cap on Ollama generation length — guards against a small
+    model's degenerate repetition loops burning minutes producing
+    unusably long, unparseable output. See `config.llm_config`."""
+
+    # ---- LLM model routing overrides -----------------------------------
+    llm_model: str | None = Field(default=None, validation_alias="FWA_LLM_MODEL")
+    """Global override, `"<provider>:<model>"` (e.g. `"anthropic:claude-
+    sonnet-4-5"`, `"ollama:qwen2.5-coder:1.5b"`). Consulted by
+    `llm_config.resolve_spec()` before the tier table, for every role that
+    has no more specific per-role override set. `provider` must be one of
+    `ModelProvider`'s values; `model` may itself contain `:` (Ollama tags),
+    so only the FIRST `:` is split on."""
+    stage3_analyst_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE3_ANALYST_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE3_VULN_ANALYST`, same
+    `"<provider>:<model>"` syntax as `llm_model`. Takes precedence over
+    `llm_model` for that role only — e.g. set this to
+    `"ollama:qwen2.5-coder:1.5b"` to run Stage 3's analysis offline while
+    leaving Stage 1's identifier (or `llm_model`) on the cloud default."""
+    use_local_model: bool = Field(
+        default=False, validation_alias="FWA_USE_LOCAL_MODEL"
+    )
+    """Preference switch consulted by `llm_config.resolve_spec()` for every
+    role that has no explicit `"<provider>:<model>"` override set (those
+    above always win outright — this only decides between the API-backed
+    and local-Ollama halves of the tier table).
+
+    * `False` (default) = prefer the API-backed model (e.g. Anthropic
+      Claude Sonnet, `ModelTier.HIGH_REASONING`'s normal spec).
+    * `True` = prefer the local Ollama model (`ModelTier.FAST_LOCAL`'s
+      spec) instead.
+
+    Whichever is preferred is tried first; if its credential/provider is
+    unavailable, `llm_config.get_llm`/`get_llm_for_agent` automatically
+    fall back to the OTHER mode (API <-> local) rather than failing
+    immediately. Only when *neither* the preferred nor the fallback model
+    is usable does resolution raise — see `llm_config.get_llm`'s
+    docstring for the exact precedence."""
 
     # ---- Directories ----------------------------------------------------
     data_dir: Path = Field(default=PROJECT_ROOT / "data", validation_alias="FWA_DATA_DIR")
@@ -182,6 +236,37 @@ class Settings(BaseSettings):
     (the no-op placeholder consumer never does) — reserved for Component
     2's real LLM calls, which can fail transiently (timeouts, rate
     limits) in ways this session's placeholder cannot."""
+
+    # ---- Stage 3 Component 2: LLM vulnerability-analysis worker pool ----
+    stage3_llm_timeout_seconds: int = Field(
+        default=300, ge=1, validation_alias="FWA_STAGE3_LLM_TIMEOUT_SECONDS"
+    )
+    """Per-chunk wall-clock cap on the analyst LLM call
+    (`agent.consumer.AnalysisConsumer`), enforced via `asyncio.wait_for`.
+    A `TimeoutError` here is caught by `chunk_queue._worker`'s broad
+    `except Exception` and retried through the normal nack() path."""
+    stage3_llm_retry_backoff_seconds: float = Field(
+        default=2.0, ge=0, validation_alias="FWA_STAGE3_LLM_RETRY_BACKOFF_SECONDS"
+    )
+    """Base delay for `AnalysisConsumer`'s exponential backoff on a retried
+    chunk (`ChunkHandle.attempt > 0`) — `ChunkQueue.nack()` itself re-queues
+    instantly with no delay, so the backoff lives in the consumer instead,
+    keyed off the `attempt` counter the handle already carries."""
+    stage3_max_chunk_tokens: int = Field(
+        default=100_000, ge=1, validation_alias="FWA_STAGE3_MAX_CHUNK_TOKENS"
+    )
+    """A chunk whose `ChunkHandle.approx_tokens` exceeds this is skipped
+    (recorded `skipped_oversized`, acked without an LLM call) rather than
+    burning `stage3_queue_max_attempts` retries on a prompt that cannot
+    fit the model's context window."""
+    stage3_repair_attempts: int = Field(
+        default=1, ge=0, validation_alias="FWA_STAGE3_REPAIR_ATTEMPTS"
+    )
+    """Extra in-process re-invocations `agent.analyst.analyze_chunk` makes
+    when the LLM's structured output fails Pydantic validation, feeding
+    the validation error back as an additional message. 0 disables
+    repair — a schema miss then falls straight through to the queue's
+    own nack()/retry instead."""
 
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names

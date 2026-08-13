@@ -34,11 +34,21 @@ every resolved target, persists each chunk to `<db_subfolder>/stage3/
 chunks/<chunk_id>.c` (the queue's own source of truth — unconditional,
 unlike `--debug-chunks`'s manual dump), drains them through an in-process
 `asyncio.Queue` with `Settings.stage3_queue_workers` concurrent consumers,
-and writes `<db_subfolder>/stage3/stage3_summary.json`. Since Component 2
-(the real LLM agent pool) isn't built yet, this uses a no-op placeholder
-consumer — proves the queue/backpressure/retry/shutdown mechanism works,
-does no actual vulnerability analysis. `main()` stays synchronous except
-for this one flag, bridged via a single `asyncio.run(...)` call.
+and writes `<db_subfolder>/stage3/stage3_summary.json`. Uses a no-op
+placeholder consumer — proves the queue/backpressure/retry/shutdown
+mechanism works, does no actual vulnerability analysis. Use `--analyze`
+instead to run Component 2's real LLM consumer.
+
+`--analyze` (Component 2) implies `--queue`'s plumbing but swaps the no-op
+consumer for `agent.orchestrator.run_analysis()`'s real one: each chunk is
+sent to the analyst LLM (`AgentRole.STAGE3_VULN_ANALYST` — Anthropic Claude
+Sonnet by default), validated against `common.findings.AnalysisReport`, and
+persisted to `<db_subfolder>/stage3/findings/<chunk_id>.json`, with a run
+summary at `<db_subfolder>/stage3/analysis_summary.json`. `--model
+provider:model` overrides which model is used for this run only (e.g.
+`--model ollama:qwen2.5-coder:1.5b` for an offline smoke test). `main()`
+stays synchronous except for the queue/analysis bridge, a single
+`asyncio.run(...)` call.
 """
 
 from __future__ import annotations
@@ -51,6 +61,7 @@ from pathlib import Path
 
 from fw_audit.config.settings import get_settings
 from fw_audit.stage3_analysis import layout
+from fw_audit.stage3_analysis.agent.orchestrator import AnalystModelUnavailableError, run_analysis
 from fw_audit.stage3_analysis.chunk_queue import run_queue
 from fw_audit.stage3_analysis.errors import Stage3InputError
 from fw_audit.stage3_analysis.ingest import ingest
@@ -117,9 +128,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Run Step 4: chunk every resolved target, persist each chunk to "
             "<db_subfolder>/stage3/chunks/<chunk_id>.c, drain them through an "
-            "asyncio.Queue with a no-op placeholder consumer (Component 2's "
-            "real LLM agent pool isn't built yet), and write "
-            "<db_subfolder>/stage3/stage3_summary.json."
+            "asyncio.Queue with a no-op placeholder consumer, and write "
+            "<db_subfolder>/stage3/stage3_summary.json. Use --analyze for "
+            "real LLM-backed vulnerability analysis instead."
+        ),
+    )
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help=(
+            "Run Component 2: like --queue, but each chunk is sent to the "
+            "analyst LLM and the result written to <db_subfolder>/stage3/"
+            "findings/<chunk_id>.json, with a run summary at "
+            "<db_subfolder>/stage3/analysis_summary.json. Implies --queue."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        metavar="PROVIDER:MODEL",
+        help=(
+            "Override the analyst model for this run only, e.g. "
+            "'anthropic:claude-sonnet-4-5' or 'ollama:qwen2.5-coder:1.5b' "
+            "(offline testing). Only meaningful with --analyze."
         ),
     )
     parser.add_argument(
@@ -182,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
         settings = settings.model_copy(update={"stage3_chunk_debug_dump": True})
     if args.chunk_lines is not None:
         settings = settings.model_copy(update={"stage3_chunk_lines": args.chunk_lines})
+    if args.model is not None:
+        settings = settings.model_copy(update={"stage3_analyst_model": args.model})
 
     try:
         report = ingest(
@@ -194,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _print_report(report)
-    stage3_dir = report.db_subfolder / "stage3"
+    stage3_dir = layout.stage3_dir(report.db_subfolder)
     print(f"\nMachine-readable report: {stage3_dir}/ingestion_report.json")
 
     if args.debug and report.targets:
@@ -202,7 +236,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.debug_chunks and report.targets:
         print(f"Chunk debug dump: {layout.chunks_dir(stage3_dir)}/<chunk_id>.c")
 
-    if args.queue:
+    if args.analyze:
+        try:
+            analysis_summary, queue_summary = asyncio.run(
+                run_analysis(report, settings=settings, run_id=args.run_id)
+            )
+        except AnalystModelUnavailableError as exc:
+            print(f"error: analyst model unavailable: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"\nQueue: {queue_summary.total_chunks} chunks, {queue_summary.total_acked} acked, "
+            f"{queue_summary.total_failed} failed"
+        )
+        print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
+        print(
+            f"Analysis ({analysis_summary.model}): {analysis_summary.total_analyzed} analyzed, "
+            f"{analysis_summary.total_failed} failed, {analysis_summary.total_skipped} skipped, "
+            f"{analysis_summary.total_findings} findings"
+        )
+        print(f"Findings: {layout.findings_dir(stage3_dir)}/<chunk_id>.json")
+        print(f"Analysis summary: {layout.analysis_summary_path(stage3_dir)}")
+    elif args.queue:
         summary = asyncio.run(run_queue(report, settings=settings, run_id=args.run_id))
         print(
             f"\nQueue: {summary.total_chunks} chunks, {summary.total_acked} acked, "
