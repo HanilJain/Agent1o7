@@ -54,6 +54,13 @@ stage2 = ["tree-sitter==0.23.2", "tree-sitter-c==0.23.2"]
 # moved from Stage 3 into Stage 2 (see stage2_extraction.clean), but the install
 # command shouldn't silently break for anyone still using the old extra name.
 stage3 = ["tree-sitter==0.23.2", "tree-sitter-c==0.23.2"]
+# Stage 4 Components 1+2 (fw_audit.stage4_rag.colab.chunk_and_embed) are designed
+# to run in Google Colab, which installs its own deps via a notebook `!pip install`
+# cell — see that module's docstring — so these are NOT required for the local venv
+# or for this project's own unit tests (both heavy imports are lazy, inside the
+# functions that need them). This extra exists only so a developer can optionally
+# run/test that same script locally instead of in Colab.
+stage4-colab = ["chromadb>=0.5", "sentence-transformers>=3.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -89,8 +96,11 @@ target-version = "py311"
 # not this project's venv — `currentProgram`, `monitor`, `getScriptArgs`,
 # and Java package imports (`java.io`, `ghidra.*`, `jpype`) only exist
 # there, so neither ruff nor mypy can meaningfully check it against this
-# project's environment.
-extend-exclude = ["docker/ghidra_scripts"]
+# project's environment. `.ipynb` notebooks are excluded too: ruff lints each
+# cell in isolation, so Stage 4's `stage4_colab.ipynb` (whose cells intentionally
+# depend on names defined in earlier cells, as any notebook's do) trips spurious
+# F821 undefined-name errors that don't reflect a real bug.
+extend-exclude = ["docker/ghidra_scripts", "*.ipynb"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]

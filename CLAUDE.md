@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 1 — Ingestion & Pre-processing | `fw_audit/stage1_ingestion/` | [CLAUDE.md](fw_audit/stage1_ingestion/CLAUDE.md) · [README.md](fw_audit/stage1_ingestion/README.md) |
 | 2 — Feature Extraction | `fw_audit/stage2_extraction/` | [CLAUDE.md](fw_audit/stage2_extraction/CLAUDE.md) · [README.md](fw_audit/stage2_extraction/README.md) |
 | 3 — Analysis Core (+ agentic analysis) | `fw_audit/stage3_analysis/` | [CLAUDE.md](fw_audit/stage3_analysis/CLAUDE.md) · [README.md](fw_audit/stage3_analysis/README.md) |
-| 4 — (reserved, empty) | `fw_audit/stage4_analysis/` | [CLAUDE.md](fw_audit/stage4_analysis/CLAUDE.md) · [README.md](fw_audit/stage4_analysis/README.md) |
+| 4 — RAG Sink-to-Source Identifier (in progress) | `fw_audit/stage4_rag/` | [CLAUDE.md](fw_audit/stage4_rag/CLAUDE.md) · [README.md](fw_audit/stage4_rag/README.md) |
 | 5 — Sandboxed Verification (empty) | `fw_audit/stage5_verification/` | [CLAUDE.md](fw_audit/stage5_verification/CLAUDE.md) · [README.md](fw_audit/stage5_verification/README.md) |
 | 6 — Reporting (empty) | `fw_audit/stage6_reporting/` | [CLAUDE.md](fw_audit/stage6_reporting/CLAUDE.md) · [README.md](fw_audit/stage6_reporting/README.md) |
 
@@ -49,6 +49,9 @@ A uniform interface (`Executor.run(command, files=workspace)`) so callers never 
 ### Two Docker images, deliberately separate
 
 `docker/Dockerfile` (Stage 1's sandbox) and `docker/Dockerfile.ghidra` (Stage 2's) are not merged — Stage 1 starts its container 6+ times per firmware, so bundling ~2GB of JDK+Ghidra would tax every start for no benefit, and Stage 1's `tpl-builder` stage is a known-flaky build Stage 2 must not inherit. See each stage's own docs for build commands and known traps.
+Note to follow everytime: 
+Docker Sandbox : will be used when Agentic AI is deployed which requires tool access. 
+Docker Container : Will be used when any script or trandional based work is required. 
 
 ### LLM routing (`fw_audit/config/llm_config.py`)
 
