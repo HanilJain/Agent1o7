@@ -54,12 +54,15 @@ stage2 = ["tree-sitter==0.23.2", "tree-sitter-c==0.23.2"]
 # moved from Stage 3 into Stage 2 (see stage2_extraction.clean), but the install
 # command shouldn't silently break for anyone still using the old extra name.
 stage3 = ["tree-sitter==0.23.2", "tree-sitter-c==0.23.2"]
-# Stage 4 Components 1+2 (fw_audit.stage4_rag.colab.chunk_and_embed) are designed
-# to run in Google Colab, which installs its own deps via a notebook `!pip install`
-# cell — see that module's docstring — so these are NOT required for the local venv
-# or for this project's own unit tests (both heavy imports are lazy, inside the
-# functions that need them). This extra exists only so a developer can optionally
-# run/test that same script locally instead of in Colab.
+# Stage 4's local pipeline (fw_audit.stage4_rag: corpus_build.py, C1+C2's
+# underlying engine in colab/chunk_and_embed.py, and C4's retrieval/store.py)
+# needs a vector store client + a sentence-embedding library. NOT required
+# for this project's own unit tests (both heavy imports are lazy, inside the
+# functions that need them) — only for actually building/querying a corpus.
+# `stage4-colab` is kept as an alias: the Colab notebook is now an optional
+# alternate path (see colab/stage4_colab.ipynb) rather than the primary one,
+# but installs the identical two packages either way.
+stage4 = ["chromadb>=0.5", "sentence-transformers>=3.0"]
 stage4-colab = ["chromadb>=0.5", "sentence-transformers>=3.0"]
 dev = [
     "pytest>=8.0",
@@ -73,6 +76,7 @@ dev = [
 fw-ingest = "fw_audit.stage1_ingestion.runner:main"
 fw-extract = "fw_audit.stage2_extraction.runner:main"
 fw-analyze = "fw_audit.stage3_analysis.runner:main"
+fw-trace = "fw_audit.stage4_rag.runner:main"
 
 [tool.setuptools.packages.find]
 include = ["fw_audit*"]

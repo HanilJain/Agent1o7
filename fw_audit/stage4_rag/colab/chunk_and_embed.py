@@ -93,11 +93,17 @@ class Stage4ColabConfig:
     output_dir: Path = Path("./stage4_corpus_build")
     chunk_words: int = 500
     chunk_overlap_words: int = 0
-    # TODO: user specified the Qwen3-Embedding 3B-parameter tier — confirm
-    # the exact Hugging Face repo id/tag under https://huggingface.co/Qwen
-    # before running and update this default. Left as an explicit
-    # placeholder rather than silently substituting a different size.
-    embedding_model: str = "Qwen/Qwen3-Embedding-3B"  # TODO: verify this tag exists
+    # Qwen3-Embedding-0.6B: smallest tier of the Qwen3-Embedding family —
+    # fast enough for CPU-only local embedding during iteration/testing.
+    # Usage: from sentence_transformers import SentenceTransformer
+    #        model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
+    #        embeddings = model.encode(texts)
+    # Override this field (e.g. to the 4B/8B tiers) for higher-quality
+    # embeddings once quality, not iteration speed, is the bottleneck.
+    # MUST match `Settings.stage4_embedding_model` if corpora built here are
+    # ever queried by the local retrieval engine (Component 4) — see that
+    # module's parity requirement.
+    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_device: str | None = None  # None -> sentence-transformers auto-picks CUDA if present
     chroma_collection_name: str = "stage4_corpus"
     embed_batch_size: int = 32
@@ -122,8 +128,9 @@ class CorpusKind(str, Enum):  # noqa: UP042 — str+Enum (not StrEnum) matches t
 # two sets first if a corpus is misclassifying real files.
 ALLOWED_TEXT_EXTENSIONS: frozenset[str] = frozenset(
     {
-        ".html", ".htm", ".asp", ".aspx", ".js", ".css", ".txt", ".xml",
-        ".json", ".conf", ".cfg", ".ini", ".sh", ".php", ".cgi", ".lua",
+        ".html",
+        # ".html", ".htm", ".asp", ".aspx", ".js", ".css", ".txt", ".xml",
+        # ".json", ".conf", ".cfg", ".ini", ".sh", ".php", ".cgi", ".lua",
     }
 )
 """Extensions treated as human-readable text — embedded as-is."""
@@ -525,28 +532,42 @@ def run(config: Stage4ColabConfig) -> Path:
 
 
 if __name__ == "__main__":
-    # Local convenience entry point (e.g. testing this file's C1+C2 logic
-    # outside Colab, against a real on-disk run) — not how Colab itself
-    # invokes this file; Colab pastes the cell and calls `run(config)`
-    # directly (see the Colab quick start in this module's docstring).
-    import argparse
+    # Detect if we're running in a notebook (Jupyter/Colab) or as a CLI script.
+    # In notebooks, get_ipython() is set by the notebook kernel; in regular
+    # Python, it raises NameError. This lets us gracefully support both modes.
+    try:
+        get_ipython()  # noqa: F821
+        # We're in a notebook — just print instructions and exit silently.
+        # The user should manually create a config and call run().
+        print("[INFO] Notebook environment detected.")
+        print("[INFO] To run, manually create a config and call run():")
+        print()
+        print("config = Stage4ColabConfig(")
+        print("    rootfs_dir=Path(\"/content/squashfs-root\"),")
+        print("    stage2_binaries_dir=Path(\"/content/stage2/binaries\"),")
+        print("    output_dir=Path(\"/content/stage4_corpus_build\"),")
+        print(")")
+        print("zip_path = run(config)")
+    except NameError:
+        # We're in a regular Python CLI — run argparse.
+        import argparse
 
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--rootfs", required=True, type=Path, help="Stage 1 rootfs directory")
-    parser.add_argument(
-        "--stage2-binaries", required=True, type=Path, help="Stage 2 stage2/binaries/ directory"
-    )
-    parser.add_argument("--output", default=Path("./stage4_corpus_build"), type=Path)
-    parser.add_argument("--chunk-words", default=500, type=int)
-    parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-3B")
-    args = parser.parse_args()
-
-    run(
-        Stage4ColabConfig(
-            rootfs_dir=args.rootfs,
-            stage2_binaries_dir=args.stage2_binaries,
-            output_dir=args.output,
-            chunk_words=args.chunk_words,
-            embedding_model=args.embedding_model,
+        parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        parser.add_argument("--rootfs", required=True, type=Path, help="Stage 1 rootfs directory")
+        parser.add_argument(
+            "--stage2-binaries", required=True, type=Path, help="Stage 2 stage2/binaries/ directory"
         )
-    )
+        parser.add_argument("--output", default=Path("./stage4_corpus_build"), type=Path)
+        parser.add_argument("--chunk-words", default=500, type=int)
+        parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+        args = parser.parse_args()
+
+        run(
+            Stage4ColabConfig(
+                rootfs_dir=args.rootfs,
+                stage2_binaries_dir=args.stage2_binaries,
+                output_dir=args.output,
+                chunk_words=args.chunk_words,
+                embedding_model=args.embedding_model,
+            )
+        )

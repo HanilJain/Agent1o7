@@ -83,6 +83,14 @@ class AgentRole(str, Enum):
     workers), unlike the Identifier Agent's single call — still routed to
     HIGH_REASONING by default because the report schema is large and
     reasoning-heavy; see ROLE_TO_TIER for the offline-testing override."""
+    STAGE4_QUERY_PLANNER = "stage4_query_planner"
+    """Stage 4 Component 3 (`stage4_rag.query.planner`): given one Stage 3
+    finding, produces a `MultiQueryPlan` of 4-5 targeted search queries fed
+    to Component 4's retrieval. No tool access."""
+    STAGE4_TAINT_ANALYST = "stage4_taint_analyst"
+    """Stage 4 Component 5 (`stage4_rag.taint.analyst`): reasons over
+    Component 4's retrieved context + the original Stage 3 finding to build
+    a structured `TaintPathReport`. No tool access."""
 
 
 @dataclass(frozen=True)
@@ -113,6 +121,13 @@ ROLE_TO_TIER: dict[AgentRole, ModelTier] = {
     # Sonnet. `FWA_STAGE3_ANALYST_MODEL` overrides this role specifically
     # (e.g. to a local Ollama model) without affecting other roles.
     AgentRole.STAGE3_VULN_ANALYST: ModelTier.HIGH_REASONING,
+    # Stage 4's two local LLM roles (query planning, taint-path reasoning)
+    # get the same HIGH_REASONING default as Stage 3's analyst — both
+    # produce large, reasoning-heavy structured output. Their own
+    # `FWA_STAGE4_*_MODEL` overrides (see _ROLE_OVERRIDE_SETTINGS_FIELD)
+    # let either be pointed at a local Ollama model independently.
+    AgentRole.STAGE4_QUERY_PLANNER: ModelTier.HIGH_REASONING,
+    AgentRole.STAGE4_TAINT_ANALYST: ModelTier.HIGH_REASONING,
 }
 
 # ---------------------------------------------------------------------- #
@@ -155,6 +170,19 @@ TIER_TO_SPEC: dict[ModelTier, ModelSpec] = {
 # Google over Anthropic without editing the tier table.
 GEMINI_HIGH_REASONING = ModelSpec(provider=ModelProvider.GOOGLE, model="gemini-2.5-flash")
 
+# ---------------------------------------------------------------------- #
+# Role -> per-role Settings override field name
+# ---------------------------------------------------------------------- #
+# Maps a role to the `Settings` attribute holding its own
+# `"<provider>:<model>"` override (checked before the global `llm_model`
+# override — see resolve_spec()). Add an entry here, not another `if`
+# branch, when a new role gets its own override field.
+_ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, str] = {
+    AgentRole.STAGE3_VULN_ANALYST: "stage3_analyst_model",
+    AgentRole.STAGE4_QUERY_PLANNER: "stage4_query_planner_model",
+    AgentRole.STAGE4_TAINT_ANALYST: "stage4_taint_analyst_model",
+}
+
 
 def _parse_model_override(value: str) -> ModelSpec:
     """Parse a `"<provider>:<model>"` override string (e.g. from
@@ -192,8 +220,9 @@ def resolve_spec(
     """Resolve an :class:`AgentRole` to a concrete :class:`ModelSpec`.
 
     Override precedence, most specific first:
-    1. A per-role override (currently only `Settings.stage3_analyst_model`,
-       for `STAGE3_VULN_ANALYST`).
+    1. A per-role override — see `_ROLE_OVERRIDE_SETTINGS_FIELD` for which
+       `Settings` attribute backs which role (e.g.
+       `Settings.stage3_analyst_model` for `STAGE3_VULN_ANALYST`).
     2. `Settings.llm_model` — a global override applied to every role.
     3. `Settings.use_local_model` picks which half of the tier table to
        prefer: the tier's own (API-backed) spec when `False` (default), or
@@ -211,8 +240,11 @@ def resolve_spec(
     """
     settings = settings or get_settings()
 
-    if role is AgentRole.STAGE3_VULN_ANALYST and settings.stage3_analyst_model:
-        return _parse_model_override(settings.stage3_analyst_model)
+    override_field = _ROLE_OVERRIDE_SETTINGS_FIELD.get(role)
+    if override_field:
+        override_value = getattr(settings, override_field, None)
+        if override_value:
+            return _parse_model_override(override_value)
     if settings.llm_model:
         return _parse_model_override(settings.llm_model)
 

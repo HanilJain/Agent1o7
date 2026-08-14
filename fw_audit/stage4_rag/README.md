@@ -8,53 +8,60 @@ the full architecture, component breakdown, and milestone roadmap.
 
 ## Status
 
-**In progress.** Components 1 (chunking) and 2 (embedding + vector store)
-are implemented, both in `colab/chunk_and_embed.py`. Components 3
-(multi-query generator), 4 (retrieval engine), 5 (taint path analyzer),
-and 6 (local driver) are not yet built — see the masterplan's milestone
-table for what's next.
+**All six components implemented, running entirely locally.** The
+original Colab-split design (C1+C2 in Colab, C3-C6 local) has been
+superseded — Colab is now an optional alternate path for C1+C2, not
+required for any part of the pipeline.
 
-## Deployment model
+## Pipeline
 
-Corpus-heavy work runs **once, in Google Colab** (free GPU, no local
-install burden); per-finding reasoning will run **locally** once
-Components 3-6 land, against a downloaded copy of the resulting vector
-store.
+1. **`fw-trace build-corpus`** (C1+C2) — classifies Stage 1's rootfs files
+   and Stage 2's cleaned decompiled C, chunks (~500 words), embeds each
+   chunk with a local Qwen3 embedding model (`Qwen/Qwen3-Embedding-0.6B`
+   by default), and indexes into a persistent local ChromaDB collection
+   under `<db_subfolder>/stage4/chroma/`. No zip/upload step — the rootfs
+   and Stage 2 directories are read directly from disk.
+2. **`fw-trace run`** (C3-C6) — for each Stage 3 finding with
+   `decision in {ESCALATE, CONTEXT_REQUIRED}`: generates 4-5 search
+   queries (C3), retrieves + merges top-k matching chunks (C4, embedding
+   queries with the exact same model as step 1), and reasons over the
+   retrieved context to build a structured `TaintPathReport` (C5) — all
+   through a bounded async worker pool (C6), same shape as Stage 3's
+   `chunk_queue.py`.
+3. **`fw-trace debug ...`** — inspect/verify any single step (corpus
+   stats, embedding parity, sink listing, or a single finding's
+   query/retrieve/taint output) without running the whole pipeline.
 
-## Components 1+2 — Google Colab
-
-`colab/chunk_and_embed.py` classifies Stage 1's rootfs files (skipping
-anything that needs Ghidra/IDA decompilation first) and Stage 2's cleaned
-decompiled C, splits everything into ~500-word chunks, embeds each chunk
-with a Qwen3 embedding model, and indexes it into a persistent ChromaDB
-collection. The file is deliberately dependency-light — stdlib plus
-`chromadb`/`sentence-transformers` only, no `fw_audit` imports — so it can
-be pasted directly into a Colab cell. `colab/stage4_colab.ipynb` wraps the
-same code in a narrative, cell-by-cell notebook (install → provide input
-folders → paste script → configure → run → download).
-
-Output is a zip containing the Chroma collection and a
-`corpus_report.json` summary. Download it and unzip under
-`<db_subfolder>/stage4/` once local components exist to read it.
-
-### Running locally instead (for testing)
+## Setup
 
 ```bash
-pip install -e ".[stage4-colab]"
-python fw_audit/stage4_rag/colab/chunk_and_embed.py \
+pip install -e ".[stage4,anthropic,ollama,dev]"
+
+fw-trace build-corpus --db-subfolder data/db/<stem> \
   --rootfs data/db/<stem>/binwalk_1/_input.pkgtb.extracted/squashfs-root \
-  --stage2-binaries data/db/<stem>/stage2/binaries \
-  --output ./stage4_corpus_build
+  --stage2-binaries data/db/<stem>/stage2/binaries
+
+fw-trace run --db-subfolder data/db/<stem>
 ```
+
+## Optional: Colab path for C1+C2
+
+`colab/chunk_and_embed.py` (the underlying engine `corpus_build.py`
+imports) is still dependency-light and Colab-pasteable, and
+`colab/stage4_colab.ipynb`/`colab/package_input.py` still work if you
+specifically want to build the corpus on Colab's free GPU. Unzip the
+result under `<db_subfolder>/stage4/` and `fw-trace run` picks up from
+there exactly as if `build-corpus` had run locally.
 
 ## Testing
 
 ```bash
-pytest -m "not integration" tests/test_stage4_colab_chunk_embed.py
+pytest -m "not integration" tests/test_stage4_*.py
 ```
 
-Covers the classifier and chunker only — no `chromadb`/
-`sentence-transformers` install required, since those imports are lazy.
+No `chromadb`/`sentence-transformers`/network required for the unit suite
+— heavy ML imports are lazy and LLM calls are mocked. Real-model/network
+tests are marked `integration` and skipped by default.
 
 See [CLAUDE.md](CLAUDE.md) for the file table, hard constraints, and
 debugging notes.

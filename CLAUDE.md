@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **fw-audit** — an agentic firmware vulnerability detection system for router firmware. A six-stage pipeline: ingestion → feature extraction (decompile/normalize/clean) → analysis core (chunk/queue) → agentic analysis → sandboxed verification → reporting. Built on **LangGraph** (stateful agent orchestration), **LangChain** (multi-provider LLM abstraction), and **Docker** (sandboxed extraction).
 
-**Current status:** Stages 1–3 are implemented. Stage 2 covers Ghidra decompilation plus BOTH normalization targets: Joern-compilable whole-program C and the LLM-facing "clean" function-only extraction (`stage2_extraction/clean/`, tree-sitter-based) — the latter moved here from Stage 3 so it's computed once and persisted, not recomputed on every Stage 3 run. Stage 3 includes both Component 1 — ingest/chunk/queue, reading Stage 2's persisted cleaned artifact — and Component 2 — the LLM vulnerability-analysis worker pool, `stage3_analysis/agent/`. Stages 4–6 are empty placeholder packages.
+**Current status:** Stages 1–4 are implemented. Stage 2 covers Ghidra decompilation plus BOTH normalization targets: Joern-compilable whole-program C and the LLM-facing "clean" function-only extraction (`stage2_extraction/clean/`, tree-sitter-based) — the latter moved here from Stage 3 so it's computed once and persisted, not recomputed on every Stage 3 run. Stage 3 includes both Component 1 — ingest/chunk/queue, reading Stage 2's persisted cleaned artifact — and Component 2 — the LLM vulnerability-analysis worker pool, `stage3_analysis/agent/`. Stage 4 (RAG Sink-to-Source Identifier) runs all six components (C1–C6) locally — corpus build (`fw-trace build-corpus`) plus the C3→C4→C5 driver (`fw-trace run`) over Stage 3's findings, with a Colab path for C1+C2 kept as an optional alternative. Stages 5–6 are empty placeholder packages.
 
 ## Stage docs — read these first for stage-specific work
 
@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 1 — Ingestion & Pre-processing | `fw_audit/stage1_ingestion/` | [CLAUDE.md](fw_audit/stage1_ingestion/CLAUDE.md) · [README.md](fw_audit/stage1_ingestion/README.md) |
 | 2 — Feature Extraction | `fw_audit/stage2_extraction/` | [CLAUDE.md](fw_audit/stage2_extraction/CLAUDE.md) · [README.md](fw_audit/stage2_extraction/README.md) |
 | 3 — Analysis Core (+ agentic analysis) | `fw_audit/stage3_analysis/` | [CLAUDE.md](fw_audit/stage3_analysis/CLAUDE.md) · [README.md](fw_audit/stage3_analysis/README.md) |
-| 4 — RAG Sink-to-Source Identifier (in progress) | `fw_audit/stage4_rag/` | [CLAUDE.md](fw_audit/stage4_rag/CLAUDE.md) · [README.md](fw_audit/stage4_rag/README.md) |
+| 4 — RAG Sink-to-Source Identifier | `fw_audit/stage4_rag/` | [CLAUDE.md](fw_audit/stage4_rag/CLAUDE.md) · [README.md](fw_audit/stage4_rag/README.md) |
 | 5 — Sandboxed Verification (empty) | `fw_audit/stage5_verification/` | [CLAUDE.md](fw_audit/stage5_verification/CLAUDE.md) · [README.md](fw_audit/stage5_verification/README.md) |
 | 6 — Reporting (empty) | `fw_audit/stage6_reporting/` | [CLAUDE.md](fw_audit/stage6_reporting/CLAUDE.md) · [README.md](fw_audit/stage6_reporting/README.md) |
 
@@ -32,6 +32,8 @@ pip install -e ".[dev]"                            # or ".[all,dev]" for every L
 fw-ingest path/to/firmware.bin                       # Stage 1 — see its CLAUDE.md for flags
 fw-extract data/db/<stem>/stage1_summary.json        # Stage 2 — see its CLAUDE.md for flags
 fw-analyze data/db/<stem>/stage1_summary.json        # Stage 3 — see its CLAUDE.md for flags
+fw-trace build-corpus --db-subfolder data/db/<stem> --rootfs ... --stage2-binaries ...  # Stage 4
+fw-trace run --db-subfolder data/db/<stem>           # Stage 4 — see its CLAUDE.md for flags
 
 pytest -m "not integration"   # unit tests, no Docker/LLM required
 pytest -m integration         # end-to-end, needs Docker image(s) + real firmware

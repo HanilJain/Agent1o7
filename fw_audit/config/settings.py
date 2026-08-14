@@ -268,6 +268,61 @@ class Settings(BaseSettings):
     repair — a schema miss then falls straight through to the queue's
     own nack()/retry instead."""
 
+    # ---- Stage 4: RAG sink-to-source identifier (local, all components) --
+    stage4_embedding_model: str = Field(
+        default="Qwen/Qwen3-Embedding-0.6B", validation_alias="FWA_STAGE4_EMBEDDING_MODEL"
+    )
+    """Sentence-transformers checkpoint tag used for BOTH corpus embedding
+    (`corpus_build.py`, C2) and query embedding (`retrieval/store.py`, C4)
+    — these MUST match exactly, or queries land in a different vector space
+    than the documents they're searched against. 0.6B (not the larger 4B/8B
+    tiers) keeps local CPU embedding fast enough for iterative testing."""
+    stage4_embedding_device: str | None = Field(
+        default=None, validation_alias="FWA_STAGE4_EMBEDDING_DEVICE"
+    )
+    """`None` = sentence-transformers auto-picks CUDA if present, else CPU."""
+    stage4_chunk_words: int = Field(default=500, ge=10, validation_alias="FWA_STAGE4_CHUNK_WORDS")
+    stage4_chunk_overlap_words: int = Field(
+        default=0, ge=0, validation_alias="FWA_STAGE4_CHUNK_OVERLAP_WORDS"
+    )
+    stage4_chroma_collection_name: str = Field(
+        default="stage4_corpus", validation_alias="FWA_STAGE4_CHROMA_COLLECTION_NAME"
+    )
+    stage4_embed_batch_size: int = Field(
+        default=4, ge=1, validation_alias="FWA_STAGE4_EMBED_BATCH_SIZE"
+    )
+    """Kept conservative (not e.g. 32) because ~500-word chunks on an 8GB
+    consumer GPU (e.g. a 4060 laptop) OOM at higher batch sizes with the
+    0.6B model's attention memory — confirmed via a real
+    `torch.OutOfMemoryError` at batch_size=32 on such a card. Raise this if
+    your GPU has more headroom (24GB+ cards can likely go back to 32+), or
+    lower it further if 8 still OOMs."""
+    stage4_top_k: int = Field(default=8, ge=1, validation_alias="FWA_STAGE4_TOP_K")
+    """Per-query top-k similarity search result count in C4 — see
+    `retrieval/engine.py`. Merged/deduped across a `MultiQueryPlan`'s 4-5
+    queries, so the final retrieved-chunk count is usually larger than this."""
+    stage4_workers: int = Field(default=3, ge=1, le=16, validation_alias="FWA_STAGE4_WORKERS")
+    stage4_queue_maxsize: int = Field(
+        default=6, ge=1, validation_alias="FWA_STAGE4_QUEUE_MAXSIZE"
+    )
+    stage4_queue_max_attempts: int = Field(
+        default=3, ge=1, validation_alias="FWA_STAGE4_QUEUE_MAX_ATTEMPTS"
+    )
+    stage4_repair_attempts: int = Field(
+        default=1, ge=0, validation_alias="FWA_STAGE4_REPAIR_ATTEMPTS"
+    )
+    """Same repair-retry budget as `stage3_repair_attempts`, shared by both
+    C3 (`query/planner.py`) and C5 (`taint/analyst.py`)."""
+    stage4_query_planner_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE4_QUERY_PLANNER_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE4_QUERY_PLANNER`, same
+    `"<provider>:<model>"` syntax as `stage3_analyst_model`."""
+    stage4_taint_analyst_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE4_TAINT_ANALYST_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE4_TAINT_ANALYST`."""
+
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names
     # (binwalk/unsquashfs/etc.) are no longer configurable here — those run
@@ -332,6 +387,12 @@ class Settings(BaseSettings):
     def stage3_dir(self, firmware_stem: str) -> Path:
         """Return (and create) `<db_subfolder>/stage3/` for a firmware image."""
         path = self.db_subfolder(firmware_stem) / "stage3"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def stage4_dir(self, firmware_stem: str) -> Path:
+        """Return (and create) `<db_subfolder>/stage4/` for a firmware image."""
+        path = self.db_subfolder(firmware_stem) / "stage4"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

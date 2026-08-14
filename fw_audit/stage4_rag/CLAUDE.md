@@ -1,83 +1,80 @@
 # CLAUDE.md — Stage 4: RAG Sink-to-Source Identifier
 
-Read this file first for Stage 4 work. **In progress** — only Components 1
-(chunking) + 2 (embedding/vector store) are implemented, both inside
-`colab/chunk_and_embed.py`. Components 3-6 (local: query generation,
-retrieval, taint analysis, driver) aren't built yet. See
-[MASTERPLAN_STAGE4.md](../../MASTERPLAN_STAGE4.md) (repo root) for the full
-architecture. Root `CLAUDE.md` covers cross-cutting concerns only (LLM
-routing, Settings).
+Read this file first for Stage 4 work. **All six components (C1-C6) are
+implemented and run locally** — the original Colab-split design has been
+superseded; the notebook now demoted to an optional alternate path. Root
+`CLAUDE.md` covers only cross-cutting concerns (LLM routing, Settings).
 
 ## Hard constraints — never violate
 
-- `colab/chunk_and_embed.py` stays **dependency-light and self-contained**
-  — stdlib + `chromadb` + a sentence-embedding lib only, **zero
-  `fw_audit.*` imports** — it is both this repo's source of truth and a
-  file meant to be pasted verbatim into a Colab cell.
-- Heavy ML imports (`chromadb`, `sentence_transformers`) stay **lazy**,
-  inside the functions that need them, never at module level — this is
-  what lets the unit suite test the classifier/chunker without them
-  installed.
 - Never write into `stage3/` or an earlier stage's output tree — only into
-  this stage's own `stage4/` directory (once Components 3-6 land).
-- Component 4 (local retrieval, not yet built) MUST embed queries with the
-  exact same Qwen3 instruction template `Qwen3Embedder.embed_query` uses —
+  this stage's own `stage4/` directory.
+- Component 4 (`retrieval/store.py`) MUST embed queries with the exact same
+  `Qwen3Embedder`/`Settings.stage4_embedding_model` that built the corpus —
   drift here degrades retrieval silently rather than raising an error.
+- `colab/chunk_and_embed.py` stays dependency-light and Colab-pasteable
+  (stdlib + `chromadb` + a sentence-embedding lib only, zero `fw_audit.*`
+  imports) — `corpus_build.py` imports its functions rather than
+  duplicating them; don't inline that logic elsewhere.
+- `debug.py`'s functions never write into `queries/`/`retrieval/`/`taint/`
+  — those are `driver.py`'s persisted, tracked output; debug runs (`taint`
+  in particular) are dry runs.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `colab/chunk_and_embed.py` | Components 1+2: file classifier, `FixedWordChunker`, Qwen3 embedding wrapper, ChromaDB setup, embed+upsert, zip packaging. Colab-pasteable. |
-| `colab/stage4_colab.ipynb` | Narrative notebook wrapping the same script (install/upload/run/download cells). |
-| `colab/package_input.py` | **Local-only** helper: zips Stage 1 rootfs + Stage 2 `stage2/binaries/` into the one-file upload the notebook's Option A expects. Never runs in Colab itself. |
+| `layout.py` | Pure path algebra for `stage4/`. |
+| `sink_index.py` | C0: resolves `stage3/findings/*.json` into `SinkCandidate`s, summary-free. |
+| `corpus_build.py` | C1+C2 local entry point: wraps `colab/chunk_and_embed.py`, persists straight to `stage4/{chroma,corpus_report.json}` — no zip/upload. |
+| `colab/chunk_and_embed.py` | The underlying classify/chunk/embed/index engine (reused, not duplicated). Optional Colab path still works via `colab/stage4_colab.ipynb`/`package_input.py`. |
+| `query/schemas.py`, `query/prompts.py`, `query/planner.py` | C3: `MultiQueryPlan` structured-output LLM call, no tools. |
+| `retrieval/store.py`, `retrieval/engine.py` | C4: loads local Chroma + parity-matched embedder, top-k search + merge/dedupe, `build_c5_prompt()`. |
+| `taint/prompts.py`, `taint/analyst.py` | C5: `TaintPathReport` structured-output LLM call, no tools. |
+| `driver.py` | C6: async worker-pool loop, C3->C4->C5->persist, mirrors `stage3_analysis.chunk_queue`. |
+| `debug.py` | Per-component inspection: corpus stats, embedding parity check, sink listing, single-finding query/retrieve/taint dry runs. |
+| `runner.py` | `fw-trace` CLI: `build-corpus`, `run`, `debug {corpus,parity,sinks,query,retrieve,taint}`. |
 | `errors.py` | `Stage4InputError`, `VectorStoreUnavailableError`. |
 
 ## Invoke
 
-Components 1+2 run in Google Colab — see `colab/stage4_colab.ipynb` for the
-cell-by-cell walkthrough, or run the script locally for testing:
-
 ```bash
-pip install -e ".[stage4-colab]"
-python fw_audit/stage4_rag/colab/chunk_and_embed.py \
+pip install -e ".[stage4,anthropic,ollama,dev]"
+
+fw-trace build-corpus --db-subfolder data/db/<stem> \
   --rootfs data/db/<stem>/binwalk_1/_input.pkgtb.extracted/squashfs-root \
-  --stage2-binaries data/db/<stem>/stage2/binaries \
-  --output ./stage4_corpus_build
+  --stage2-binaries data/db/<stem>/stage2/binaries
+
+fw-trace run --db-subfolder data/db/<stem>
+fw-trace debug corpus --db-subfolder data/db/<stem>
+fw-trace debug parity
+fw-trace debug taint --db-subfolder data/db/<stem> --gid "<chunk_id>::<finding_id>"
 ```
 
 ## Input
 
-Stage 1's extracted rootfs directory + Stage 2's `stage2/binaries/`
-directory (reads `<bin_id>/cleaned/whole.c` per binary — never re-runs
-tree-sitter).
+Stage 1's rootfs directory + Stage 2's `stage2/binaries/` (C1+C2); Stage 3's
+`stage3/findings/*.json` (C0/C6) — never `stage3_summary.json`/
+`analysis_summary.json`, both best-effort and often absent.
 
-## Output
+## Output — `<db_subfolder>/stage4/`
 
-A zip (`stage4_corpus_build/stage4_corpus.zip`) containing the persisted
-Chroma collection (`chroma/`) and `corpus_report.json`. Download from
-Colab and unzip under `<db_subfolder>/stage4/` for local Components 3-6 to
-consume once built.
+`chroma/`, `corpus_report.json` (build-corpus) → `queries/<gid>.json`,
+`retrieval/<gid>.json`, `taint/<gid>.json`, `stage4_summary.json` (run).
 
 ## Debugging
 
-- A Windows-extracted rootfs contains entries `Path.is_file()`/
-  `.is_symlink()` raise `OSError` on (device nodes, unsupported reparse
-  points) — `discover_rootfs_files` and `package_input.py` both wrap those
-  calls; don't remove either guard or swap in `Compress-Archive`/
-  `shutil.make_archive` (both abort the whole zip on the first such entry).
-- Zero chunks discovered usually means `rootfs_dir`/`stage2_binaries_dir`
-  point at the wrong directory — `run()` prints both before embedding.
-- `ALLOWED_TEXT_EXTENSIONS`/`SKIP_EXTENSIONS` in `chunk_and_embed.py` are
-  the first place to look if real files are mis-classified — plain
-  module-level sets, per the brief's "make list of them easily parsing".
-- Unit: `pytest -m "not integration" tests/test_stage4_colab_chunk_embed.py`
-  (no `chromadb`/`sentence-transformers` needed — lazy imports).
+- `fw-trace debug parity` first if retrieval looks wrong — near-zero cosine
+  similarity means the query/document embedder setup has drifted.
+- `VectorStoreUnavailableError` before `run`/`debug retrieve|taint`: run
+  `build-corpus` first, or check `Settings.stage4_chroma_collection_name`
+  matches what built the collection.
+- `query/prompts.py`/`taint/prompts.py`'s `SYSTEM_PROMPT` are placeholders
+  (marked `TODO(user)`) — replace with the specialized prompts when supplied.
+- Unit: `pytest -m "not integration" tests/test_stage4_*.py`.
 
 ## Adding a feature here
 
-New chunking strategies implement the `ChunkStrategy` protocol in
-`colab/chunk_and_embed.py` — v1 ships only `FixedWordChunker`. Component 3
-onward (query generation, retrieval, taint analysis, driver) are separate,
-not-yet-built local modules — see `MASTERPLAN_STAGE4.md` §7-10 for their
-planned shape before adding them.
+New chunking strategies implement `ChunkStrategy` in `colab/chunk_and_embed.py`.
+New retrieval fusion goes in `retrieval/engine.py`. New taint fields go in
+`common/taint.py`, never `common/findings.py` (that's Stage 3's).
