@@ -335,6 +335,72 @@ class Settings(BaseSettings):
     )
     """Per-role override for `AgentRole.STAGE4_TAINT_ANALYST`."""
 
+    # ---- Stage 5: sandboxed verification (Joern tool-calling agent) ------
+    stage5_verifier_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_VERIFIER_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_VERIFIER`, same
+    `"<provider>:<model>"` syntax as `stage3_analyst_model` — e.g.
+    `"ollama:qwen3:8b"` to run verification against a local model."""
+    stage5_joern_image: str = Field(
+        default="fw-audit-joern:latest", validation_alias="FWA_STAGE5_JOERN_IMAGE"
+    )
+    stage5_joern_timeout_seconds: int = Field(
+        default=300, ge=1, validation_alias="FWA_STAGE5_JOERN_TIMEOUT_SECONDS"
+    )
+    """Wall-clock cap for ONE `run_joern_script` tool call (one script
+    execution against an already-built CPG)."""
+    stage5_cpg_build_timeout_seconds: int = Field(
+        default=900, ge=1, validation_alias="FWA_STAGE5_CPG_BUILD_TIMEOUT_SECONDS"
+    )
+    """Wall-clock cap for the `build_cpg` tool call — larger than
+    `stage5_joern_timeout_seconds` because parsing a whole-program `.c` file
+    into a CPG is typically slower than running one query against it."""
+    stage5_max_agent_iterations: int = Field(
+        default=6, ge=1, validation_alias="FWA_STAGE5_MAX_AGENT_ITERATIONS"
+    )
+    """Hard cap on tool-call round-trips in the verification agent's
+    LangGraph loop (`stage5_verification.agent.graph`) — once hit, the graph
+    force-routes to the finalize node regardless of pending tool calls.
+    Bounds runaway loops, especially important against a smaller local
+    model (e.g. Ollama qwen3) that may not reliably converge."""
+    stage5_repair_attempts: int = Field(
+        default=1, ge=0, validation_alias="FWA_STAGE5_REPAIR_ATTEMPTS"
+    )
+    """Extra in-process re-invocations the graph's finalize node makes when
+    the LLM's structured `VerifierVerdict` output fails Pydantic validation
+    — same pattern as `stage3_repair_attempts`/`stage4_repair_attempts`."""
+    stage5_sandbox_memory: str = Field(
+        default="4g", pattern=r"^\d+[mMgG]$", validation_alias="FWA_STAGE5_SANDBOX_MEMORY"
+    )
+    stage5_sandbox_cpus: float = Field(
+        default=2.0, gt=0, validation_alias="FWA_STAGE5_SANDBOX_CPUS"
+    )
+    stage5_sandbox_pids_limit: int = Field(
+        default=256, ge=1, validation_alias="FWA_STAGE5_SANDBOX_PIDS_LIMIT"
+    )
+    """Resource caps applied by `SandboxExecutor` (never by `DockerExecutor`)
+    — this backend runs LLM-authored script content, so it gets a tighter
+    posture than the fixed deterministic pipelines `DockerExecutor` runs."""
+    stage5_workers: int = Field(default=2, ge=1, le=16, validation_alias="FWA_STAGE5_WORKERS")
+    stage5_queue_maxsize: int = Field(
+        default=4, ge=1, validation_alias="FWA_STAGE5_QUEUE_MAXSIZE"
+    )
+    stage5_queue_max_attempts: int = Field(
+        default=2, ge=1, validation_alias="FWA_STAGE5_QUEUE_MAX_ATTEMPTS"
+    )
+    """Worker-pool sizing, mirrors `stage4_workers`/`stage4_queue_maxsize`/
+    `stage4_queue_max_attempts` — kept smaller by default than Stage 4's
+    since each candidate here drives a multi-turn agent loop plus a Docker
+    CPG build, both far more expensive per item than a RAG retrieval call."""
+    stage5_keep_workspace: bool = Field(
+        default=False, validation_alias="FWA_STAGE5_KEEP_WORKSPACE"
+    )
+    """When true, `stage5/workspace/<gid>/` (the copied source, built CPG,
+    and every script attempt) is left on disk after a run instead of being
+    cleaned up — debugging convenience, mirrors `stage3_debug_dump`'s
+    "manual testing/verification only" posture."""
+
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names
     # (binwalk/unsquashfs/etc.) are no longer configurable here — those run
@@ -405,6 +471,12 @@ class Settings(BaseSettings):
     def stage4_dir(self, firmware_stem: str) -> Path:
         """Return (and create) `<db_subfolder>/stage4/` for a firmware image."""
         path = self.db_subfolder(firmware_stem) / "stage4"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def stage5_dir(self, firmware_stem: str) -> Path:
+        """Return (and create) `<db_subfolder>/stage5/` for a firmware image."""
+        path = self.db_subfolder(firmware_stem) / "stage5"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

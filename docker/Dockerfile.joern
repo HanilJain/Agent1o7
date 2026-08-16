@@ -1,0 +1,160 @@
+# syntax=docker/dockerfile:1
+#
+# fw-audit Joern verification image — Stage 5's sandbox. This is the FIRST
+# image in this project meant to back fw_audit/executors/sandbox_executor.py
+# (SandboxExecutor), NOT fw_audit/executors/docker_executor.py — the
+# opposite of docker/Dockerfile and docker/Dockerfile.ghidra, both of which
+# explicitly disclaim being an LLM-controlled sandbox. The Stage 5
+# verification agent (stage5_verification.agent) writes and runs its own
+# Scala/CPGQL scripts against a CPG built from a Stage 3 finding's binary —
+# genuinely agent-authored script CONTENT, even though the surrounding
+# `docker run`/`joern-parse`/`joern --script` invocation itself is still
+# composed by fixed Python code (stage5_verification/tools/joern_tool.py),
+# never handed to the LLM directly. See that module's docstring and
+# fw_audit/executors/sandbox_executor.py's docstring for the full posture.
+#
+# DELIBERATELY SEPARATE from docker/Dockerfile (Stage 1's extraction
+# sandbox) and docker/Dockerfile.ghidra (Stage 2's decompilation image):
+# same "why not bundle everything into one image" reasoning as
+# Dockerfile.ghidra's own header comment — a JVM-based static analysis tool
+# has nothing in common with either Stage 1's binwalk/unsquashfs toolchain
+# or Stage 2's Ghidra/PyGhidra install, and bundling would tax every one of
+# Stage 1's 6+ container starts per firmware for zero benefit to Stage 1.
+#
+# Runtime is started with --network=none, --memory/--cpus/--pids-limit (see
+# SandboxExecutor.run()) — same no-network posture as the other two images,
+# plus the extra resource caps SandboxExecutor applies that DockerExecutor
+# does not, because this image runs less-trusted, LLM-authored script
+# content. BUILD time needs network for apt only — the Joern release
+# archive is pre-fetched to the host first (see the fetch stage's own
+# comment for why), so `docker build` itself doesn't need to sustain that
+# ~1.8GB download. Before building for the first time (or after bumping
+# JOERN_VERSION), fetch it once:
+#
+#   curl --http1.1 --speed-limit 20000 --speed-time 20 -C - -fSL \
+#       -o docker/.joern-cli.zip \
+#       "https://github.com/joernio/joern/releases/download/v4.0.420/joern-cli.zip"
+#
+# (retry the same command if it stalls — -C - resumes from where it left
+# off) then `docker build -f docker/Dockerfile.joern -t fw-audit-joern:latest .`
+#
+# ONE-SHOT container per tool call (see SandboxExecutor's docstring): this
+# image is never left running as a persistent Joern REPL/server in v1 — the
+# CPG is built once via `joern-parse` into the host-mounted workspace, and
+# every subsequent query is its own fresh container loading that CPG back
+# off disk. A future interactive tool (QEMU+GDB) will need a genuinely
+# different, session-based execution model — not this image's concern.
+
+# ---------------------------------------------------------------------------
+# Stage A: fetch — verify and unpack the Joern release.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS fetch
+
+# Pin explicitly rather than "latest" — same rationale as Dockerfile.ghidra's
+# GHIDRA_VERSION pin: an unpinned Joern version could silently change CPGQL
+# behavior or CLI flags the verification agent's prompt/tool code depends on.
+# Purely documentary here (nothing below interpolates it) since the archive
+# itself is pinned by JOERN_CLI_SHA256 below — bump it together with that
+# hash and docker/.joern-cli.zip when moving to a new Joern release.
+ARG JOERN_VERSION=4.0.420
+
+ARG JOERN_CLI_SHA256=d30760165d964e141d5cd6a1841912a5c7bbf92910b6ba022f2b74e73ba0ce81
+# Verified locally: downloaded
+# https://github.com/joernio/joern/releases/download/v4.0.420/joern-cli.zip
+# (~1.8GB) and ran `sha256sum` on it directly (not copied from a listing) —
+# same discipline as Dockerfile.ghidra's GHIDRA_SHA256. Re-verify the same
+# way if JOERN_VERSION is ever bumped; a stale hash here just makes the
+# build fail safely at the `sha256sum -c` step below, never silently
+# install the wrong release.
+#
+# A prior version of this stage instead ran Joern's own `joern-install.sh`
+# (piping a fetched script to a shell, network access mid-`RUN`) on the
+# theory that Joern doesn't publish a single stable, directly-downloadable
+# release archive URL the way Ghidra does. That assumption was wrong — it
+# does, at exactly the URL above — and piping-to-shell is what this repo's
+# other Dockerfiles deliberately avoid anyway (see Dockerfile.ghidra's own
+# comment). Switched to the same direct zip+sha256sum-c pattern used there.
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# COPY (not RUN curl) deliberately: this ~1.8GB release asset repeatedly
+# failed mid-download inside `docker build`'s own network — twice, at 38%
+# and 83%, both `curl: (18) HTTP/2 stream ... not closed cleanly before end
+# of the underlying stream` — even after retrying with --http1.1 --retry.
+# This environment's network doesn't sustain one HTTP/2 stream that long.
+# Downloading it on the HOST instead (--speed-limit/--speed-time to detect
+# a stall, -C - to resume past one, looped until complete) is what actually
+# got all 1,887,444,081 bytes down intact; the build then just verifies and
+# unpacks the already-local, already-hash-pinned file. docker/.joern-cli.zip
+# is git-ignored (huge, and a build input, not source) — fetch it once per
+# machine building this image; see this file's own header for the exact
+# command. If your network sustains the direct download fine, a plain
+# `RUN curl -fsSL <url> -o joern-cli.zip && sha256sum -c ...` is equally
+# valid here — JOERN_CLI_SHA256 doesn't care which path got the bytes there.
+COPY docker/.joern-cli.zip /tmp/joern-cli.zip
+RUN echo "${JOERN_CLI_SHA256}  /tmp/joern-cli.zip" | sha256sum -c - \
+    && mkdir -p /opt/joern \
+    && unzip -q /tmp/joern-cli.zip -d /opt/joern \
+    && find /opt/joern/joern-cli -maxdepth 1 -type f ! -name '*.bat' \
+        -exec chmod +x {} + \
+    && rm -f /tmp/joern-cli.zip
+# The archive's top-level entry is already `joern-cli/`, matching the
+# runtime stage's `PATH="/opt/joern/joern-cli:${PATH}"` below directly — no
+# extra install-dir shuffling needed. `chmod +x` is defensive (GitHub's
+# zip build usually preserves the Unix exec bit, but "usually" isn't
+# "verified", and a non-executable `joern-parse` would fail confusingly
+# deep inside a verification run rather than here at build time).
+#
+# NOT run here (unlike joern-install.sh's default behavior): the
+# `joern-scan --updatedb` default-plugins step — that's for `joern-scan`,
+# a tool this project's agent never calls (only `joern-parse` and
+# `joern --script`, see tools/joern_tool.py). Add it back if a future tool
+# module needs joern-scan's default query plugins.
+
+# ---------------------------------------------------------------------------
+# Stage B: runtime — the image SandboxExecutor actually runs.
+# ---------------------------------------------------------------------------
+# Joern's own documentation requires a JDK (17+ for recent Joern releases;
+# re-confirm the exact minimum against JOERN_VERSION's own release notes
+# when bumping it — same "verify against the pinned version's real
+# requirement" discipline Dockerfile.ghidra used for OpenJDK 21). jammy
+# (not bookworm) for the same apt-consistency reason Dockerfile.ghidra chose
+# it: apt-get keeps working the way the rest of this repo's Dockerfiles
+# assume.
+FROM eclipse-temurin:17-jdk-jammy AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=fetch /opt/joern /opt/joern
+ENV PATH="/opt/joern/joern-cli:${PATH}"
+
+# Non-root: Joern needs no root privilege to parse a bind-mounted C file and
+# run a script against it. Unlike Stage 2's Ghidra project (a `.rep` tree
+# kept container-local for Windows bind-mount performance — see
+# Dockerfile.ghidra's comment), Joern's CPG (`cpg.bin`) is a single file
+# small enough that persisting it directly on the bind-mounted workspace is
+# fine — that's the whole point of the "state survives via the filesystem,
+# not a live process" CPG lifecycle SandboxExecutor's docstring describes.
+RUN useradd -m -u 1000 joern && mkdir -p /work && chown -R joern:joern /work
+USER joern
+
+# BUILD-TIME SMOKE TEST — proves both joern-parse and joern --script work
+# end-to-end against a trivial C file, at build time rather than 10 minutes
+# into a real verification run. Mirrors Dockerfile.ghidra's own smoke-test
+# rationale exactly. CPG given POSITIONALLY (not `--param cpgPath=`) and the
+# script explicitly `println`s its result — both required, see
+# tools/joern_tool.py's docstring for why (verified against this exact
+# image; `--param` and un-`println`'d scripts both silently fail/produce no
+# output against Joern 4.0.420's actual `--script` semantics).
+RUN mkdir -p /tmp/smoke && cd /tmp/smoke \
+    && printf 'int main() { return 0; }\n' > whole.c \
+    && joern-parse whole.c --output cpg.bin \
+    && printf 'println(cpg.method.name.l)\n' > smoke.sc \
+    && joern --script smoke.sc cpg.bin \
+    && rm -rf /tmp/smoke
+
+WORKDIR /work

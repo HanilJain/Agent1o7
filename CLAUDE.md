@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **fw-audit** — an agentic firmware vulnerability detection system for router firmware. A six-stage pipeline: ingestion → feature extraction (decompile/normalize/clean) → analysis core (chunk/queue) → agentic analysis → sandboxed verification → reporting. Built on **LangGraph** (stateful agent orchestration), **LangChain** (multi-provider LLM abstraction), and **Docker** (sandboxed extraction).
 
-**Current status:** Stages 1–4 are implemented. Stage 2 covers Ghidra decompilation plus BOTH normalization targets: Joern-compilable whole-program C and the LLM-facing "clean" function-only extraction (`stage2_extraction/clean/`, tree-sitter-based) — the latter moved here from Stage 3 so it's computed once and persisted, not recomputed on every Stage 3 run. Stage 3 includes both Component 1 — ingest/chunk/queue, reading Stage 2's persisted cleaned artifact — and Component 2 — the LLM vulnerability-analysis worker pool, `stage3_analysis/agent/`. Stage 4 (RAG Sink-to-Source Identifier) runs all six components (C1–C6) locally — corpus build (`fw-trace build-corpus`) plus the C3→C4→C5 driver (`fw-trace run`) over Stage 3's findings, with a Colab path for C1+C2 kept as an optional alternative. Stages 5–6 are empty placeholder packages.
+**Current status:** Stages 1–4 are implemented, and Stage 5's Joern half is implemented. Stage 2 covers Ghidra decompilation plus BOTH normalization targets: Joern-compilable whole-program C and the LLM-facing "clean" function-only extraction (`stage2_extraction/clean/`, tree-sitter-based) — the latter moved here from Stage 3 so it's computed once and persisted, not recomputed on every Stage 3 run. Stage 3 includes both Component 1 — ingest/chunk/queue, reading Stage 2's persisted cleaned artifact — and Component 2 — the LLM vulnerability-analysis worker pool, `stage3_analysis/agent/`. Stage 4 (RAG Sink-to-Source Identifier) runs all six components (C1–C6) locally — corpus build (`fw-trace build-corpus`) plus the C3→C4→C5 driver (`fw-trace run`) over Stage 3's findings, with a Colab path for C1+C2 kept as an optional alternative. Stage 5 (Sandboxed Verification) is a tool-calling LangGraph agent (`stage5_verification/agent/`) — the repo's first genuine multi-turn tool-calling loop — that builds a Joern CPG for a Stage 3 finding's binary and runs CPGQL queries to confirm/refute it (`fw-verify run`); this is Stage 5's ONLY tool so far — QEMU+GDB dynamic verification is not yet built. Stage 6 is still an empty placeholder package.
 
 ## Stage docs — read these first for stage-specific work
 
@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 2 — Feature Extraction | `fw_audit/stage2_extraction/` | [CLAUDE.md](fw_audit/stage2_extraction/CLAUDE.md) · [README.md](fw_audit/stage2_extraction/README.md) |
 | 3 — Analysis Core (+ agentic analysis) | `fw_audit/stage3_analysis/` | [CLAUDE.md](fw_audit/stage3_analysis/CLAUDE.md) · [README.md](fw_audit/stage3_analysis/README.md) |
 | 4 — RAG Sink-to-Source Identifier | `fw_audit/stage4_rag/` | [CLAUDE.md](fw_audit/stage4_rag/CLAUDE.md) · [README.md](fw_audit/stage4_rag/README.md) |
-| 5 — Sandboxed Verification (empty) | `fw_audit/stage5_verification/` | [CLAUDE.md](fw_audit/stage5_verification/CLAUDE.md) · [README.md](fw_audit/stage5_verification/README.md) |
+| 5 — Sandboxed Verification (Joern agent implemented; QEMU+GDB not yet) | `fw_audit/stage5_verification/` | [CLAUDE.md](fw_audit/stage5_verification/CLAUDE.md) · [README.md](fw_audit/stage5_verification/README.md) |
 | 6 — Reporting (empty) | `fw_audit/stage6_reporting/` | [CLAUDE.md](fw_audit/stage6_reporting/CLAUDE.md) · [README.md](fw_audit/stage6_reporting/README.md) |
 
 Adding a new stage: create its package, give it a `runner.py` CLI entry registered in `pyproject.toml`, and write its `CLAUDE.md`/`README.md` pair following the same template (file table, invoke, input, output, debugging) before adding a row above.
@@ -34,6 +34,7 @@ fw-extract data/db/<stem>/stage1_summary.json        # Stage 2 — see its CLAUD
 fw-analyze data/db/<stem>/stage1_summary.json        # Stage 3 — see its CLAUDE.md for flags
 fw-trace build-corpus --db-subfolder data/db/<stem> --rootfs ... --stage2-binaries ...  # Stage 4
 fw-trace run --db-subfolder data/db/<stem>           # Stage 4 — see its CLAUDE.md for flags
+fw-verify run --db-subfolder data/db/<stem>          # Stage 5 — see its CLAUDE.md for flags
 
 pytest -m "not integration"   # unit tests, no Docker/LLM required
 pytest -m integration         # end-to-end, needs Docker image(s) + real firmware
@@ -46,11 +47,11 @@ Copy `.env.example` to `.env` before running anything for real. Both the Stage 1
 
 ### The Executor abstraction (`fw_audit/executors/`)
 
-A uniform interface (`Executor.run(command, files=workspace)`) so callers never know which backend answers a command — selected via `FWA_EXECUTOR_BACKEND` through `manager.get_executor()`: **`DockerExecutor`** (default, production — plain Docker, `--network=none`, used by Stage 1's deterministic Extraction Script and Stage 2's Ghidra invocations against separate images), **`SandboxExecutor`** (reserved, **not implemented** — intended for future *LLM-controlled* execution, Stage 5 territory), **`LocalExecutor`** (host subprocess, tests/dev only, never production). An unrecognized backend name raises `ValueError` rather than silently degrading isolation.
+A uniform interface (`Executor.run(command, files=workspace)`) so callers never know which backend answers a command — selected via `FWA_EXECUTOR_BACKEND` through `manager.get_executor()`: **`DockerExecutor`** (default, production — plain Docker, `--network=none`, used by Stage 1's deterministic Extraction Script and Stage 2's Ghidra invocations against separate images), **`SandboxExecutor`** (*LLM-controlled* execution — Stage 5's Joern verification agent is its first real consumer, `fw_audit/stage5_verification/tools/joern_tool.py`; one-shot per call like `DockerExecutor` but resource-limited via `Settings.stage5_sandbox_*`, since it runs agent-authored script content), **`LocalExecutor`** (host subprocess, tests/dev only, never production). An unrecognized backend name raises `ValueError` rather than silently degrading isolation.
 
-### Two Docker images, deliberately separate
+### Three Docker images, deliberately separate
 
-`docker/Dockerfile` (Stage 1's sandbox) and `docker/Dockerfile.ghidra` (Stage 2's) are not merged — Stage 1 starts its container 6+ times per firmware, so bundling ~2GB of JDK+Ghidra would tax every start for no benefit, and Stage 1's `tpl-builder` stage is a known-flaky build Stage 2 must not inherit. See each stage's own docs for build commands and known traps.
+`docker/Dockerfile` (Stage 1's sandbox), `docker/Dockerfile.ghidra` (Stage 2's), and `docker/Dockerfile.joern` (Stage 5's, the first backing `SandboxExecutor` rather than `DockerExecutor`) are not merged — Stage 1 starts its container 6+ times per firmware, so bundling ~2GB of JDK+Ghidra (or a JVM-based Joern install) would tax every start for no benefit, and each tool's failure surface/network profile stays isolated from the others. See each stage's own docs for build commands and known traps.
 Note to follow everytime: 
 Docker Sandbox : will be used when Agentic AI is deployed which requires tool access. 
 Docker Container : Will be used when any script or trandional based work is required. 
@@ -63,9 +64,9 @@ Agents request an `AgentRole` (`STAGE1_BINARY_IDENTIFIER`, `STAGE3_VULN_ANALYST`
 
 Single `Settings` (pydantic-settings) object, cached via `get_settings()`. No module reaches for `os.environ` directly — add new config here. LLM credentials use conventional env-var names (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_BASE_URL`); app-specific settings use the `FWA_` prefix.
 
-### Cross-stage schemas (`fw_audit/common/schemas.py`, `fw_audit/common/findings.py`)
+### Cross-stage schemas (`fw_audit/common/schemas.py`, `findings.py`, `taint.py`, `verification.py`)
 
-`schemas.py` carries the pipeline-plumbing contracts passed between stages (`FirmwareMetadata`, `IdentifiedBinary`, `Stage1Summary`, `DecompiledBinary`, `Stage2Summary`, `Stage3Summary`, ...) — later stages import these rather than re-deriving ad-hoc dicts. `findings.py` carries Stage 3 Component 2's `AnalysisReport`/`Finding`/`AnalysisRunSummary` — the exact structured-output contract, kept separate from `schemas.py` to avoid bloating it further. `Stage2Summary` paths are relative to `db_subfolder`, with one documented exception (`decompiled_tree_dir` — see its docstring).
+`schemas.py` carries the pipeline-plumbing contracts passed between stages (`FirmwareMetadata`, `IdentifiedBinary`, `Stage1Summary`, `DecompiledBinary`, `Stage2Summary`, `Stage3Summary`, ...) — later stages import these rather than re-deriving ad-hoc dicts. `findings.py` carries Stage 3 Component 2's `AnalysisReport`/`Finding`/`AnalysisRunSummary`; `taint.py` carries Stage 4's `TaintPathReport`; `verification.py` carries Stage 5's `VerificationReport`/`VerifierVerdict` — each the exact structured-output contract for its stage's LLM call(s), kept separate from `schemas.py` (and from each other) to avoid bloating any one file, following the same "genuinely different concern" split each module's own docstring explains. `Stage2Summary` paths are relative to `db_subfolder`, with one documented exception (`decompiled_tree_dir` — see its docstring).
 
 ### Why `fw_audit/` wraps everything
 
@@ -77,4 +78,4 @@ The unit suite mocks both boundaries each stage depends on (`tests/conftest.py::
 
 ## Git/workflow conventions
 
-Commit or push only when asked. Branch off `main` before committing. Follow the stage doc for the stage you're changing before making cross-stage edits — most feature work touches exactly one stage's package plus, at most, `common/schemas.py` or `common/findings.py`.
+Commit or push only when asked. Branch off `main` before committing. Follow the stage doc for the stage you're changing before making cross-stage edits — most feature work touches exactly one stage's package plus, at most, `common/schemas.py` or that stage's own `common/*.py` schema module (`findings.py`, `taint.py`, `verification.py`).

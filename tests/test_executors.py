@@ -12,8 +12,8 @@ import pytest
 from fw_audit.config.settings import Settings
 from fw_audit.executors import (
     DockerExecutor,
-    Executor,
     ExecutionResult,
+    Executor,
     LocalExecutor,
     SandboxExecutor,
     get_executor,
@@ -95,11 +95,25 @@ async def test_local_executor_empty_command():
     assert not result.ok
 
 
-async def test_sandbox_executor_run_raises_not_implemented():
+async def test_sandbox_executor_runs_via_docker(monkeypatch, tmp_path):
+    """SandboxExecutor is now a real, Docker-backed one-shot executor (see
+    `tests/test_sandbox_executor.py` for its full argv-composition coverage)
+    — this just confirms it satisfies the same `run()` contract as every
+    other backend from `manager.get_executor()`'s perspective."""
+    from fw_audit.stage1_ingestion.tools.extraction_tools import CommandResult
+
+    async def fake_run_command(binary, args, *, settings=None):
+        return CommandResult(
+            command=[binary, *args], returncode=0, stdout="ok", stderr="", timed_out=False
+        )
+
+    monkeypatch.setattr("fw_audit.executors.sandbox_executor.run_command", fake_run_command)
+
     executor = SandboxExecutor()
-    with pytest.raises(NotImplementedError, match="reserved for future"):
-        await executor.run("echo hi")
+    result = await executor.run("echo hi", files=tmp_path)
+    assert result.ok
+    assert result.stdout == "ok"
 
 
-def test_sandbox_executor_unavailable():
-    assert SandboxExecutor().available() is False
+def test_sandbox_executor_available_returns_bool():
+    assert isinstance(SandboxExecutor().available(), bool)

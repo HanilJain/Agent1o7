@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from fw_audit.common.schemas import IdentifiedBinary
+from fw_audit.stage2_extraction import resolve as resolve_module
 from fw_audit.stage2_extraction.resolve import Resolution, resolve_binaries
 
 
@@ -282,6 +283,121 @@ def test_basename_rescan_skips_unstattable_entry_without_raising(
 
     assert len(report.resolved) == 1
     assert report.resolved[0].rootfs_rel == "bin/httpd"
+
+
+def test_lx_symlink_reparse_point_is_followed_on_windows(
+    tmp_path, synthetic_elf_bytes, monkeypatch
+):
+    """Regression test for the actual bug observed against a real firmware
+    rootfs: a rootfs extracted via a Linux container through Docker
+    Desktop's WSL2 backend stores real POSIX symlinks as
+    `IO_REPARSE_TAG_LX_SYMLINK` reparse points — `Path.is_symlink()`
+    doesn't recognize this tag at all and reports `False`, so the old code
+    treated a genuine symlink (confirmed: `sbin/nordvpn -> rc`, one of 409
+    affected entries in one real committed firmware) as a terminal,
+    unreadable regular file and silently reported it `not_found`.
+
+    A real `IO_REPARSE_TAG_LX_SYMLINK` reparse point can't portably be
+    created in a unit test (it requires WSL2/Docker Desktop's filesystem
+    driver, not just admin rights) — this instead monkeypatches
+    `winreparse.read_lx_symlink_target` (the exact seam `_walk_symlinks`
+    calls) to simulate what a real one returns, which is enough to pin the
+    `_walk_symlinks` control flow this bug was in.
+    """
+    rootfs = _make_rootfs(tmp_path)
+    _write_elf(rootfs / "sbin" / "rc", synthetic_elf_bytes)
+    # A plain regular file standing in for the LX-symlink reparse point --
+    # is_symlink() is False for it, exactly like the real broken case.
+    (rootfs / "sbin" / "nordvpn").write_bytes(b"")
+
+    def fake_lx_target(path: Path) -> str | None:
+        if path.name == "nordvpn":
+            return "rc"
+        return None
+
+    monkeypatch.setattr(resolve_module, "read_lx_symlink_target", fake_lx_target)
+
+    report = resolve_binaries(
+        [IdentifiedBinary(path="sbin/nordvpn")],
+        rootfs,
+        max_binaries=25,
+        max_rescan_files=10_000,
+    )
+
+    assert report.unresolved == ()
+    assert len(report.resolved) == 1
+    resolved = report.resolved[0]
+    assert resolved.resolution == Resolution.SYMLINK
+    assert resolved.symlink_chain == ("rc",)
+    assert resolved.rootfs_rel == "sbin/nordvpn"  # identity kept as requested
+    assert resolved.host_path == rootfs / "sbin" / "rc"  # bytes come from the real target
+
+
+def test_lx_symlink_fallback_not_triggered_for_a_real_regular_file(
+    tmp_path, synthetic_elf_bytes, monkeypatch
+):
+    """The fallback must never fire for an ordinary file that just happens
+    to not be a symlink -- `read_lx_symlink_target` returning `None` (as it
+    always does for a non-reparse-point entry) must leave normal DIRECT
+    resolution working exactly as before."""
+    rootfs = _make_rootfs(tmp_path)
+    _write_elf(rootfs / "bin" / "httpd", synthetic_elf_bytes)
+
+    calls: list[Path] = []
+
+    def tracking_lx_target(path: Path) -> str | None:
+        calls.append(path)
+        return None
+
+    monkeypatch.setattr(resolve_module, "read_lx_symlink_target", tracking_lx_target)
+
+    report = resolve_binaries(
+        [IdentifiedBinary(path="bin/httpd")],
+        rootfs,
+        max_binaries=25,
+        max_rescan_files=10_000,
+    )
+
+    assert len(report.resolved) == 1
+    assert report.resolved[0].resolution == Resolution.DIRECT
+    assert calls == [rootfs / "bin" / "httpd"]  # the fallback WAS consulted, and correctly declined
+
+
+def test_is_symlink_raising_oserror_is_treated_as_terminal_not_a_crash(
+    tmp_path, synthetic_elf_bytes, monkeypatch
+):
+    """A sufficiently broken/exotic filesystem entry can make even
+    `Path.is_symlink()` itself raise `OSError` (confirmed against a real
+    firmware rootfs: an entry unreadable by `fsutil`/Git Bash's own `ls`
+    too, unrelated to the LX-symlink case above). `resolve_binaries` must
+    still never raise -- this pins that `_walk_symlinks` catches it and
+    treats the entry as a non-symlink terminal, letting `_is_file_safe`
+    downstream reject it cleanly."""
+    rootfs = _make_rootfs(tmp_path)
+    _write_elf(rootfs / "bin" / "httpd", synthetic_elf_bytes)
+    broken = rootfs / "bin" / "broken"
+    broken.write_bytes(b"")
+
+    real_is_symlink = Path.is_symlink
+
+    def fake_is_symlink(self, *args, **kwargs):
+        if self == broken:
+            raise OSError(1920, "The file cannot be accessed by the system", str(broken))
+        return real_is_symlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+
+    report = resolve_binaries(
+        [IdentifiedBinary(path="bin/broken"), IdentifiedBinary(path="bin/httpd")],
+        rootfs,
+        max_binaries=25,
+        max_rescan_files=10_000,
+    )
+
+    assert len(report.resolved) == 1
+    assert report.resolved[0].rootfs_rel == "bin/httpd"
+    assert len(report.unresolved) == 1
+    assert report.unresolved[0].requested_path == "bin/broken"
 
 
 def test_ambiguous_basename_rescan_is_unresolved(tmp_path, synthetic_elf_bytes):

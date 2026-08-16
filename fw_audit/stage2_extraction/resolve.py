@@ -29,6 +29,7 @@ from fw_audit.common.schemas import (
     extension_from_path,
 )
 from fw_audit.stage1_ingestion.tools.filesystem_tools import ELFParseError, is_elf, parse_elf_header
+from fw_audit.stage2_extraction.winreparse import read_lx_symlink_target
 
 _DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 _URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
@@ -287,23 +288,49 @@ def _walk_symlinks(
     for _ in range(_MAX_SYMLINK_HOPS):
         if not _is_within(current, rootfs_dir):
             return None, tuple(chain), "escapes_rootfs"
-        if not current.is_symlink():
-            return current, tuple(chain), None
+
         try:
-            target = current.readlink()
+            currently_a_symlink = current.is_symlink()
         except OSError:
-            return None, tuple(chain), "unreadable_symlink"
+            # A sufficiently broken/exotic filesystem entry can raise here
+            # too (confirmed against a real extracted rootfs: a config
+            # file even `fsutil`/Git Bash's own `ls` can't read at all —
+            # unrelated to the LX-symlink case below, genuinely
+            # unreadable by any means). Treat exactly like "not a
+            # symlink" — `_is_file_safe` downstream already has its own
+            # try/except guard and will correctly reject it as unresolvable.
+            return current, tuple(chain), None
+        if currently_a_symlink:
+            try:
+                target_str = str(current.readlink()).replace("\\", "/")
+            except OSError:
+                return None, tuple(chain), "unreadable_symlink"
+        else:
+            # Standard library gap, Windows only: a rootfs extracted via a
+            # Linux container through Docker Desktop's WSL2 backend stores
+            # real POSIX symlinks as `IO_REPARSE_TAG_LX_SYMLINK` reparse
+            # points — a tag `Path.is_symlink()` doesn't recognize at all,
+            # so it reports `False` here even though `current` genuinely
+            # is a symlink (confirmed against a real firmware rootfs: 409
+            # affected entries in one extracted image, e.g.
+            # `sbin/nordvpn -> rc`, most busybox applets). `winreparse.
+            # read_lx_symlink_target` recovers the real target directly
+            # from the reparse point; `None` means `current` truly isn't a
+            # symlink by either mechanism, so the walk legitimately ends.
+            lx_target = read_lx_symlink_target(current)
+            if lx_target is None:
+                return current, tuple(chain), None
+            target_str = lx_target
 
         # A POSIX-style leading "/" always means "absolute within the
         # firmware rootfs", regardless of the host OS — `target.is_absolute()`
         # is unusable here since Windows' pathlib does not consider
         # "/bin/busybox" absolute (no drive letter), but that is exactly
         # what a router firmware's symlink means.
-        target_str = str(target).replace("\\", "/")
         if target_str.startswith("/"):
             current = rootfs_dir / target_str.lstrip("/")
         else:
-            current = current.parent / target
+            current = current.parent / target_str
         current = Path(os.path.normpath(str(current)))
         chain.append(target_str)
 
@@ -325,8 +352,18 @@ def _is_file_safe(path: Path) -> bool:
     `is_symlink()` short-circuit is kept anyway since it's a real,
     free-of-a-syscall-round-trip case (`lstat`, never follows), but the
     `try/except OSError` is what actually catches this specific one — it's
-    the backstop that matters, not just a defensive nicety."""
-    if path.is_symlink():
+    the backstop that matters, not just a defensive nicety.
+
+    `is_symlink()` itself can ALSO raise `OSError` for a sufficiently
+    broken/exotic entry (confirmed against a real firmware rootfs: an
+    entry `fsutil`/Git Bash's own `ls` can't read either — a different,
+    genuinely unreadable case than the LX-symlink reparse points
+    `_walk_symlinks` recovers) — guarded here too, same verdict either way
+    (not a usable file)."""
+    try:
+        if path.is_symlink():
+            return False
+    except OSError:
         return False
     try:
         return path.is_file()

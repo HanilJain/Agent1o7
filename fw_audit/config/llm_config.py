@@ -91,6 +91,15 @@ class AgentRole(str, Enum):
     """Stage 4 Component 5 (`stage4_rag.taint.analyst`): reasons over
     Component 4's retrieved context + the original Stage 3 finding to build
     a structured `TaintPathReport`. No tool access."""
+    STAGE5_VERIFIER = "stage5_verifier"
+    """Stage 5's Joern verification agent (`stage5_verification.agent`): the
+    first role in this repo with actual tool access (`build_cpg`,
+    `run_joern_script`, bound via LangGraph) rather than a one-shot
+    structured-output call. Routed to HIGH_REASONING by default (Claude
+    Sonnet) — same reasoning as Stage 3/4's roles — but commonly overridden
+    to a local Ollama model (e.g. `FWA_STAGE5_VERIFIER_MODEL=ollama:qwen3:8b`)
+    for offline/cheap iteration; a weaker model just means the bounded
+    `stage5_max_agent_iterations`/`stage5_repair_attempts` retries matter more."""
 
 
 @dataclass(frozen=True)
@@ -128,6 +137,11 @@ ROLE_TO_TIER: dict[AgentRole, ModelTier] = {
     # let either be pointed at a local Ollama model independently.
     AgentRole.STAGE4_QUERY_PLANNER: ModelTier.HIGH_REASONING,
     AgentRole.STAGE4_TAINT_ANALYST: ModelTier.HIGH_REASONING,
+    # Stage 5's verification agent gets the same HIGH_REASONING default —
+    # it drives real tool calls (Joern CPG queries) and a final structured
+    # verdict, both reasoning-heavy. `FWA_STAGE5_VERIFIER_MODEL` overrides
+    # this role specifically (e.g. to a local Ollama qwen3 model).
+    AgentRole.STAGE5_VERIFIER: ModelTier.HIGH_REASONING,
 }
 
 # ---------------------------------------------------------------------- #
@@ -181,6 +195,7 @@ _ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, str] = {
     AgentRole.STAGE3_VULN_ANALYST: "stage3_analyst_model",
     AgentRole.STAGE4_QUERY_PLANNER: "stage4_query_planner_model",
     AgentRole.STAGE4_TAINT_ANALYST: "stage4_taint_analyst_model",
+    AgentRole.STAGE5_VERIFIER: "stage5_verifier_model",
 }
 
 

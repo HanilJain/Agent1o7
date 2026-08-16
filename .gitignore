@@ -30,3 +30,10 @@ data/db/*
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Pre-fetched build inputs for docker/Dockerfile.joern (~1.8GB release
+# asset, downloaded locally to work around this environment's flaky
+# long-lived HTTP/2 connections — never commit it; see Dockerfile.joern's
+# fetch stage comment for why it's referenced via local COPY instead of a
+# RUN curl).
+docker/.joern-cli.zip

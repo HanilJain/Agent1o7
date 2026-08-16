@@ -7,14 +7,16 @@ reporting. Built on **LangGraph** (stateful agent orchestration),
 **LangChain** (unified LLM abstraction), and **Docker** (sandboxed
 extraction).
 
-**Current status:** Stage 1 (Ingestion), Stage 2 (Feature Extraction —
-including the LLM-facing "clean" function-only extraction), and Stage 3
-(Analysis Core — both Component 1's ingest/chunk/queue and Component 2's
-LLM vulnerability-analysis worker pool) are implemented. Stage 4 (RAG
-Sink-to-Source Identifier) is in progress — see
-[MASTERPLAN_STAGE4.md](MASTERPLAN_STAGE4.md). Stages 5–6 are scaffolded as
-empty sub-packages (`fw_audit/stage5_verification/`,
-`fw_audit/stage6_reporting/`).
+**Current status:** Stages 1–4 are implemented — Stage 1 (Ingestion),
+Stage 2 (Feature Extraction, including the LLM-facing "clean" function-only
+extraction), Stage 3 (Analysis Core — both Component 1's ingest/chunk/queue
+and Component 2's LLM vulnerability-analysis worker pool), and Stage 4 (RAG
+Sink-to-Source Identifier, all six components running locally — see
+[MASTERPLAN_STAGE4.md](MASTERPLAN_STAGE4.md)). Stage 5 (Sandboxed
+Verification) has its Joern half implemented — a tool-calling agent that
+builds a CPG for a Stage 3 finding's binary and runs Joern/CPGQL queries to
+confirm or refute it; QEMU+GDB dynamic verification is not yet built. Stage
+6 is still a scaffolded empty sub-package (`fw_audit/stage6_reporting/`).
 
 ## Stage documentation
 
@@ -29,8 +31,8 @@ re-deriving detail from this file or the full source tree:
 | 1 — Ingestion & Pre-processing | `fw_audit/stage1_ingestion/` | [CLAUDE.md](fw_audit/stage1_ingestion/CLAUDE.md) · [README.md](fw_audit/stage1_ingestion/README.md) |
 | 2 — Feature Extraction | `fw_audit/stage2_extraction/` | [CLAUDE.md](fw_audit/stage2_extraction/CLAUDE.md) · [README.md](fw_audit/stage2_extraction/README.md) |
 | 3 — Analysis Core (+ agentic analysis) | `fw_audit/stage3_analysis/` | [CLAUDE.md](fw_audit/stage3_analysis/CLAUDE.md) · [README.md](fw_audit/stage3_analysis/README.md) |
-| 4 — RAG Sink-to-Source Identifier (in progress) | `fw_audit/stage4_rag/` | [CLAUDE.md](fw_audit/stage4_rag/CLAUDE.md) · [README.md](fw_audit/stage4_rag/README.md) |
-| 5 — Sandboxed Verification (empty) | `fw_audit/stage5_verification/` | [CLAUDE.md](fw_audit/stage5_verification/CLAUDE.md) · [README.md](fw_audit/stage5_verification/README.md) |
+| 4 — RAG Sink-to-Source Identifier | `fw_audit/stage4_rag/` | [CLAUDE.md](fw_audit/stage4_rag/CLAUDE.md) · [README.md](fw_audit/stage4_rag/README.md) |
+| 5 — Sandboxed Verification (Joern agent implemented; QEMU+GDB not yet) | `fw_audit/stage5_verification/` | [CLAUDE.md](fw_audit/stage5_verification/CLAUDE.md) · [README.md](fw_audit/stage5_verification/README.md) |
 | 6 — Reporting (empty) | `fw_audit/stage6_reporting/` | [CLAUDE.md](fw_audit/stage6_reporting/CLAUDE.md) · [README.md](fw_audit/stage6_reporting/README.md) |
 
 The project-level [CLAUDE.md](CLAUDE.md) covers cross-cutting architecture
@@ -59,9 +61,10 @@ See each stage's own docs (table above) for the full mechanics.
 `fw_audit/executors/` provides a uniform interface so callers never know or
 care which backend answers `executor.run(command, files=workspace)`:
 **`DockerExecutor`** (production default — deterministic pipelines,
-`--network=none`), **`SandboxExecutor`** (reserved, not implemented —
-future LLM-controlled execution, Stage 5 territory), **`LocalExecutor`**
-(host subprocess, tests/dev only). Selected via `FWA_EXECUTOR_BACKEND`.
+`--network=none`), **`SandboxExecutor`** (LLM-controlled execution —
+Stage 5's Joern verification agent is its first real consumer; one-shot per
+call, resource-limited), **`LocalExecutor`** (host subprocess, tests/dev
+only). Selected via `FWA_EXECUTOR_BACKEND`.
 
 ## Project Layout
 
@@ -73,11 +76,13 @@ fw_audit/
   stage1_ingestion/         # Stage 1 — see its CLAUDE.md/README.md
   stage2_extraction/        # Stage 2 — see its CLAUDE.md/README.md
   stage3_analysis/           # Stage 3 — see its CLAUDE.md/README.md
-  stage4_rag/                # Stage 4 — see its CLAUDE.md/README.md (in progress)
-  stage5_verification/ … stage6_reporting/   # Scaffolded, not yet implemented
+  stage4_rag/                # Stage 4 — see its CLAUDE.md/README.md
+  stage5_verification/        # Stage 5 (Joern agent) — see its CLAUDE.md/README.md
+  stage6_reporting/          # Scaffolded, not yet implemented
 docker/
   Dockerfile               # Stage 1's sandbox image
   Dockerfile.ghidra        # Stage 2's Ghidra image — separate, see Stage 2 docs
+  Dockerfile.joern         # Stage 5's Joern sandbox image — separate, see Stage 5 docs
   ghidra_scripts/          # PyGhidra headless export script + build-time smoke test
 data/
   firmware/                # Drop raw firmware images here (gitignored)
@@ -115,6 +120,7 @@ Docker images (build before running the relevant stage for real):
 ```bash
 docker build -f docker/Dockerfile -t fw-audit-sandbox:latest .          # Stage 1
 docker build -f docker/Dockerfile.ghidra -t fw-audit-ghidra:latest .    # Stage 2
+docker build -f docker/Dockerfile.joern -t fw-audit-joern:latest .      # Stage 5
 ```
 
 ## Running the pipeline
@@ -123,6 +129,9 @@ docker build -f docker/Dockerfile.ghidra -t fw-audit-ghidra:latest .    # Stage 
 fw-ingest path/to/firmware.bin                        # Stage 1
 fw-extract data/db/<firmware-stem>/stage1_summary.json # Stage 2
 fw-analyze data/db/<firmware-stem>/stage1_summary.json --analyze # Stage 3
+fw-trace build-corpus --db-subfolder data/db/<stem> ...          # Stage 4
+fw-trace run --db-subfolder data/db/<stem>                       # Stage 4
+fw-verify run --db-subfolder data/db/<stem>                      # Stage 5
 ```
 
 Full flag reference, expected input/output, and debugging steps for each
