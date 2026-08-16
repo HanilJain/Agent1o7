@@ -47,6 +47,26 @@ def test_parse_args_debug_subcommands():
     assert args.gid == "a::1"
 
 
+def test_parse_args_debug_search_repeatable_query_and_top_k():
+    args = runner._parse_args(
+        [
+            "debug",
+            "search",
+            "--db-subfolder",
+            "db/fw",
+            "--query",
+            "find exec calls",
+            "--query",
+            "find popen calls",
+            "--top-k",
+            "15",
+        ]
+    )
+    assert args.debug_command == "search"
+    assert args.query == ["find exec calls", "find popen calls"]
+    assert args.top_k == 15
+
+
 def test_cmd_build_corpus_invokes_build_corpus_and_prints(monkeypatch, tmp_path, capsys):
     fake_report = CorpusBuildReport(
         total_files=1,

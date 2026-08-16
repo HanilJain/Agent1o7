@@ -107,6 +107,12 @@ class Stage4ColabConfig:
     embedding_device: str | None = None  # None -> sentence-transformers auto-picks CUDA if present
     chroma_collection_name: str = "stage4_corpus"
     embed_batch_size: int = 32
+    embed_max_seq_length: int = 2048
+    """Forwarded to `Qwen3Embedder`'s `max_seq_length` — hard token cap per
+    chunk, independent of `chunk_words`. See `DEFAULT_MAX_SEQ_LENGTH`'s
+    docstring: a single pathological chunk (minified JS, base64, long
+    unbroken hex) can OOM a small GPU regardless of batch size without
+    this, since attention memory scales with sequence_length^2."""
 
 
 # ============================================================================
@@ -128,9 +134,8 @@ class CorpusKind(str, Enum):  # noqa: UP042 — str+Enum (not StrEnum) matches t
 # two sets first if a corpus is misclassifying real files.
 ALLOWED_TEXT_EXTENSIONS: frozenset[str] = frozenset(
     {
-        ".html",
-        # ".html", ".htm", ".asp", ".aspx", ".js", ".css", ".txt", ".xml",
-        # ".json", ".conf", ".cfg", ".ini", ".sh", ".php", ".cgi", ".lua",
+        ".html", ".htm", ".asp", ".aspx", ".js", ".css", ".txt", ".xml",
+        ".json", ".conf", ".cfg", ".ini", ".sh", ".php", ".cgi", ".lua",
     }
 )
 """Extensions treated as human-readable text — embedded as-is."""
@@ -374,6 +379,20 @@ silently degrades retrieval quality without raising an error, since
 mismatched-but-valid-shaped vectors still "work", just badly."""
 
 
+DEFAULT_MAX_SEQ_LENGTH = 2048
+"""Hard cap on tokens-per-chunk passed into the model, independent of
+`FixedWordChunker`'s WORD-count limit. Qwen3-Embedding's own default max
+sequence length is far higher (up to 32K), which does nothing to protect a
+small/consumer GPU: attention memory scales roughly with sequence_length^2,
+so a single chunk with pathological tokenization — a minified/obfuscated JS
+file, a base64 blob, a long unbroken hex string, all things a real firmware
+rootfs contains — can blow up memory even at batch_size=1, regardless of how
+few *words* (whitespace-delimited) the chunker counted it as. Confirmed via
+a real `torch.OutOfMemoryError` on an 8GB card at batch_size=4. 2048 tokens
+is comfortably above ~500 words' worth of normal English/code text (usually
+under a thousand tokens) while still bounding the pathological case."""
+
+
 class Qwen3Embedder:
     """Thin wrapper around a Qwen3-Embedding checkpoint via
     `sentence-transformers`, which is what the official Qwen3-Embedding
@@ -387,15 +406,24 @@ class Qwen3Embedder:
     installed.
     """
 
-    def __init__(self, model_name: str, device: str | None = None):
+    def __init__(
+        self,
+        model_name: str,
+        device: str | None = None,
+        max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
+    ):
         from sentence_transformers import SentenceTransformer
 
         self.model_name = model_name
         self._model = SentenceTransformer(model_name, device=device)
+        # Truncates (never errors) any input tokenizing past this length —
+        # see DEFAULT_MAX_SEQ_LENGTH's docstring for why this must be set
+        # explicitly rather than trusting the checkpoint's own default.
+        self._model.max_seq_length = max_seq_length
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+    def embed_documents(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
         vectors = self._model.encode(
-            texts, batch_size=32, show_progress_bar=False, normalize_embeddings=True
+            texts, batch_size=batch_size, show_progress_bar=False, normalize_embeddings=True
         )
         return vectors.tolist()
 
@@ -437,7 +465,7 @@ def embed_and_upsert(
             }
             for c in batch
         ]
-        embeddings = embedder.embed_documents(docs)
+        embeddings = embedder.embed_documents(docs, batch_size=batch_size)
         collection.upsert(ids=ids, embeddings=embeddings, documents=docs, metadatas=metadatas)
         upserted += len(batch)
         print(f"  [C2] embedded+upserted {upserted}/{len(chunks)} chunks")
@@ -510,7 +538,11 @@ def run(config: Stage4ColabConfig) -> Path:
     report_path = config.output_dir / "corpus_report.json"
 
     print(f"[C2] loading embedding model: {config.embedding_model}")
-    embedder = Qwen3Embedder(config.embedding_model, device=config.embedding_device)
+    embedder = Qwen3Embedder(
+        config.embedding_model,
+        device=config.embedding_device,
+        max_seq_length=config.embed_max_seq_length,
+    )
 
     print(f"[C2] embedding + upserting into Chroma collection '{config.chroma_collection_name}'")
     collection = get_or_create_collection(

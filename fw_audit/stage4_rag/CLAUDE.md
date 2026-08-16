@@ -32,8 +32,8 @@ superseded; the notebook now demoted to an optional alternate path. Root
 | `retrieval/store.py`, `retrieval/engine.py` | C4: loads local Chroma + parity-matched embedder, top-k search + merge/dedupe, `build_c5_prompt()`. |
 | `taint/prompts.py`, `taint/analyst.py` | C5: `TaintPathReport` structured-output LLM call, no tools. |
 | `driver.py` | C6: async worker-pool loop, C3->C4->C5->persist, mirrors `stage3_analysis.chunk_queue`. |
-| `debug.py` | Per-component inspection: corpus stats, embedding parity check, sink listing, single-finding query/retrieve/taint dry runs. |
-| `runner.py` | `fw-trace` CLI: `build-corpus`, `run`, `debug {corpus,parity,sinks,query,retrieve,taint}`. |
+| `debug.py` | Per-component inspection: corpus stats, embedding parity check, sink listing, single-finding query/retrieve/taint dry runs, and raw-query C4 search that bypasses C3 entirely. |
+| `runner.py` | `fw-trace` CLI: `build-corpus`, `run`, `debug {corpus,parity,sinks,query,retrieve,search,taint}`. |
 | `errors.py` | `Stage4InputError`, `VectorStoreUnavailableError`. |
 
 ## Invoke

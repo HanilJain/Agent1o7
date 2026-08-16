@@ -74,6 +74,7 @@ def build_corpus(
         embedding_device=settings.stage4_embedding_device,
         chroma_collection_name=settings.stage4_chroma_collection_name,
         embed_batch_size=settings.stage4_embed_batch_size,
+        embed_max_seq_length=settings.stage4_embed_max_seq_length,
     )
 
     logger.info("rootfs: %s", rootfs_dir)
@@ -116,7 +117,11 @@ def _build_embedder(config: Stage4ColabConfig):
     `corpus_build` module import time."""
     from fw_audit.stage4_rag.colab.chunk_and_embed import Qwen3Embedder
 
-    return Qwen3Embedder(config.embedding_model, device=config.embedding_device)
+    return Qwen3Embedder(
+        config.embedding_model,
+        device=config.embedding_device,
+        max_seq_length=config.embed_max_seq_length,
+    )
 
 
 __all__ = ["CorpusBuildReport", "build_corpus"]

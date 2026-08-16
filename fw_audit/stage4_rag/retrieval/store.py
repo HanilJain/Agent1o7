@@ -61,7 +61,11 @@ def load_embedder(*, settings: Settings | None = None) -> Any:
             'sentence-transformers is not installed. Install it with: '
             'pip install "fw-audit[stage4]"'
         ) from exc
-    return Qwen3Embedder(settings.stage4_embedding_model, device=settings.stage4_embedding_device)
+    return Qwen3Embedder(
+        settings.stage4_embedding_model,
+        device=settings.stage4_embedding_device,
+        max_seq_length=settings.stage4_embed_max_seq_length,
+    )
 
 
 __all__ = ["load_embedder", "load_local_collection"]

@@ -289,7 +289,7 @@ class Settings(BaseSettings):
         default="stage4_corpus", validation_alias="FWA_STAGE4_CHROMA_COLLECTION_NAME"
     )
     stage4_embed_batch_size: int = Field(
-        default=4, ge=1, validation_alias="FWA_STAGE4_EMBED_BATCH_SIZE"
+        default=8, ge=1, validation_alias="FWA_STAGE4_EMBED_BATCH_SIZE"
     )
     """Kept conservative (not e.g. 32) because ~500-word chunks on an 8GB
     consumer GPU (e.g. a 4060 laptop) OOM at higher batch sizes with the
@@ -297,6 +297,18 @@ class Settings(BaseSettings):
     `torch.OutOfMemoryError` at batch_size=32 on such a card. Raise this if
     your GPU has more headroom (24GB+ cards can likely go back to 32+), or
     lower it further if 8 still OOMs."""
+    stage4_embed_max_seq_length: int = Field(
+        default=2048, ge=32, validation_alias="FWA_STAGE4_EMBED_MAX_SEQ_LENGTH"
+    )
+    """Hard token cap per chunk passed to the embedding model, independent
+    of `stage4_chunk_words`'s WORD-count limit — see
+    `colab.chunk_and_embed.DEFAULT_MAX_SEQ_LENGTH`'s docstring: a single
+    chunk with pathological tokenization (minified JS, base64, a long
+    unbroken hex string — all things a real firmware rootfs contains) can
+    OOM a small GPU at ANY batch size without this, since attention memory
+    scales with sequence_length^2. Confirmed via a real
+    `torch.OutOfMemoryError` that persisted down to batch_size=4 until this
+    cap was added. Lower further (e.g. 512-1024) if OOMs still occur."""
     stage4_top_k: int = Field(default=8, ge=1, validation_alias="FWA_STAGE4_TOP_K")
     """Per-query top-k similarity search result count in C4 — see
     `retrieval/engine.py`. Merged/deduped across a `MultiQueryPlan`'s 4-5

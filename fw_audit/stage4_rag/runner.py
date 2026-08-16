@@ -9,6 +9,7 @@ Registered as the `fw-trace` console script (see pyproject.toml). Usage:
     fw-trace debug sinks --db-subfolder DIR
     fw-trace debug query --db-subfolder DIR --gid GID
     fw-trace debug retrieve --db-subfolder DIR --gid GID
+    fw-trace debug search --db-subfolder DIR --query TEXT [--query TEXT ...] [--top-k N]
     fw-trace debug taint --db-subfolder DIR --gid GID
 
 `build-corpus` runs Components 1+2 locally — no zip/upload, straight to
@@ -84,6 +85,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p = dbg_sub.add_parser(name, help=help_text)
         p.add_argument("--db-subfolder", type=str, required=True)
         p.add_argument("--gid", type=str, required=True, help="Global finding id.")
+
+    dbg_search = dbg_sub.add_parser(
+        "search", help="Run Component 4 directly against hand-written queries (bypasses C3)."
+    )
+    dbg_search.add_argument("--db-subfolder", type=str, required=True)
+    dbg_search.add_argument(
+        "--query",
+        action="append",
+        required=True,
+        metavar="TEXT",
+        help="A raw search query. Repeatable — pass multiple for broader coverage.",
+    )
+    dbg_search.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Per-query result count (default: FWA_STAGE4_TOP_K). Results are merged/deduped "
+        "across all --query values, so more queries and/or a higher --top-k both widen the "
+        "final result set.",
+    )
 
     return parser.parse_args(argv)
 
@@ -167,6 +189,19 @@ def _cmd_debug(args: argparse.Namespace) -> int:
             print(f"finding: {bundle.global_id}")
             for chunk in bundle.chunks:
                 print(f"  [{chunk.distance:.4f}] {chunk.kind} {chunk.source_path}")
+        elif args.debug_command == "search":
+            bundle = debug_mod.debug_search(
+                Path(args.db_subfolder), args.query, top_k=args.top_k
+            )
+            print(f"queries: {len(args.query)}  results: {len(bundle.chunks)}")
+            for chunk in bundle.chunks:
+                snippet = chunk.text[:200].replace("\n", " ")
+                bin_label = f" bin_id={chunk.bin_id}" if chunk.bin_id else ""
+                print(
+                    f"  [{chunk.distance:.4f}] {chunk.kind} {chunk.source_path}{bin_label} "
+                    f"(matched by {len(chunk.matched_queries)}/{len(args.query)} queries)"
+                )
+                print(f"      {snippet}...")
         elif args.debug_command == "taint":
             report = asyncio.run(debug_mod.debug_taint(Path(args.db_subfolder), args.gid))
             print(report.model_dump_json(indent=2))

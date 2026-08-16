@@ -8,7 +8,7 @@ one exception, `debug_corpus`, only reads). `debug_taint` runs a real
 C3->C4->C5 pass but is explicitly a **dry run**: nothing it produces is
 written to `stage4_dir`'s tracked output paths.
 
-Wired into `runner.py debug {corpus,parity,sinks,query,retrieve,taint}`.
+Wired into `runner.py debug {corpus,parity,sinks,query,retrieve,search,taint}`.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from pathlib import Path
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.stage4_rag import layout
 from fw_audit.stage4_rag.query.planner import generate_queries
-from fw_audit.stage4_rag.query.schemas import MultiQueryPlan
+from fw_audit.stage4_rag.query.schemas import MultiQueryPlan, SearchQuery
 from fw_audit.stage4_rag.retrieval.engine import RetrievalBundle, build_c5_prompt, retrieve
 from fw_audit.stage4_rag.retrieval.store import load_embedder, load_local_collection
 from fw_audit.stage4_rag.sink_index import (
@@ -155,6 +155,37 @@ async def debug_retrieve(
     return retrieve(plan, collection=collection, embedder=embedder, top_k=settings.stage4_top_k)
 
 
+def debug_search(
+    db_subfolder: Path,
+    queries: list[str],
+    *,
+    top_k: int | None = None,
+    settings: Settings | None = None,
+) -> RetrievalBundle:
+    """Runs Component 4 directly against hand-written query strings —
+    bypasses Component 3's LLM entirely (no `finding`/`--gid` needed, no
+    LLM call, no cost). For testing retrieval quality/coverage against
+    queries you write yourself before trusting C3 to generate similar ones.
+
+    `top_k` overrides `settings.stage4_top_k` for this call only (results
+    are merged/deduped across all `queries`, same as real retrieval — so
+    passing more queries and/or a higher `top_k` widens the result set;
+    see `retrieval.engine.retrieve`'s docstring for the merge/dedupe rule).
+    """
+    settings = settings or get_settings()
+    plan = MultiQueryPlan(
+        finding_id="ad-hoc-search",
+        queries=[SearchQuery(query_text=q, focus="user-provided") for q in queries],
+    )
+    stage4_dir_ = layout.stage4_dir(db_subfolder)
+    collection = load_local_collection(
+        layout.chroma_dir(stage4_dir_), collection_name=settings.stage4_chroma_collection_name
+    )
+    embedder = load_embedder(settings=settings)
+    effective_top_k = top_k if top_k is not None else settings.stage4_top_k
+    return retrieve(plan, collection=collection, embedder=embedder, top_k=effective_top_k)
+
+
 async def debug_taint(
     db_subfolder: Path, global_id: str, *, settings: Settings | None = None
 ):
@@ -176,6 +207,7 @@ __all__ = [
     "debug_embedding_parity",
     "debug_query",
     "debug_retrieve",
+    "debug_search",
     "debug_sinks",
     "debug_taint",
 ]

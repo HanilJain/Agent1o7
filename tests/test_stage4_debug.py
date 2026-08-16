@@ -21,10 +21,11 @@ from fw_audit.common.findings import (
     Severity,
 )
 from fw_audit.common.taint import TaintPathReport
+from fw_audit.config.settings import Settings
 from fw_audit.stage4_rag import debug as debug_mod
 from fw_audit.stage4_rag import layout
 from fw_audit.stage4_rag.query.schemas import MultiQueryPlan, SearchQuery
-from fw_audit.stage4_rag.retrieval.engine import RetrievalBundle
+from fw_audit.stage4_rag.retrieval.engine import RetrievalBundle, RetrievedChunk
 
 
 def _finding(finding_id: str, decision: Decision = Decision.ESCALATE) -> Finding:
@@ -134,6 +135,56 @@ async def test_debug_taint_is_a_dry_run_writes_nothing(tmp_path, monkeypatch):
     assert not (layout.taint_dir(stage4_dir)).exists()
     assert not (layout.queries_dir(stage4_dir)).exists()
     assert not (layout.retrieval_dir(stage4_dir)).exists()
+
+
+def test_debug_search_bypasses_c3_and_merges_across_raw_queries(tmp_path, monkeypatch):
+    def fake_retrieve(plan, *, collection, embedder, top_k):
+        assert [q.query_text for q in plan.queries] == ["q1", "q2"]
+        assert plan.finding_id == "ad-hoc-search"
+        assert top_k == 15
+        return RetrievalBundle(
+            global_id=plan.finding_id,
+            chunks=(
+                RetrievedChunk(
+                    chunk_id="a",
+                    source_path="a.c",
+                    kind="DECOMPILED_C",
+                    bin_id="bin",
+                    text="void f(void) {}",
+                    distance=0.1,
+                    matched_queries=("q1", "q2"),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(debug_mod, "retrieve", fake_retrieve)
+    monkeypatch.setattr(
+        debug_mod, "load_local_collection", lambda chroma_dir, *, collection_name: object()
+    )
+    monkeypatch.setattr(debug_mod, "load_embedder", lambda *, settings: object())
+
+    bundle = debug_mod.debug_search(tmp_path, ["q1", "q2"], top_k=15)
+
+    assert len(bundle.chunks) == 1
+    assert bundle.chunks[0].matched_queries == ("q1", "q2")
+
+
+def test_debug_search_defaults_top_k_from_settings(tmp_path, monkeypatch):
+    seen_top_k = {}
+
+    def fake_retrieve(plan, *, collection, embedder, top_k):
+        seen_top_k["value"] = top_k
+        return RetrievalBundle(global_id=plan.finding_id, chunks=())
+
+    monkeypatch.setattr(debug_mod, "retrieve", fake_retrieve)
+    monkeypatch.setattr(
+        debug_mod, "load_local_collection", lambda chroma_dir, *, collection_name: object()
+    )
+    monkeypatch.setattr(debug_mod, "load_embedder", lambda *, settings: object())
+
+    debug_mod.debug_search(tmp_path, ["q1"], settings=Settings(_env_file=None, stage4_top_k=12))
+
+    assert seen_top_k["value"] == 12
 
 
 def test_cosine_similarity_identical_vectors_is_one():
