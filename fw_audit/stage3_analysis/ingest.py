@@ -21,6 +21,17 @@ Reason codes recorded in `SkippedTarget.reason`, extending
                           unresolved[] (e.g. Stage 2 ran with --only)
     unresolved_upstream   matched an UnresolvedBinaryRecord; detail = problem
     decompile_failed      DecompiledBinary.status is failed/skipped
+    empty_bin_id          DecompiledBinary.bin_id is "" — a corrupt/stale
+                          stage2_summary.json (observed once: a `completed`,
+                          zero-error Stage 2 run somehow wrote bin_id="" for
+                          one binary while its own on-disk directory used the
+                          correct name). Checked BEFORE this binary is used
+                          to build any chunk_id/filename — those are built
+                          as "<bin_id>#NNNN"/"<bin_id>__NNNN", so a blank
+                          bin_id here would otherwise silently produce
+                          unattributable "#NNNN"/"__NNNN" chunk and finding
+                          files with no way to tell which binary they came
+                          from.
     artifact_missing_on_disk   locate_source() found nothing on disk
     empty_source          resolved file exists but is 0 bytes
 
@@ -155,6 +166,17 @@ def _resolve_target(
             requested_path=binary.requested_path,
             reason="decompile_failed",
             detail=f"status={binary.status.value}",
+        )
+
+    if not binary.bin_id:
+        # See this module's docstring ("empty_bin_id") — checked before
+        # bin_id is used to build source_path/chunk_id/any filename below,
+        # so a corrupt Stage 2 summary can never silently produce
+        # unattributable "#NNNN"/"__NNNN" chunk/finding files.
+        return None, SkippedTarget(
+            requested_path=binary.requested_path,
+            reason="empty_bin_id",
+            detail=f"rootfs_path={binary.rootfs_path!r}",
         )
 
     source_path = discover.locate_source(binary, tree_dir)

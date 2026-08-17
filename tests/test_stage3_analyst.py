@@ -143,6 +143,42 @@ async def test_analyze_chunk_zero_repair_attempts_raises_immediately(monkeypatch
     assert fake_llm.with_structured_output(None).ainvoke.call_count == 1
 
 
+async def test_analyze_chunk_logs_prompt_when_enabled(monkeypatch, caplog):
+    """`stage3_log_prompts=True` must print the messages actually sent to
+    the LLM — the feature exists purely so a developer can see the exact
+    prompt on the console, so the log record has to name the chunk and
+    carry the message content, not just announce that a call happened."""
+    fake_llm = _fake_llm(results=[_MINIMAL_REPORT])
+    _patch_get_llm(monkeypatch, fake_llm)
+
+    with caplog.at_level("INFO", logger="fw_audit.stage3_analysis.agent"):
+        await analyze_chunk(
+            "int main() { return 0; }",
+            chunk_id="test_bin#0000",
+            rootfs_path="bin/test",
+            settings=_settings(stage3_log_prompts=True),
+        )
+
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "test_bin#0000" in joined
+    assert "int main() { return 0; }" in joined
+
+
+async def test_analyze_chunk_does_not_log_prompt_by_default(monkeypatch, caplog):
+    fake_llm = _fake_llm(results=[_MINIMAL_REPORT])
+    _patch_get_llm(monkeypatch, fake_llm)
+
+    with caplog.at_level("INFO", logger="fw_audit.stage3_analysis.agent"):
+        await analyze_chunk(
+            "int main() { return 0; }",
+            chunk_id="test_bin#0000",
+            rootfs_path="bin/test",
+            settings=_settings(),
+        )
+
+    assert caplog.records == []
+
+
 async def test_analyze_chunk_output_parser_error_repair_retry_succeeds(monkeypatch):
     """A model that returns text that isn't valid JSON at all (Ollama's
     `OUTPUT_PARSING_FAILURE`) gets the same repair-retry treatment as a

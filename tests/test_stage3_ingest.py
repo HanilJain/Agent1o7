@@ -115,9 +115,10 @@ def _binary_dict(
     decompiled_tree_c: str | None = None,
     function_count: int = 1,
     functions: list[dict] | None = None,
+    bin_id: str | None = None,
 ) -> dict:
     return {
-        "bin_id": rootfs_path.replace("/", "_"),
+        "bin_id": rootfs_path.replace("/", "_") if bin_id is None else bin_id,
         "rootfs_path": rootfs_path,
         "requested_path": requested_path or rootfs_path,
         "aliases": aliases or [],
@@ -507,6 +508,24 @@ def test_ingest_decompile_failed_status_is_skipped(tmp_path):
 
     assert report.targets == ()
     assert report.skipped[0].reason == "decompile_failed"
+
+
+def test_ingest_empty_bin_id_is_skipped(tmp_path):
+    """A `DecompiledBinary` with `bin_id=""` (a corrupt/stale Stage 2
+    summary — observed for real, see ingest.py's module docstring) must be
+    skipped, not turned into a `Target` that would build unattributable
+    "#NNNN"-only chunk_ids/filenames downstream."""
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[_binary_dict("sbin/wpasupp", bin_id="")],
+        tree_files={"sbin/wpasupp.c": "int main(void) { return 0; }\n"},
+    )
+
+    report = ingest(stage1_summary_path=stage1_path)
+
+    assert report.targets == ()
+    assert report.skipped[0].reason == "empty_bin_id"
 
 
 def test_ingest_whitelisted_and_unresolved_upstream(tmp_path):

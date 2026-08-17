@@ -303,6 +303,19 @@ class Settings(BaseSettings):
     choice for the production Anthropic/Google/OpenAI backends this
     project targets — only override for a local Ollama model that hits
     the failure mode above."""
+    stage3_log_prompts: bool = Field(
+        default=False, validation_alias="FWA_STAGE3_LOG_PROMPTS"
+    )
+    """When true, `agent.analyst.analyze_chunk` logs the full message list
+    (system prompt + human message, and any repair-retry message appended
+    on a later attempt) sent to the analyst LLM, at INFO level so it's
+    visible under the default `FWA_LOG_LEVEL` without also having to enable
+    DEBUG globally (which would additionally flood the console with every
+    HTTP client's own request/response logging). Off by default — same
+    "opt-in, verbose debugging aid" discipline as `stage3_debug_dump`/
+    `stage3_chunk_debug_dump` — the full prompt includes the entire chunk's
+    source text and would otherwise flood the console on every one of
+    potentially hundreds of chunk calls per firmware."""
 
     # ---- Stage 4: RAG sink-to-source identifier (local, all components) --
     stage4_embedding_model: str = Field(

@@ -19,16 +19,19 @@ common on local/smaller models given this schema's size).
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from pydantic import ValidationError
 
 from fw_audit.common.findings import AnalysisReport
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings
 from fw_audit.stage3_analysis.agent.prompts import build_messages
+
+logger = logging.getLogger("fw_audit.stage3_analysis.agent")
 
 
 class AnalysisUnavailableError(RuntimeError):
@@ -79,6 +82,8 @@ async def analyze_chunk(
     attempts_allowed = settings.stage3_repair_attempts + 1
     last_error: ValidationError | OutputParserException | None = None
     for attempt in range(attempts_allowed):
+        if settings.stage3_log_prompts:
+            _log_prompt(messages, chunk_id=chunk_id, attempt=attempt)
         try:
             parsed = await structured_llm.ainvoke(messages)
         except (OSError, TimeoutError) as exc:
@@ -129,6 +134,35 @@ async def analyze_chunk(
     raise AnalysisUnavailableError(  # pragma: no cover - defensive
         f"Analyst agent produced no result: {last_error}"
     )
+
+
+def _log_prompt(messages: Sequence[BaseMessage], *, chunk_id: str, attempt: int) -> None:
+    """Print the exact messages about to be sent to the analyst LLM —
+    gated behind `settings.stage3_log_prompts` (see that field's
+    docstring), so it's an explicit opt-in rather than firing on every one
+    of potentially hundreds of chunk calls per firmware.
+
+    Logs at INFO rather than DEBUG so `FWA_STAGE3_LOG_PROMPTS=true` alone
+    is enough to see it under the project's default `FWA_LOG_LEVEL=INFO` —
+    turning on DEBUG globally instead would also surface every HTTP
+    client's own request/response logging (see the repeated `httpx: HTTP
+    Request` lines this project's own logs already show)."""
+    logger.info(
+        "chunk %s attempt %d: sending %d message(s) to the analyst LLM",
+        chunk_id,
+        attempt + 1,
+        len(messages),
+    )
+    for i, message in enumerate(messages):
+        role = message.type  # "system" / "human" / ...
+        logger.info(
+            "chunk %s attempt %d message[%d] (%s):\n%s",
+            chunk_id,
+            attempt + 1,
+            i,
+            role,
+            message.content,
+        )
 
 
 def _repair_request(error: ValidationError | OutputParserException) -> HumanMessage:
