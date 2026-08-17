@@ -97,6 +97,11 @@ collisions with generic module names.
 
 ## Setup
 
+For a full, detailed walkthrough (system packages, Python env, `.env`,
+building all three Docker images including the Joern image's large-download
+handling, and a troubleshooting table of known errors) see
+**[SETUP.md](SETUP.md)** — Linux-first. The quick version:
+
 ```bash
 python -m venv .venv
 .venv/Scripts/activate        # Windows
@@ -122,6 +127,10 @@ docker build -f docker/Dockerfile -t fw-audit-sandbox:latest .          # Stage 
 docker build -f docker/Dockerfile.ghidra -t fw-audit-ghidra:latest .    # Stage 2
 docker build -f docker/Dockerfile.joern -t fw-audit-joern:latest .      # Stage 5
 ```
+
+The Joern image needs `docker/.joern-cli.zip` (~1.8GB) pre-fetched to the
+host first — see [SETUP.md §4.3](SETUP.md#43-stage-5--joern-verification-sandbox-fw-audit-joernlatest)
+for the exact command and why.
 
 ## Running the pipeline
 

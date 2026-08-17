@@ -51,10 +51,20 @@ def test_classify_skips_elf_even_with_text_like_extension(tmp_path: Path) -> Non
     assert classify_rootfs_file(f) is False
 
 
-def test_classify_extensionless_text_via_heuristic(tmp_path: Path) -> None:
+def test_classify_extensionless_text_rejected(tmp_path: Path) -> None:
+    # Strict allow-list: no printable-byte heuristic fallback — an
+    # extensionless file is never ingested, however text-like its content.
     f = tmp_path / "captive_portal_passcode"
     f.write_text("nvram_get(\"captive_portal_passcode\")\n" * 10, encoding="utf-8")
-    assert classify_rootfs_file(f) is True
+    assert classify_rootfs_file(f) is False
+
+
+def test_classify_unlisted_extension_rejected(tmp_path: Path) -> None:
+    # An extension not on ALLOWED_TEXT_EXTENSIONS is skipped even though
+    # its content is plainly text.
+    f = tmp_path / "notes.md"
+    f.write_text("just some readable notes", encoding="utf-8")
+    assert classify_rootfs_file(f) is False
 
 
 def test_classify_extensionless_binary_rejected(tmp_path: Path) -> None:
@@ -182,7 +192,7 @@ def test_build_chunks_for_file_missing_path_returns_empty(tmp_path: Path) -> Non
     assert chunks == []
 
 
-def test_build_corpus_chunks_combines_rootfs_and_cleaned_c(tmp_path: Path) -> None:
+def test_build_corpus_chunks_excludes_cleaned_c_by_default(tmp_path: Path) -> None:
     rootfs = tmp_path / "rootfs"
     rootfs.mkdir()
     (rootfs / "login.asp").write_text(
@@ -201,12 +211,35 @@ def test_build_corpus_chunks_combines_rootfs_and_cleaned_c(tmp_path: Path) -> No
     chunks = build_corpus_chunks(config)
 
     kinds = {c.kind for c in chunks}
+    assert kinds == {CorpusKind.ROOTFS_TEXT}
+    web_chunk = next(c for c in chunks if c.kind is CorpusKind.ROOTFS_TEXT)
+    assert web_chunk.source_path == "login.asp"
+
+
+def test_build_corpus_chunks_includes_cleaned_c_when_opted_in(tmp_path: Path) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "login.asp").write_text(
+        " ".join(f"w{i}" for i in range(50)) + " nvram_get(\"admin_password\")", encoding="utf-8"
+    )
+
+    stage2_bins = tmp_path / "stage2_binaries"
+    bin_dir = stage2_bins / "sbin_httpd__abc123"
+    (bin_dir / "cleaned").mkdir(parents=True)
+    (bin_dir / "cleaned" / "whole.c").write_text(
+        " ".join(f"tok{i}" for i in range(50)), encoding="utf-8"
+    )
+
+    config = Stage4ColabConfig(
+        rootfs_dir=rootfs, stage2_binaries_dir=stage2_bins, include_decompiled_c=True
+    )
+    chunks = build_corpus_chunks(config)
+
+    kinds = {c.kind for c in chunks}
     assert kinds == {CorpusKind.ROOTFS_TEXT, CorpusKind.DECOMPILED_C}
     c_chunk = next(c for c in chunks if c.kind is CorpusKind.DECOMPILED_C)
     assert c_chunk.bin_id == "sbin_httpd__abc123"
     assert c_chunk.source_path == "stage2/sbin_httpd__abc123/cleaned/whole.c"
-    web_chunk = next(c for c in chunks if c.kind is CorpusKind.ROOTFS_TEXT)
-    assert web_chunk.source_path == "login.asp"
 
 
 def test_build_corpus_chunks_empty_inputs_yield_no_chunks(tmp_path: Path) -> None:

@@ -285,6 +285,14 @@ class Settings(BaseSettings):
     stage4_chunk_overlap_words: int = Field(
         default=0, ge=0, validation_alias="FWA_STAGE4_CHUNK_OVERLAP_WORDS"
     )
+    stage4_include_decompiled_c: bool = Field(
+        default=False, validation_alias="FWA_STAGE4_INCLUDE_DECOMPILED_C"
+    )
+    """Whether `build-corpus` also ingests Stage 2's `cleaned/whole.c` per
+    binary (`CorpusKind.DECOMPILED_C`). Defaults to False — the corpus is
+    rootfs text only, strictly limited to
+    `colab.chunk_and_embed.ALLOWED_TEXT_EXTENSIONS` (no printable-byte
+    heuristic fallback for unlisted/extensionless files)."""
     stage4_chroma_collection_name: str = Field(
         default="stage4_corpus", validation_alias="FWA_STAGE4_CHROMA_COLLECTION_NAME"
     )

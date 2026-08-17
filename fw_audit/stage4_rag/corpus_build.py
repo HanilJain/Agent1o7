@@ -70,6 +70,7 @@ def build_corpus(
         output_dir=stage4_dir_,
         chunk_words=settings.stage4_chunk_words,
         chunk_overlap_words=settings.stage4_chunk_overlap_words,
+        include_decompiled_c=settings.stage4_include_decompiled_c,
         embedding_model=settings.stage4_embedding_model,
         embedding_device=settings.stage4_embedding_device,
         chroma_collection_name=settings.stage4_chroma_collection_name,

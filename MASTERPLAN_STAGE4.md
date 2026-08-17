@@ -51,9 +51,15 @@ flowchart TB
 
 **File classifier** (canonical copy in `colab/chunk_and_embed.py`, see §5):
 - `ALLOWED_TEXT_EXTENSIONS`: `.html .htm .asp .aspx .js .css .txt .xml .json .conf .cfg .ini .sh .php .cgi .lua`
-- `SKIP_EXTENSIONS`: `.so .ko .png .jpg .jpeg .gif .svg .bin .o .a .gz .tar .zip .woff .ttf .ico`
-- ELF magic-byte guard (`\x7fELF` prefix) — safety net for extensionless or
-  misnamed binaries that slip past the extension check.
+  — strict allow-list; a file whose extension isn't in this set is never
+  ingested, no printable-byte heuristic fallback for unlisted/extensionless
+  files.
+- ELF magic-byte guard (`\x7fELF` prefix) — backstops the allow-list itself
+  for a binary hiding under a misleading text-like extension.
+- Stage 2's cleaned decompiled C (`cleaned/whole.c` per binary) is
+  **excluded from the corpus by default** — opt in via
+  `Settings.stage4_include_decompiled_c` /
+  `FWA_STAGE4_INCLUDE_DECOMPILED_C=true`.
 
 **Stage 2 cleaned artifacts** — `stage2/binaries/<bin_id>/cleaned/whole.c` +
 `cleaned/functions.json` (per-function `{name, start_line, end_line}`

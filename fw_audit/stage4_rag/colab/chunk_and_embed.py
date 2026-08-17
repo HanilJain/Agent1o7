@@ -106,6 +106,12 @@ class Stage4ColabConfig:
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_device: str | None = None  # None -> sentence-transformers auto-picks CUDA if present
     chroma_collection_name: str = "stage4_corpus"
+    include_decompiled_c: bool = False
+    """Whether to also ingest Stage 2's `cleaned/whole.c` per binary
+    (`CorpusKind.DECOMPILED_C`) alongside the rootfs text corpus. Defaults
+    to False — the corpus is rootfs text only, restricted to
+    `ALLOWED_TEXT_EXTENSIONS` (see `classify_rootfs_file`). Flip to True to
+    fold decompiled C back in via `discover_cleaned_c_files`."""
     embed_batch_size: int = 32
     embed_max_seq_length: int = 2048
     """Forwarded to `Qwen3Embedder`'s `max_seq_length` — hard token cap per
@@ -129,26 +135,20 @@ class CorpusKind(str, Enum):  # noqa: UP042 — str+Enum (not StrEnum) matches t
     ROOTFS_TEXT = "ROOTFS_TEXT"
 
 
-# Kept as plain, easily-edited module-level sets rather than buried in
-# logic, per the brief: "make list of them easily parsing". Extend these
-# two sets first if a corpus is misclassifying real files.
+# Kept as a plain, easily-edited module-level set rather than buried in
+# logic, per the brief: "make list of them easily parsing". Extend this
+# set first if a corpus is missing files it should include — nothing
+# outside it is ever ingested, regardless of content.
 ALLOWED_TEXT_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".html", ".htm", ".asp", ".aspx", ".js", ".css", ".txt", ".xml",
         ".json", ".conf", ".cfg", ".ini", ".sh", ".php", ".cgi", ".lua",
     }
 )
-"""Extensions treated as human-readable text — embedded as-is."""
-
-SKIP_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".so", ".ko", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".bin",
-        ".o", ".a", ".gz", ".tar", ".zip", ".woff", ".ttf", ".ico",
-    }
-)
-"""Extensions explicitly skipped: binaries needing Ghidra/IDA decompilation
-first (`.so`/`.ko`/etc.), or non-text assets that are technically
-"readable" by extension but not source/text (`.png`/`.svg`/`.jpg`)."""
+"""Extensions treated as human-readable text — embedded as-is. This is a
+strict allow-list: a file whose extension is not in this set is never
+ingested, no matter what its content looks like (no printable-byte
+heuristic fallback) — see `classify_rootfs_file`."""
 
 ELF_MAGIC = b"\x7fELF"
 
@@ -156,37 +156,22 @@ ELF_MAGIC = b"\x7fELF"
 def classify_rootfs_file(path: Path) -> bool:
     """True if `path` should be embedded, False if it should be skipped.
 
-    Extension allow/deny lists are checked first (cheap); an ELF
-    magic-byte check backstops both an allow-listed extension (firmware
-    occasionally ships a real binary under a misleading name) and any
-    extension not on either list, via a printable-byte heuristic.
+    Strict extension allow-list: only files whose extension is in
+    `ALLOWED_TEXT_EXTENSIONS` are ever ingested — everything else (no
+    extension, or one not on the list) is skipped, full stop. An ELF
+    magic-byte check backstops the allow-list itself, since firmware
+    occasionally ships a real binary under a misleading text-like
+    extension (e.g. `.cgi`).
     """
     suffix = path.suffix.lower()
-    if suffix in SKIP_EXTENSIONS:
+    if suffix not in ALLOWED_TEXT_EXTENSIONS:
         return False
     try:
         with path.open("rb") as f:
             head = f.read(4096)
     except OSError:
         return False
-    if head.startswith(ELF_MAGIC):
-        return False
-    if suffix in ALLOWED_TEXT_EXTENSIONS:
-        return True
-    return _looks_like_text(head)
-
-
-def _looks_like_text(sample: bytes) -> bool:
-    """Crude printable-byte-ratio heuristic for extensionless or
-    unrecognized-extension files. Not a substitute for the extension
-    lists above — just a fallback so a stray text file with no/odd
-    extension isn't silently dropped."""
-    if not sample:
-        return False
-    if b"\x00" in sample:
-        return False
-    printable = sum(1 for b in sample if b in (9, 10, 13) or 32 <= b <= 126)
-    return (printable / len(sample)) > 0.85
+    return not head.startswith(ELF_MAGIC)
 
 
 def discover_rootfs_files(rootfs_dir: Path) -> Iterator[Path]:
@@ -331,9 +316,11 @@ def build_chunks_for_file(
 
 
 def build_corpus_chunks(config: Stage4ColabConfig) -> list[Chunk]:
-    """Discovers + chunks the full corpus: Stage 1 rootfs text files plus
-    Stage 2 cleaned decompiled C, one uniform chunking strategy across
-    both (see this module's docstring for why)."""
+    """Discovers + chunks the corpus: Stage 1 rootfs text files restricted
+    to `ALLOWED_TEXT_EXTENSIONS`, plus — only when
+    `config.include_decompiled_c` is True — Stage 2's cleaned decompiled C.
+    One uniform chunking strategy across both (see this module's docstring
+    for why)."""
     chunker = FixedWordChunker(
         words_per_chunk=config.chunk_words, overlap_words=config.chunk_overlap_words
     )
@@ -347,17 +334,18 @@ def build_corpus_chunks(config: Stage4ColabConfig) -> list[Chunk]:
             )
         )
 
-    for bin_id, whole_c in discover_cleaned_c_files(config.stage2_binaries_dir):
-        rel = f"stage2/{bin_id}/cleaned/whole.c"
-        chunks.extend(
-            build_chunks_for_file(
-                path=whole_c,
-                rel_id=rel,
-                kind=CorpusKind.DECOMPILED_C,
-                bin_id=bin_id,
-                chunker=chunker,
+    if config.include_decompiled_c:
+        for bin_id, whole_c in discover_cleaned_c_files(config.stage2_binaries_dir):
+            rel = f"stage2/{bin_id}/cleaned/whole.c"
+            chunks.extend(
+                build_chunks_for_file(
+                    path=whole_c,
+                    rel_id=rel,
+                    kind=CorpusKind.DECOMPILED_C,
+                    bin_id=bin_id,
+                    chunker=chunker,
+                )
             )
-        )
 
     return chunks
 
@@ -592,6 +580,11 @@ if __name__ == "__main__":
         parser.add_argument("--output", default=Path("./stage4_corpus_build"), type=Path)
         parser.add_argument("--chunk-words", default=500, type=int)
         parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+        parser.add_argument(
+            "--include-decompiled-c",
+            action="store_true",
+            help="Also ingest Stage 2's cleaned/whole.c per binary (off by default).",
+        )
         args = parser.parse_args()
 
         run(
@@ -601,5 +594,6 @@ if __name__ == "__main__":
                 output_dir=args.output,
                 chunk_words=args.chunk_words,
                 embedding_model=args.embedding_model,
+                include_decompiled_c=args.include_decompiled_c,
             )
         )

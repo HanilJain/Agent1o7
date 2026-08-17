@@ -16,11 +16,16 @@ required for any part of the pipeline.
 ## Pipeline
 
 1. **`fw-trace build-corpus`** (C1+C2) — classifies Stage 1's rootfs files
-   and Stage 2's cleaned decompiled C, chunks (~500 words), embeds each
-   chunk with a local Qwen3 embedding model (`Qwen/Qwen3-Embedding-0.6B`
-   by default), and indexes into a persistent local ChromaDB collection
-   under `<db_subfolder>/stage4/chroma/`. No zip/upload step — the rootfs
-   and Stage 2 directories are read directly from disk.
+   against a strict extension allow-list
+   (`colab.chunk_and_embed.ALLOWED_TEXT_EXTENSIONS` — no printable-byte
+   heuristic fallback for unlisted/extensionless files), chunks (~500
+   words), embeds each chunk with a local Qwen3 embedding model
+   (`Qwen/Qwen3-Embedding-0.6B` by default), and indexes into a persistent
+   local ChromaDB collection under `<db_subfolder>/stage4/chroma/`. No
+   zip/upload step — the rootfs directory is read directly from disk.
+   Stage 2's cleaned decompiled C (`cleaned/whole.c` per binary) is
+   **excluded by default** — set `FWA_STAGE4_INCLUDE_DECOMPILED_C=true`
+   (`Settings.stage4_include_decompiled_c`) to fold it back in.
 2. **`fw-trace run`** (C3-C6) — for each Stage 3 finding with
    `decision in {ESCALATE, CONTEXT_REQUIRED}`: generates 4-5 search
    queries (C3), retrieves + merges top-k matching chunks (C4, embedding

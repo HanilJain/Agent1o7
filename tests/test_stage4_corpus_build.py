@@ -57,7 +57,10 @@ def test_build_corpus_writes_to_stage4_dir_no_zip(tmp_path, monkeypatch):
         settings=settings,
     )
 
-    assert report.total_chunks == 2  # one rootfs chunk + one decompiled-C chunk
+    # stage4_include_decompiled_c defaults to False — only the rootfs chunk
+    # is ingested, the Stage 2 cleaned/whole.c is left out.
+    assert report.total_chunks == 1
+    assert report.chunks_by_kind == {"ROOTFS_TEXT": 1}
     assert report.embedding_model == "Qwen/Qwen3-Embedding-0.6B"
     stage4_dir = layout.stage4_dir(db_subfolder)
     assert report.chroma_dir == layout.chroma_dir(stage4_dir)
@@ -65,6 +68,36 @@ def test_build_corpus_writes_to_stage4_dir_no_zip(tmp_path, monkeypatch):
     assert report.corpus_report_path.is_file()
     # No zip artifact anywhere under stage4/ — the whole point of the local path.
     assert not list(stage4_dir.rglob("*.zip"))
+    assert upserted_calls == [1]
+
+
+def test_build_corpus_includes_decompiled_c_when_opted_in(tmp_path, monkeypatch):
+    rootfs, stage2_binaries = _make_inputs(tmp_path)
+    db_subfolder = tmp_path / "db" / "fw"
+
+    monkeypatch.setattr(corpus_build, "_build_embedder", lambda config: _FakeEmbedder())
+
+    upserted_calls = []
+
+    def fake_upsert(*, chunks, embedder, collection, batch_size):
+        upserted_calls.append(len(chunks))
+        return len(chunks)
+
+    monkeypatch.setattr(corpus_build, "embed_and_upsert", fake_upsert)
+    monkeypatch.setattr(
+        corpus_build, "get_or_create_collection", lambda *, persist_dir, collection_name: object()
+    )
+
+    settings = Settings(_env_file=None, stage4_include_decompiled_c=True)
+    report = corpus_build.build_corpus(
+        db_subfolder=db_subfolder,
+        rootfs_dir=rootfs,
+        stage2_binaries_dir=stage2_binaries,
+        settings=settings,
+    )
+
+    assert report.total_chunks == 2  # one rootfs chunk + one decompiled-C chunk
+    assert report.chunks_by_kind == {"ROOTFS_TEXT": 1, "DECOMPILED_C": 1}
     assert upserted_calls == [2]
 
 

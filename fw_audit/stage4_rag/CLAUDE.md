@@ -26,7 +26,7 @@ superseded; the notebook now demoted to an optional alternate path. Root
 |---|---|
 | `layout.py` | Pure path algebra for `stage4/`. |
 | `sink_index.py` | C0: resolves `stage3/findings/*.json` into `SinkCandidate`s, summary-free. |
-| `corpus_build.py` | C1+C2 local entry point: wraps `colab/chunk_and_embed.py`, persists straight to `stage4/{chroma,corpus_report.json}` — no zip/upload. |
+| `corpus_build.py` | C1+C2 local entry point: wraps `colab/chunk_and_embed.py`, persists straight to `stage4/{chroma,corpus_report.json}` — no zip/upload. Rootfs corpus only (strict `ALLOWED_TEXT_EXTENSIONS` allow-list); Stage 2 decompiled C is opt-in via `Settings.stage4_include_decompiled_c`. |
 | `colab/chunk_and_embed.py` | The underlying classify/chunk/embed/index engine (reused, not duplicated). Optional Colab path still works via `colab/stage4_colab.ipynb`/`package_input.py`. |
 | `query/schemas.py`, `query/prompts.py`, `query/planner.py` | C3: `MultiQueryPlan` structured-output LLM call, no tools. |
 | `retrieval/store.py`, `retrieval/engine.py` | C4: loads local Chroma + parity-matched embedder, top-k search + merge/dedupe, `build_c5_prompt()`. |
