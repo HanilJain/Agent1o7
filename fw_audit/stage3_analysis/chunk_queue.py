@@ -198,8 +198,14 @@ async def _worker(queue: ChunkQueue, consumer: Consumer) -> None:
     async for handle in queue:
         try:
             await consumer(handle)
-        except Exception:
-            logger.warning("chunk %s failed (attempt %d)", handle.chunk_id, handle.attempt + 1)
+        except Exception as exc:
+            logger.warning(
+                "chunk %s failed (attempt %d): %s",
+                handle.chunk_id,
+                handle.attempt + 1,
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
             await queue.nack(handle)
         else:
             queue.ack(handle)
