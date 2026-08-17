@@ -283,6 +283,26 @@ class Settings(BaseSettings):
     the validation error back as an additional message. 0 disables
     repair — a schema miss then falls straight through to the queue's
     own nack()/retry instead."""
+    stage3_structured_output_method: str = Field(
+        default="json_schema", validation_alias="FWA_STAGE3_STRUCTURED_OUTPUT_METHOD"
+    )
+    """`method=` passed to `BaseChatModel.with_structured_output(...)` in
+    `agent.analyst.analyze_chunk` — one of `"json_schema"` (default),
+    `"function_calling"`, or `"json_mode"` (see LangChain's own
+    `with_structured_output` docstring for what each does per-provider).
+    `AnalysisReport` is a large, deeply nested schema (see
+    `common.findings`'s module docstring), and some local Ollama models/
+    server versions fail to render their chat template when a schema this
+    large is injected via Ollama's `json_schema` `format=` payload —
+    observed as the model erroring with something like "no user query
+    found in messages" on the FIRST attempt, not a retry, which rules out
+    a message-construction bug on our side. Setting this to
+    `"function_calling"` routes through Ollama's tool-calling endpoint
+    instead, sidestepping that template path entirely. Left at
+    `"json_schema"` by default because it's the correct/well-supported
+    choice for the production Anthropic/Google/OpenAI backends this
+    project targets — only override for a local Ollama model that hits
+    the failure mode above."""
 
     # ---- Stage 4: RAG sink-to-source identifier (local, all components) --
     stage4_embedding_model: str = Field(

@@ -58,13 +58,20 @@ async def analyze_chunk(
     Raises :class:`AnalysisUnavailableError` if the model/credential can't
     be resolved, the call transport-fails, or structured output never
     validates within `settings.stage3_repair_attempts` extra attempts.
+
+    `with_structured_output`'s `method=` comes from
+    `settings.stage3_structured_output_method` (default `"json_schema"`)
+    rather than being hardcoded — see that `Settings` field's docstring for
+    why a local Ollama model may need `"function_calling"` instead.
     """
     try:
         llm = get_llm_for_agent(AgentRole.STAGE3_VULN_ANALYST, settings=settings)
     except (ImportError, ValueError) as exc:
         raise AnalysisUnavailableError(str(exc)) from exc
 
-    structured_llm = llm.with_structured_output(AnalysisReport)
+    structured_llm = llm.with_structured_output(
+        AnalysisReport, method=settings.stage3_structured_output_method
+    )
     messages = build_messages(
         chunk_text, chunk_id=chunk_id, rootfs_path=rootfs_path, function_names=function_names
     )

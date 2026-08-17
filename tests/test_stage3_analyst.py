@@ -25,7 +25,7 @@ def _fake_llm(*, results=None, side_effect=None):
         structured = SimpleNamespace(ainvoke=AsyncMock(side_effect=list(results)))
     else:
         structured = SimpleNamespace(ainvoke=AsyncMock(side_effect=side_effect))
-    return SimpleNamespace(with_structured_output=lambda schema: structured)
+    return SimpleNamespace(with_structured_output=lambda schema, **kwargs: structured)
 
 
 def _patch_get_llm(monkeypatch, fake_llm) -> None:
@@ -52,6 +52,30 @@ async def test_analyze_chunk_happy_path(monkeypatch):
         settings=_settings(),
     )
     assert report.chunk_id == "test_bin#0000"
+
+
+async def test_analyze_chunk_passes_structured_output_method_from_settings(monkeypatch):
+    """`settings.stage3_structured_output_method` must reach
+    `with_structured_output(method=...)` — the override that lets a local
+    Ollama model switch away from `json_schema` (see that Settings field's
+    docstring) actually has to take effect, not just exist."""
+    structured = SimpleNamespace(ainvoke=AsyncMock(side_effect=[_MINIMAL_REPORT]))
+    captured_kwargs: dict = {}
+
+    def _with_structured_output(schema, **kwargs):
+        captured_kwargs.update(kwargs)
+        return structured
+
+    fake_llm = SimpleNamespace(with_structured_output=_with_structured_output)
+    _patch_get_llm(monkeypatch, fake_llm)
+
+    await analyze_chunk(
+        "int main() {}",
+        chunk_id="test_bin#0000",
+        rootfs_path="bin/test",
+        settings=_settings(stage3_structured_output_method="function_calling"),
+    )
+    assert captured_kwargs.get("method") == "function_calling"
 
 
 async def test_analyze_chunk_overwrites_hallucinated_chunk_id(monkeypatch):
