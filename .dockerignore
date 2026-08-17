@@ -1,0 +1,52 @@
+# Docker does NOT read .gitignore — this file is the real gate on build
+# context size. None of the Dockerfiles under docker/ COPY anything from the
+# repo root (they clone/build from GitHub sources and their own builder
+# stages), so nothing here should ever need to reach the build context.
+# Keep this in sync with .gitignore's intent; see that file for detail on
+# each entry.
+
+# Version control
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Firmware inputs & the extraction Database (can be huge; never needed in
+# a build context)
+data/
+
+# Large local artifacts — EXCEPT docker/.joern-cli.zip, which
+# docker/Dockerfile.joern explicitly COPYs into its build (pre-fetched
+# release asset; see that Dockerfile's fetch-stage comment).
+*.zip
+!docker/.joern-cli.zip
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.claude/
+.vscode/
+.idea/
