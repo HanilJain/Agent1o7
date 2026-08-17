@@ -89,7 +89,18 @@ class AnalysisConsumer:
                 ),
                 timeout=self._settings.stage3_llm_timeout_seconds,
             )
-        except (AnalysisUnavailableError, TimeoutError) as exc:
+        except TimeoutError as exc:
+            # asyncio.wait_for's TimeoutError carries NO message of its
+            # own — str(exc) is always "" (confirmed: TimeoutError() takes
+            # no args) — so `{exc}` here would silently produce a blank,
+            # content-free "analysis failed for X: " log line indistinguishable
+            # from any other failure. Name the actual timeout value instead,
+            # so this is self-explanatory without knowing that quirk.
+            raise RuntimeError(
+                f"analysis failed for {handle.chunk_id}: LLM call exceeded "
+                f"stage3_llm_timeout_seconds ({self._settings.stage3_llm_timeout_seconds}s)"
+            ) from exc
+        except AnalysisUnavailableError as exc:
             # Let it propagate: chunk_queue._worker's broad `except
             # Exception` will nack() this handle for a queue-level retry.
             # We do NOT append a "failed" record here — a retry may still

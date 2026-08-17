@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -110,6 +111,30 @@ async def test_consumer_raises_on_analysis_failure_no_record_appended(tmp_path, 
 
     # No record appended on failure — chunk_queue's nack()/retry owns this
     # outcome; the orchestrator reconciles permanent failure afterward.
+    assert consumer.records == []
+
+
+async def test_consumer_timeout_message_names_the_configured_seconds(tmp_path, monkeypatch):
+    """`asyncio.wait_for`'s `TimeoutError` carries no message of its own
+    (`str(TimeoutError()) == ""`) — the consumer must build an actual
+    message naming the configured timeout, not rely on `{exc}` producing a
+    blank, content-free "analysis failed for X: " log line."""
+
+    async def fake_analyze_chunk(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk", fake_analyze_chunk
+    )
+
+    consumer = AnalysisConsumer(
+        db_subfolder=tmp_path, settings=_settings(stage3_llm_timeout_seconds=1)
+    )
+    handle = _handle(tmp_path)
+
+    with pytest.raises(RuntimeError, match=r"exceeded stage3_llm_timeout_seconds \(1s\)"):
+        await consumer(handle)
+
     assert consumer.records == []
 
 
