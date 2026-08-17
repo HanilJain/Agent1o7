@@ -11,13 +11,17 @@ per CHUNK — potentially hundreds of times per firmware — so a model that
 fumbles the schema on a transient basis is worth one extra attempt with the
 validation error fed back, rather than immediately falling through to
 `chunk_queue`'s queue-level retry (which re-prompts with zero feedback
-about what went wrong).
+about what went wrong). The repair retry covers both ways a model can
+fumble structured output: `ValidationError` (valid JSON, wrong shape) and
+`langchain_core.exceptions.OutputParserException` (not valid JSON at all —
+common on local/smaller models given this schema's size).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage
 from pydantic import ValidationError
 
@@ -66,7 +70,7 @@ async def analyze_chunk(
     )
 
     attempts_allowed = settings.stage3_repair_attempts + 1
-    last_error: ValidationError | None = None
+    last_error: ValidationError | OutputParserException | None = None
     for attempt in range(attempts_allowed):
         try:
             parsed = await structured_llm.ainvoke(messages)
@@ -76,7 +80,16 @@ async def analyze_chunk(
             # chunk_queue's own nack()/retry (with AnalysisConsumer's
             # backoff) handle it instead.
             raise AnalysisUnavailableError(f"LLM call failed: {exc}") from exc
-        except ValidationError as exc:
+        except (ValidationError, OutputParserException) as exc:
+            # OutputParserException (langchain_core) covers a model
+            # returning text that isn't parseable JSON at all — distinct
+            # from ValidationError (parses fine, fails the AnalysisReport
+            # schema) but the same "the model fumbled the output format,
+            # ask it to try again" situation local/smaller models hit
+            # often on this large a schema. Both get the same bounded
+            # repair-retry treatment rather than only ValidationError
+            # getting feedback and OutputParserException falling straight
+            # through to chunk_queue's blind, feedback-free retry.
             last_error = exc
             if attempt < attempts_allowed - 1:
                 messages = [
@@ -111,7 +124,7 @@ async def analyze_chunk(
     )
 
 
-def _repair_request(error: ValidationError) -> HumanMessage:
+def _repair_request(error: ValidationError | OutputParserException) -> HumanMessage:
     return HumanMessage(
         content=(
             f"Your previous response failed schema validation:\n{error}\n\n"

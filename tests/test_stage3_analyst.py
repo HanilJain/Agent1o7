@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from langchain_core.exceptions import OutputParserException
 from pydantic import ValidationError
 
 from fw_audit.common.findings import AnalysisReport
@@ -116,6 +117,37 @@ async def test_analyze_chunk_zero_repair_attempts_raises_immediately(monkeypatch
             settings=_settings(stage3_repair_attempts=0),
         )
     assert fake_llm.with_structured_output(None).ainvoke.call_count == 1
+
+
+async def test_analyze_chunk_output_parser_error_repair_retry_succeeds(monkeypatch):
+    """A model that returns text that isn't valid JSON at all (Ollama's
+    `OUTPUT_PARSING_FAILURE`) gets the same repair-retry treatment as a
+    `ValidationError`, not a blind fall-through to the queue-level retry."""
+    parse_error = OutputParserException("Invalid json output: not json")
+    fake_llm = _fake_llm(side_effect=[parse_error, _MINIMAL_REPORT])
+    _patch_get_llm(monkeypatch, fake_llm)
+
+    report = await analyze_chunk(
+        "int main() {}",
+        chunk_id="test_bin#0000",
+        rootfs_path="bin/test",
+        settings=_settings(stage3_repair_attempts=1),
+    )
+    assert report.chunk_id == "test_bin#0000"
+
+
+async def test_analyze_chunk_output_parser_error_repair_exhausted_raises(monkeypatch):
+    parse_error = OutputParserException("Invalid json output: not json")
+    fake_llm = _fake_llm(side_effect=[parse_error, parse_error])
+    _patch_get_llm(monkeypatch, fake_llm)
+
+    with pytest.raises(AnalysisUnavailableError, match="doesn't match the expected schema"):
+        await analyze_chunk(
+            "int main() {}",
+            chunk_id="test_bin#0000",
+            rootfs_path="bin/test",
+            settings=_settings(stage3_repair_attempts=1),
+        )
 
 
 async def test_analyze_chunk_transport_error_propagates_without_repair(monkeypatch):
