@@ -9,6 +9,7 @@ container, NOT a "sandbox" in the LLM-controlled-execution sense — see
 
 from __future__ import annotations
 
+import os
 import subprocess
 import uuid
 from pathlib import Path
@@ -18,6 +19,23 @@ from fw_audit.executors.base import ExecutionResult, Executor
 from fw_audit.stage1_ingestion.tools.extraction_tools import run_command
 
 CONTAINER_WORKDIR = "/work"
+
+
+def _host_user_flag() -> list[str]:
+    """`["--user", "<uid>:<gid>"]` for the current host user, or `[]` if the
+    host has no POSIX UID/GID concept (Windows) or they can't be read.
+
+    Used so a container writes to the bind-mounted workspace as the SAME
+    user that owns it on the host, instead of whatever `USER` the image
+    bakes in — see `Settings.docker_run_as_host_user`'s docstring for the
+    permission-mismatch failure this avoids (e.g. Stage 2's Ghidra image
+    running as non-root UID 1000).
+    """
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    if getuid is None or getgid is None:
+        return []
+    return ["--user", f"{getuid()}:{getgid()}"]
 
 
 def to_container_path(host_path: str | Path, workspace_root: Path) -> str:
@@ -75,6 +93,8 @@ class DockerExecutor(Executor):
         # like Ghidra's JVM can otherwise leave behind as PID 1.
         container_name = f"fw-audit-{uuid.uuid4().hex[:12]}"
         docker_args = ["run", "--rm", "--init", "--network=none", "--name", container_name]
+        if settings.docker_run_as_host_user:
+            docker_args += _host_user_flag()
 
         if files is not None:
             files = Path(files).resolve()

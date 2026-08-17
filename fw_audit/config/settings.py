@@ -117,6 +117,22 @@ class Settings(BaseSettings):
     docker_image: str = Field(
         default="fw-audit-sandbox:latest", validation_alias="FWA_DOCKER_IMAGE"
     )
+    docker_run_as_host_user: bool = Field(
+        default=True, validation_alias="FWA_DOCKER_RUN_AS_HOST_USER"
+    )
+    """When true (default) and running on a POSIX host, every `DockerExecutor`
+    invocation adds `--user "<host uid>:<host gid>"`, so the container writes
+    to the bind-mounted workspace as the SAME user that owns it on the host —
+    instead of whatever `USER` an image bakes in (e.g. `docker/Dockerfile.ghidra`'s
+    non-root `ghidra`, UID 1000). Without this, a host directory owned by a
+    different UID (commonly: created by a `fw-ingest`/`fw-extract` run as
+    root, then written to by an image's non-root user, or vice versa) causes
+    a `Permission denied` deep inside the container — e.g. Stage 2's
+    `analyzeHeadless` failing to create `.../ghidra/headless_stdout.txt`.
+    Matching the host UID sidesteps the mismatch entirely, no `chown`/`chmod`
+    of `data/db/` required. No-op on Windows (`os.getuid` doesn't exist) —
+    Docker Desktop's Linux VM + bind-mount layer doesn't hit this class of
+    permission error the same way a native Linux host does."""
 
     # ---- Stage 2: Ghidra decompilation -----------------------------------
     ghidra_image: str = Field(

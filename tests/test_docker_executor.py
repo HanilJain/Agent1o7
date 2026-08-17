@@ -7,6 +7,7 @@ its assertions are behavior-shape only (return type), not daemon-state.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,44 @@ async def test_run_forces_empty_command_prefix(monkeypatch):
     await executor.run("echo hi")
 
     assert captured["settings"].command_prefix == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX-only (os.getuid)")
+async def test_run_adds_host_user_flag_by_default(monkeypatch, tmp_path: Path):
+    """Default FWA_DOCKER_RUN_AS_HOST_USER=true adds --user <uid>:<gid> so
+    the container writes to the bind mount as the host's own user, avoiding
+    the "Permission denied" mismatch against an image's baked-in non-root
+    user (e.g. docker/Dockerfile.ghidra's UID 1000 `ghidra`)."""
+    captured: dict = {}
+
+    async def fake_run_command(binary, args, *, settings=None):
+        captured["args"] = args
+        return _ok(binary, args)
+
+    monkeypatch.setattr("fw_audit.executors.docker_executor.run_command", fake_run_command)
+
+    executor = DockerExecutor(Settings(_env_file=None))
+    await executor.run("echo hi", files=tmp_path)
+
+    argv = captured["args"]
+    assert "--user" in argv
+    assert argv[argv.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+
+
+async def test_run_omits_host_user_flag_when_disabled(monkeypatch, tmp_path: Path):
+    captured: dict = {}
+
+    async def fake_run_command(binary, args, *, settings=None):
+        captured["args"] = args
+        return _ok(binary, args)
+
+    monkeypatch.setattr("fw_audit.executors.docker_executor.run_command", fake_run_command)
+
+    settings = Settings(_env_file=None, FWA_DOCKER_RUN_AS_HOST_USER="false")
+    executor = DockerExecutor(settings)
+    await executor.run("echo hi", files=tmp_path)
+
+    assert "--user" not in captured["args"]
 
 
 def test_to_container_path_translates_relative_to_mount(tmp_path: Path):

@@ -42,7 +42,7 @@ from pathlib import Path
 
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.executors.base import ExecutionResult, Executor
-from fw_audit.executors.docker_executor import CONTAINER_WORKDIR
+from fw_audit.executors.docker_executor import CONTAINER_WORKDIR, _host_user_flag
 from fw_audit.stage1_ingestion.tools.extraction_tools import run_command
 
 
@@ -91,6 +91,8 @@ class SandboxExecutor(Executor):
             f"--cpus={settings.stage5_sandbox_cpus}",
             f"--pids-limit={settings.stage5_sandbox_pids_limit}",
         ]
+        if settings.docker_run_as_host_user:
+            docker_args += _host_user_flag()
 
         if files is not None:
             files = Path(files).resolve()
