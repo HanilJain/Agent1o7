@@ -25,7 +25,10 @@ class _ScriptedLLM:
         self._responses = list(responses)
         self.calls: list = []
 
-    async def ainvoke(self, messages):
+    async def ainvoke(self, messages, config=None):
+        # config=... is graph.py's LangSmith run_config passthrough (see
+        # fw_audit.observability) — accepted and ignored here, same as a
+        # real BaseChatModel would.
         self.calls.append(messages)
         item = self._responses.pop(0)
         if isinstance(item, Exception):

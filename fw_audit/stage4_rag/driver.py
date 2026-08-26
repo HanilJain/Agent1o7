@@ -21,6 +21,7 @@ from pathlib import Path
 
 from fw_audit.common.taint import FindingRunRecord, Stage4RunSummary, TaintPathReport
 from fw_audit.config.settings import Settings, get_settings
+from fw_audit.observability import span, trace_context
 from fw_audit.stage4_rag import layout
 from fw_audit.stage4_rag.errors import Stage4InputError
 from fw_audit.stage4_rag.query.planner import QueryPlannerUnavailableError, generate_queries
@@ -103,6 +104,32 @@ class _RunContext:
 
 async def _process_one(candidate: SinkCandidate, *, ctx: _RunContext) -> None:
     """C3 -> C4 -> C5 for one finding, persisting each stage's output."""
+    # Entered here (not once around the whole worker pool): _worker fans
+    # out via asyncio.create_task, and context set inside one task's
+    # _process_one must not leak into a sibling task processing a
+    # different finding concurrently — see
+    # fw_audit.observability.context's docstring.
+    with trace_context(
+        stage="4",
+        global_id=candidate.global_id,
+        chunk_id=candidate.chunk_id,
+        bin_id=candidate.bin_id,
+    ), span(
+        "stage4.finding",
+        inputs={"global_id": candidate.global_id},
+    ) as run:
+        try:
+            await _run_pipeline(candidate, ctx=ctx)
+        except BaseException as exc:
+            if run is not None:
+                run.end(error=str(exc))
+            raise
+        else:
+            if run is not None:
+                run.end(outputs={"status": "completed"})
+
+
+async def _run_pipeline(candidate: SinkCandidate, *, ctx: _RunContext) -> None:
     plan: MultiQueryPlan = await generate_queries(candidate, settings=ctx.settings)
     _write_json(
         layout.queries_dir(ctx.stage4_dir) / layout.query_plan_filename(candidate.global_id),
@@ -266,12 +293,16 @@ async def run_queue(
         finally:
             await queue.close()
 
-    producer_task = asyncio.create_task(_produce())
-    worker_tasks = [
-        asyncio.create_task(_worker(queue, ctx)) for _ in range(settings.stage4_workers)
-    ]
-    await producer_task
-    await asyncio.gather(*worker_tasks)
+    # Entered around the create_task fan-out so every producer/worker task
+    # (each copies the context at creation time) inherits run_id — layered
+    # under by _process_one's own per-finding chunk_id/bin_id/global_id.
+    with trace_context(stage="4", run_id=run_id):
+        producer_task = asyncio.create_task(_produce())
+        worker_tasks = [
+            asyncio.create_task(_worker(queue, ctx)) for _ in range(settings.stage4_workers)
+        ]
+        await producer_task
+        await asyncio.gather(*worker_tasks)
 
     finished_at = datetime.now(UTC)
     records = list(ctx.records.values())

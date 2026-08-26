@@ -56,6 +56,7 @@ from fw_audit.common.verification import (
 )
 from fw_audit.config.settings import Settings
 from fw_audit.executors.base import Executor
+from fw_audit.observability import run_config
 from fw_audit.stage5_verification.agent import transcript as tx
 from fw_audit.stage5_verification.agent.cleaning import clean_json_payload, clean_script
 from fw_audit.stage5_verification.agent.prompts import (
@@ -227,7 +228,14 @@ def build_verifier_graph(
             previous_stdout=(last_attempt.stdout if last_attempt else ""),
             previous_stderr=(last_attempt.stderr if last_attempt else ""),
         )
-        response = await llm.ainvoke(messages)
+        response = await llm.ainvoke(
+            messages,
+            config=run_config(
+                run_name="stage5.generate_script",
+                metadata={"iteration": iteration},
+                settings=settings,
+            ),
+        )
         script = clean_script(response.content)
         attempt_index = len(attempts)
         turn = tx.next_turn(state)
@@ -276,8 +284,17 @@ def build_verifier_graph(
         attempts_allowed = settings.stage5_repair_attempts + 1
         verdict: EvaluatorVerdict | None = None
         last_raw = ""
+        iteration_for_trace = state.get("iteration", 1)
         for attempt_num in range(attempts_allowed):
-            response = await evaluator_llm.ainvoke(messages)
+            response = await evaluator_llm.ainvoke(
+                messages,
+                config=run_config(
+                    run_name="stage5.evaluate",
+                    tags=["repair"] if attempt_num else [],
+                    metadata={"iteration": iteration_for_trace, "attempt": attempt_num},
+                    settings=settings,
+                ),
+            )
             last_raw = str(getattr(response, "content", response))
             verdict = parse_evaluator_response(response.content)
             if verdict is not None:

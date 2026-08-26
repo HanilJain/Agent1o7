@@ -36,7 +36,16 @@ all = [
     "langchain-anthropic>=1.0.0",
     "langchain-google-genai>=2.0.0",
     "langchain-openai>=1.0.0",
+    "langsmith>=0.10",
 ]
+# LangSmith tracing for Stages 3 (agentic analysis), 4 (RAG) and 5
+# (verification) — see fw_audit/observability/. Already present as a
+# transitive dependency of langchain-core, so this extra changes nothing
+# about what actually gets installed; it exists to declare the floor
+# explicitly and make `pip install -e ".[observability]"` self-documenting.
+# `fw_audit.observability` degrades to a complete no-op without it (or
+# without LANGSMITH_TRACING=true) — never required for the pipeline to run.
+observability = ["langsmith>=0.10"]
 # Stage 2's tree-sitter-based function extraction (fw_audit.stage2_extraction.clean),
 # consumed by Stage 3's chunking via the persisted cleaned/ artifact.
 # Optional: cleaning is skipped with a per-binary warning (Joern normalization and

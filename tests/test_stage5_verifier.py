@@ -58,7 +58,9 @@ class _FakeGraph:
         self._final_state = final_state
         self.invocations: list = []
 
-    async def ainvoke(self, initial_state):
+    async def ainvoke(self, initial_state, config=None):
+        # config=... is verifier.py's LangSmith run_config passthrough (see
+        # fw_audit.observability) — accepted and ignored here.
         self.invocations.append(initial_state)
         return self._final_state
 

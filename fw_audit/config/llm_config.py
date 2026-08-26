@@ -446,11 +446,37 @@ def resolve_usable_spec(
     return usable_spec
 
 
-def _build_from_spec(spec: ModelSpec, credential_kwargs: dict[str, Any]) -> "BaseChatModel":
+def _build_from_spec(
+    spec: ModelSpec,
+    credential_kwargs: dict[str, Any],
+    *,
+    role: AgentRole | None = None,
+) -> "BaseChatModel":
     """Shared `init_chat_model` call, factored out so `get_llm`'s
     preferred/fallback attempts don't duplicate the try/except ImportError
-    handling."""
+    handling.
+
+    `role` is threaded in ONLY to stamp `tags`/`metadata` on the
+    constructed model for LangSmith — see `fw_audit.observability`. It has
+    no effect on model resolution or credentials, which are already fully
+    decided by `spec`/`credential_kwargs` by the time this runs. `tags`/
+    `metadata` are ordinary constructor fields on `BaseLanguageModel` (not a
+    `.with_config()` overlay), which is what makes them safe to pass here:
+    `with_structured_output()` (used by every call site in this repo)
+    returns a `RunnableBinding` with no `with_config` counterpart, so
+    per-call identity has to be attached at construction time, not chained
+    on afterward.
+    """
     from langchain.chat_models import init_chat_model
+
+    identity_kwargs: dict[str, Any] = {}
+    if role is not None:
+        identity_kwargs["tags"] = [f"role:{role.value}"]
+        identity_kwargs["metadata"] = {
+            "role": role.value,
+            "provider": spec.provider.value,
+            "model": spec.model,
+        }
 
     try:
         return init_chat_model(
@@ -458,6 +484,7 @@ def _build_from_spec(spec: ModelSpec, credential_kwargs: dict[str, Any]) -> "Bas
             model_provider=spec.provider.langchain_id,
             temperature=spec.temperature,
             **credential_kwargs,
+            **identity_kwargs,
             **spec.kwargs,
         )
     except ImportError as exc:
@@ -496,6 +523,7 @@ def get_llm(
     the missing package.
     """
     settings = settings or get_settings()
+    role = spec_or_role if isinstance(spec_or_role, AgentRole) else None
     spec = (
         spec_or_role
         if isinstance(spec_or_role, ModelSpec)
@@ -503,7 +531,7 @@ def get_llm(
     )
 
     usable_spec, credential_kwargs = _pick_usable_spec(spec, settings=settings)
-    return _build_from_spec(usable_spec, credential_kwargs)
+    return _build_from_spec(usable_spec, credential_kwargs, role=role)
 
 
 def get_llm_for_agent(
@@ -512,7 +540,10 @@ def get_llm_for_agent(
     """Convenience wrapper: resolve `role` to a spec, then build the model.
 
     `settings` defaults to the cached singleton — see `resolve_spec`'s
-    docstring for when a caller must pass its own instead.
+    docstring for when a caller must pass its own instead. Passes `role`
+    through to `get_llm` (rather than only a resolved `ModelSpec`) so the
+    constructed model carries `role`-tagged `tags`/`metadata` for LangSmith
+    — see `_build_from_spec`'s docstring.
     """
     settings = settings or get_settings()
-    return get_llm(resolve_spec(role, settings=settings), settings=settings)
+    return get_llm(role, settings=settings)

@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 from fw_audit.config.settings import get_settings
+from fw_audit.observability import configure_tracing, flush_traces
 from fw_audit.stage4_rag import debug as debug_mod
 from fw_audit.stage4_rag import layout
 from fw_audit.stage4_rag.corpus_build import build_corpus
@@ -43,6 +44,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="fw-trace",
         description="Stage 4: RAG sink-to-source identifier — local corpus build + C3-C6 driver.",
+    )
+    parser.add_argument(
+        "--trace",
+        dest="trace",
+        action="store_true",
+        default=None,
+        help=(
+            "Force-enable LangSmith tracing for this run, overriding "
+            "LANGSMITH_TRACING. Requires LANGSMITH_API_KEY to actually upload."
+        ),
+    )
+    parser.add_argument(
+        "--no-trace",
+        dest="trace",
+        action="store_false",
+        help="Force-disable LangSmith tracing for this run, overriding LANGSMITH_TRACING.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -225,13 +242,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = _parse_args(argv)
 
-    if args.command == "build-corpus":
-        return _cmd_build_corpus(args)
-    if args.command == "run":
-        return _cmd_run(args)
-    if args.command == "debug":
-        return _cmd_debug(args)
-    return 2  # pragma: no cover - argparse enforces valid subcommands
+    settings = get_settings()
+    if args.trace is not None:
+        settings = settings.model_copy(update={"langsmith_tracing": args.trace})
+    configure_tracing(settings)
+
+    try:
+        if args.command == "build-corpus":
+            return _cmd_build_corpus(args)
+        if args.command == "run":
+            return _cmd_run(args)
+        if args.command == "debug":
+            return _cmd_debug(args)
+        return 2  # pragma: no cover - argparse enforces valid subcommands
+    finally:
+        flush_traces()
 
 
 if __name__ == "__main__":

@@ -103,6 +103,45 @@ class Settings(BaseSettings):
     is usable does resolution raise — see `llm_config.get_llm`'s
     docstring for the exact precedence."""
 
+    # ---- Observability (LangSmith tracing, Stages 3/4/5) -----------------
+    langsmith_tracing: bool = Field(default=False, validation_alias="LANGSMITH_TRACING")
+    """Master switch. `False` (default) means `fw_audit.observability` is a
+    complete no-op everywhere it's called — no env var written, no
+    `langsmith` import attempted, zero behavior change to any persisted
+    artifact. Conventional (non-`FWA_`) name so it lines up with the
+    LangSmith SDK's own env var and any existing LangSmith shell setup."""
+    langsmith_api_key: str | None = Field(default=None, validation_alias="LANGSMITH_API_KEY")
+    langsmith_project: str = Field(
+        default="fw-audit", validation_alias="LANGSMITH_PROJECT"
+    )
+    """Project name traces are grouped under in the LangSmith UI. One
+    project shared by Stages 3, 4 and 5 — the `stage` tag (see
+    `fw_audit.observability.context`) is how you filter within it, not a
+    separate project per stage."""
+    langsmith_endpoint: str = Field(
+        default="https://api.smith.langchain.com", validation_alias="LANGSMITH_ENDPOINT"
+    )
+    """LangSmith cloud by default. Point at a self-hosted instance's URL to
+    keep traces off the public endpoint entirely."""
+    langsmith_hide_inputs: bool = Field(
+        default=False, validation_alias="LANGSMITH_HIDE_INPUTS"
+    )
+    langsmith_hide_outputs: bool = Field(
+        default=False, validation_alias="LANGSMITH_HIDE_OUTPUTS"
+    )
+    """Together, redact prompt/completion bodies from uploaded traces while
+    keeping run structure, timing, and metadata — for firmware where the
+    decompiled source itself shouldn't leave the machine, at the cost of
+    losing the single most useful debugging signal (the actual failing
+    prompt). Off by default: see this project's LangSmith deployment
+    decision (traces go to LangSmith cloud, payloads included)."""
+    langsmith_sample_rate: float = Field(
+        default=1.0, ge=0.0, le=1.0, validation_alias="LANGSMITH_TRACING_SAMPLE_RATE"
+    )
+    """Fraction of runs actually traced when tracing is on. 1.0 (default) =
+    trace everything — the env var name matches the LangSmith SDK's own so
+    it's honored even by code paths this module doesn't control."""
+
     # ---- Directories ----------------------------------------------------
     data_dir: Path = Field(default=PROJECT_ROOT / "data", validation_alias="FWA_DATA_DIR")
     firmware_dir: Path | None = Field(default=None, validation_alias="FWA_FIRMWARE_DIR")

@@ -69,6 +69,10 @@ into `stage2/` or the mirror tree.
 - A chunk over `FWA_STAGE3_MAX_CHUNK_TOKENS` is skipped rather than retried.
 - `qwen2.5-coder:1.5b` verifies plumbing only — expect materially worse
   finding quality than Claude Sonnet on the large `AnalysisReport` schema.
+- `--trace` (or `LANGSMITH_TRACING=true`) traces `--analyze` runs in
+  LangSmith: one root run per chunk, with schema-repair retries visible as
+  sibling child runs — see the project root `CLAUDE.md`'s Observability
+  section.
 
 ## Testing
 

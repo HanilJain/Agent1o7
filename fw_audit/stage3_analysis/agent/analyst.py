@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from fw_audit.common.findings import AnalysisReport
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings
+from fw_audit.observability import run_config
 from fw_audit.stage3_analysis.agent.prompts import build_messages
 
 logger = logging.getLogger("fw_audit.stage3_analysis.agent")
@@ -85,7 +86,13 @@ async def analyze_chunk(
         if settings.stage3_log_prompts:
             _log_prompt(messages, chunk_id=chunk_id, attempt=attempt)
         try:
-            parsed = await structured_llm.ainvoke(messages)
+            config = run_config(
+                run_name="stage3.c2.analyze_chunk",
+                tags=["repair"] if attempt else [],
+                metadata={"attempt": attempt},
+                settings=settings,
+            )
+            parsed = await structured_llm.ainvoke(messages, config=config)
         except (OSError, TimeoutError) as exc:
             # Transport failures get no repair attempt: re-prompting a dead
             # socket/rate-limited endpoint wastes tokens and time. Let

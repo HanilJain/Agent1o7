@@ -23,6 +23,7 @@ from pathlib import Path
 
 from fw_audit.common.verification import TranscriptEntry
 from fw_audit.config.settings import get_settings
+from fw_audit.observability import configure_tracing, flush_traces
 from fw_audit.stage5_verification import debug as debug_mod
 from fw_audit.stage5_verification import layout
 from fw_audit.stage5_verification.driver import run_queue
@@ -64,6 +65,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="fw-verify",
         description="Stage 5: sandboxed verification — Joern generate/run/evaluate pipeline.",
+    )
+    parser.add_argument(
+        "--trace",
+        dest="trace",
+        action="store_true",
+        default=None,
+        help=(
+            "Force-enable LangSmith tracing for this run, overriding "
+            "LANGSMITH_TRACING. Requires LANGSMITH_API_KEY to actually upload."
+        ),
+    )
+    parser.add_argument(
+        "--no-trace",
+        dest="trace",
+        action="store_false",
+        help="Force-disable LangSmith tracing for this run, overriding LANGSMITH_TRACING.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -229,11 +246,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = _parse_args(argv)
 
-    if args.command == "run":
-        return _cmd_run(args)
-    if args.command == "debug":
-        return _cmd_debug(args)
-    return 2  # pragma: no cover - argparse enforces valid subcommands
+    settings = get_settings()
+    if args.trace is not None:
+        settings = settings.model_copy(update={"langsmith_tracing": args.trace})
+    configure_tracing(settings)
+
+    try:
+        if args.command == "run":
+            return _cmd_run(args)
+        if args.command == "debug":
+            return _cmd_debug(args)
+        return 2  # pragma: no cover - argparse enforces valid subcommands
+    finally:
+        flush_traces()
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from fw_audit.common.findings import AnalysisReport, AnalysisRunSummary, ChunkAn
 from fw_audit.common.schemas import Stage3Summary
 from fw_audit.config.llm_config import AgentRole, resolve_usable_spec
 from fw_audit.config.settings import Settings
+from fw_audit.observability import trace_context
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.agent.consumer import AnalysisConsumer
 from fw_audit.stage3_analysis.chunk_queue import run_queue
@@ -66,9 +67,16 @@ async def run_analysis(
 
     consumer = AnalysisConsumer(db_subfolder=report.db_subfolder, settings=settings)
 
-    stage3_summary: Stage3Summary = await run_queue(
-        report, settings=settings, consumer=consumer, run_id=run_id
-    )
+    # Entered here, around run_queue's own asyncio.create_task fan-out, so
+    # every worker task (each copies the context at creation time) inherits
+    # run_id/model — AnalysisConsumer.__call__ then layers per-chunk
+    # chunk_id/bin_id on top, isolated per task. See
+    # fw_audit.observability.context's docstring for why this can't instead
+    # be set once inside a single worker.
+    with trace_context(stage="3", run_id=run_id, model=model_label):
+        stage3_summary: Stage3Summary = await run_queue(
+            report, settings=settings, consumer=consumer, run_id=run_id
+        )
 
     analysis_summary = _build_analysis_summary(
         report=report,

@@ -69,6 +69,13 @@ unconditional) → `stage3_summary.json` (`--queue`/`--analyze`) →
 
 ## Debugging
 
+- `--trace` (or `LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`) traces every
+  `--analyze` run: one `stage3.chunk` root run per chunk, containing the
+  analyst LLM call and any schema-repair retry (tagged `repair`,
+  `attempt:N` in metadata) — see root `CLAUDE.md`'s Observability section.
+
+## Debugging
+
 - A `Target` with no cleaned artifact recorded (Stage 2 skipped cleaning
   for it — e.g. the `stage2` extra wasn't installed there): `--debug`'s
   cleaned dump is skipped for that target with a warning;

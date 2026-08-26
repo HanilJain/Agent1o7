@@ -58,6 +58,15 @@ specifically want to build the corpus on Colab's free GPU. Unzip the
 result under `<db_subfolder>/stage4/` and `fw-trace run` picks up from
 there exactly as if `build-corpus` had run locally.
 
+## Debugging
+
+`--trace` (or `LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`) traces `run`
+in LangSmith: one root run per finding (C3->C4->C5), with C4's retrieval
+step as a `run_type="retriever"` span recording each query's returned
+chunk ids and distances — the fastest way to tell whether a bad taint path
+came from a bad query (C3) or bad retrieval (C4). See the project root
+`CLAUDE.md`'s Observability section.
+
 ## Testing
 
 ```bash

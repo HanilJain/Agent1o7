@@ -23,6 +23,7 @@ from fw_audit.common.verification import (
     VerificationRunSummary,
 )
 from fw_audit.config.settings import Settings, get_settings
+from fw_audit.observability import span, trace_context
 from fw_audit.stage5_verification import layout
 from fw_audit.stage5_verification.agent.verifier import verify_candidate
 from fw_audit.stage5_verification.candidate_index import (
@@ -104,9 +105,25 @@ class _RunContext:
 async def _process_one(candidate: VerificationCandidate, *, ctx: _RunContext) -> None:
     """Verify one candidate, persisting the JSON report and Markdown
     explanation, then updating the run-level bookkeeping record."""
-    report: VerificationReport = await verify_candidate(
-        candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings
-    )
+    # Entered here (not once around the whole worker pool): _worker fans
+    # out via asyncio.create_task, and context set inside one task's
+    # _process_one must not leak into a sibling task verifying a different
+    # candidate concurrently — see fw_audit.observability.context's
+    # docstring.
+    with trace_context(
+        stage="5",
+        global_id=candidate.global_id,
+        chunk_id=candidate.chunk_id,
+        bin_id=candidate.bin_id,
+    ), span(
+        "stage5.candidate",
+        inputs={"global_id": candidate.global_id},
+    ) as run:
+        report: VerificationReport = await verify_candidate(
+            candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings
+        )
+        if run is not None:
+            run.end(outputs={"verdict": report.verdict.value})
 
     _write_json(
         layout.verifications_dir(ctx.stage5_dir)
@@ -240,12 +257,16 @@ async def run_queue(
         finally:
             await queue.close()
 
-    producer_task = asyncio.create_task(_produce())
-    worker_tasks = [
-        asyncio.create_task(_worker(queue, ctx)) for _ in range(settings.stage5_workers)
-    ]
-    await producer_task
-    await asyncio.gather(*worker_tasks)
+    # Entered around the create_task fan-out so every producer/worker task
+    # (each copies the context at creation time) inherits run_id — layered
+    # under by _process_one's own per-candidate chunk_id/bin_id/global_id.
+    with trace_context(stage="5", run_id=run_id):
+        producer_task = asyncio.create_task(_produce())
+        worker_tasks = [
+            asyncio.create_task(_worker(queue, ctx)) for _ in range(settings.stage5_workers)
+        ]
+        await producer_task
+        await asyncio.gather(*worker_tasks)
 
     finished_at = datetime.now(UTC)
     records = list(ctx.records.values())

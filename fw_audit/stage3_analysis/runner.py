@@ -60,6 +60,7 @@ import sys
 from pathlib import Path
 
 from fw_audit.config.settings import get_settings
+from fw_audit.observability import configure_tracing, flush_traces
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.agent.orchestrator import AnalystModelUnavailableError, run_analysis
 from fw_audit.stage3_analysis.chunk_queue import run_queue
@@ -157,6 +158,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--run-id", type=str, default=None, help="Run identifier for logging (default: random)."
     )
+    parser.add_argument(
+        "--trace",
+        dest="trace",
+        action="store_true",
+        default=None,
+        help=(
+            "Force-enable LangSmith tracing for this run, overriding "
+            "LANGSMITH_TRACING. Requires LANGSMITH_API_KEY to actually upload."
+        ),
+    )
+    parser.add_argument(
+        "--no-trace",
+        dest="trace",
+        action="store_false",
+        help="Force-disable LangSmith tracing for this run, overriding LANGSMITH_TRACING.",
+    )
     return parser.parse_args(argv)
 
 
@@ -216,6 +233,9 @@ def main(argv: list[str] | None = None) -> int:
         settings = settings.model_copy(update={"stage3_chunk_lines": args.chunk_lines})
     if args.model is not None:
         settings = settings.model_copy(update={"stage3_analyst_model": args.model})
+    if args.trace is not None:
+        settings = settings.model_copy(update={"langsmith_tracing": args.trace})
+    configure_tracing(settings)
 
     try:
         report = ingest(
@@ -264,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
 
+    flush_traces()
     return 1 if not report.targets else 0
 
 

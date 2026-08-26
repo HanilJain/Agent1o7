@@ -89,6 +89,18 @@ to resolve each binary's `normalized/joern/whole.c`).
 
 ## Debugging
 
+- `--trace` (or `LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`) traces every
+  `run`: one `stage5.candidate` root run per candidate, with the compiled
+  graph's own generate/run/evaluate loop nested beneath it, plus
+  `run_type="tool"` spans around `build_cpg_async`/`run_joern_script_async`
+  (Joern's two `docker run` calls — otherwise untimed). A persisted
+  `verifications/<gid>.json`'s `trace_url` field links back to the live
+  trace when tracing was on; `agent/transcript.py`'s hand-rolled transcript
+  remains the offline artifact of record either way. See root `CLAUDE.md`'s
+  Observability section.
+
+## Debugging
+
 - `docker build -f docker/Dockerfile.joern -t fw-audit-joern:latest .` —
   the `JOERN_CLI_SHA256` build arg is already populated with a
   locally-verified hash; build context must be the repo root (the

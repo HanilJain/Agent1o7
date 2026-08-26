@@ -19,6 +19,7 @@ from pathlib import Path
 
 from fw_audit.common.findings import AnalysisReport, ChunkAnalysisRecord
 from fw_audit.config.settings import Settings
+from fw_audit.observability import span, trace_context
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.agent.analyst import AnalysisUnavailableError, analyze_chunk
 from fw_audit.stage3_analysis.models import ChunkHandle
@@ -52,6 +53,37 @@ class AnalysisConsumer:
         lists rely on."""
 
     async def __call__(self, handle: ChunkHandle) -> None:
+        # trace_context is entered here, per-call, rather than once around
+        # the whole worker pool: chunk_queue fans workers out via
+        # asyncio.create_task, and a context set inside one worker's
+        # __call__ must not leak into a sibling task processing a different
+        # chunk concurrently — see fw_audit.observability.context's
+        # docstring. The `stage3.chunk` span is opened here too, OUTSIDE
+        # the asyncio.wait_for below: wait_for cancels its inner coroutine
+        # on timeout, which would destroy a span opened inside it before
+        # the timeout — the single most useful failure to see — could be
+        # recorded.
+        with trace_context(
+            stage="3",
+            chunk_id=handle.chunk_id,
+            bin_id=handle.bin_id,
+        ), span(
+            "stage3.chunk",
+            run_type="chain",
+            inputs={"chunk_id": handle.chunk_id, "attempt": handle.attempt},
+            metadata={"queue_attempt": handle.attempt},
+        ) as run:
+            try:
+                await self._process(handle)
+            except BaseException as exc:
+                if run is not None:
+                    run.end(error=str(exc))
+                raise
+            else:
+                if run is not None:
+                    run.end(outputs={"status": "ok"})
+
+    async def _process(self, handle: ChunkHandle) -> None:
         if handle.attempt:
             backoff = self._settings.stage3_llm_retry_backoff_seconds * (2 ** (handle.attempt - 1))
             if backoff:

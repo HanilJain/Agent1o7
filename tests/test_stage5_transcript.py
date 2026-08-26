@@ -153,7 +153,9 @@ async def test_verify_candidate_on_step_receives_incremental_new_turns(tmp_path,
         """Mimics LangGraph's `astream(..., stream_mode='values')`: yields
         the FULL accumulated state after each step."""
 
-        async def astream(self, initial_state, stream_mode):
+        async def astream(self, initial_state, config=None, stream_mode="values"):
+            # config=... is verifier.py's LangSmith run_config passthrough
+            # (see fw_audit.observability) — accepted and ignored here.
             assert stream_mode == "values"
             transcript = list(initial_state["transcript"])
             yield {**initial_state, "transcript": transcript}

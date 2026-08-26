@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from fw_audit.observability import span
 from fw_audit.stage4_rag.query.schemas import MultiQueryPlan
 from fw_audit.stage4_rag.sink_index import SinkCandidate
 
@@ -45,27 +46,67 @@ def retrieve(
     top_k: int,
 ) -> RetrievalBundle:
     """Runs one top-k similarity search per query in `plan`, merges and
-    dedupes the results by `chunk_id`."""
+    dedupes the results by `chunk_id`.
+
+    Wrapped in a `run_type="retriever"` span (a no-op unless tracing is
+    on): Chroma's `collection.query(...)` and the embedder are raw SDK
+    calls, invisible to LangSmith's automatic LangChain instrumentation, so
+    without this wrapping "was the right chunk even retrieved?" has no
+    answer short of manually diffing `queries/<gid>.json` against
+    `retrieval/<gid>.json`. Each query gets its own child span recording
+    the returned chunk ids and distances — a uniformly high distance across
+    every query is the signature of the embedder-parity drift
+    `stage4_rag/CLAUDE.md` calls out as otherwise silent.
+    """
     best: dict[str, RetrievedChunk] = {}
     matched_by: dict[str, list[str]] = {}
 
-    for query in plan.queries:
-        query_vector = embedder.embed_query(query.query_text)
-        results = collection.query(query_embeddings=[query_vector], n_results=top_k)
-        _merge_query_results(results, query.query_text, best=best, matched_by=matched_by)
+    with span(
+        "stage4.c4.retrieve",
+        run_type="retriever",
+        inputs={"finding_id": plan.finding_id, "queries": [q.query_text for q in plan.queries]},
+    ) as retrieve_run:
+        for query in plan.queries:
+            with span(
+                "stage4.c4.embed_and_search",
+                run_type="retriever",
+                inputs={"query_text": query.query_text, "top_k": top_k},
+            ) as query_run:
+                query_vector = embedder.embed_query(query.query_text)
+                results = collection.query(query_embeddings=[query_vector], n_results=top_k)
+                if query_run is not None:
+                    ids = (results.get("ids") or [[]])[0]
+                    distances = (results.get("distances") or [[]])[0]
+                    query_run.end(
+                        outputs={
+                            "chunk_ids": list(ids),
+                            "distances": [float(d) for d in distances],
+                        }
+                    )
+            _merge_query_results(results, query.query_text, best=best, matched_by=matched_by)
 
-    merged = tuple(
-        RetrievedChunk(
-            chunk_id=chunk.chunk_id,
-            source_path=chunk.source_path,
-            kind=chunk.kind,
-            bin_id=chunk.bin_id,
-            text=chunk.text,
-            distance=chunk.distance,
-            matched_queries=tuple(matched_by[chunk.chunk_id]),
+        merged = tuple(
+            RetrievedChunk(
+                chunk_id=chunk.chunk_id,
+                source_path=chunk.source_path,
+                kind=chunk.kind,
+                bin_id=chunk.bin_id,
+                text=chunk.text,
+                distance=chunk.distance,
+                matched_queries=tuple(matched_by[chunk.chunk_id]),
+            )
+            for chunk in sorted(best.values(), key=lambda c: c.distance)
         )
-        for chunk in sorted(best.values(), key=lambda c: c.distance)
-    )
+
+        if retrieve_run is not None:
+            retrieve_run.end(
+                outputs={
+                    "chunk_ids": [c.chunk_id for c in merged],
+                    "distances": [c.distance for c in merged],
+                    "matched_queries": {c.chunk_id: list(c.matched_queries) for c in merged},
+                }
+            )
+
     return RetrievalBundle(global_id=plan.finding_id, chunks=merged)
 
 

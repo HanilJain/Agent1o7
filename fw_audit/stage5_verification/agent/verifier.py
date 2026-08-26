@@ -25,6 +25,7 @@ from fw_audit.common.verification import (
 )
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings
+from fw_audit.observability import current_trace_url, run_config
 from fw_audit.stage5_verification import layout
 from fw_audit.stage5_verification.agent import transcript as tx
 from fw_audit.stage5_verification.agent.graph import build_verifier_graph
@@ -129,14 +130,22 @@ async def verify_candidate(
         "max_iterations": settings.stage5_max_agent_iterations,
         "transcript": tx.initial_transcript(system_prompt=effective_system_prompt, brief=brief),
     }
+    config = run_config(
+        run_name="stage5.verify_candidate",
+        metadata={"global_id": candidate.global_id, "bin_id": candidate.bin_id},
+        settings=settings,
+    )
     try:
         if on_step is None:
-            final_state = await graph.ainvoke(initial_state)
+            final_state = await graph.ainvoke(initial_state, config=config)
         else:
-            final_state = await _stream_with_callback(graph, initial_state, on_step)
+            final_state = await _stream_with_callback(
+                graph, initial_state, on_step, config=config
+            )
     except (OSError, TimeoutError) as exc:
         raise VerifierModelUnavailableError(f"verification pipeline call failed: {exc}") from exc
     finished_at = datetime.now(UTC)
+    trace_url = current_trace_url()
 
     transcript = final_state.get("transcript", [])
 
@@ -164,10 +173,13 @@ async def verify_candidate(
         recommended_next_steps=final_state.get("verdict_next_steps", []),
         started_at=started_at,
         finished_at=finished_at,
+        trace_url=trace_url,
     )
 
 
-async def _stream_with_callback(graph, initial_state: dict, on_step: OnStep) -> dict:
+async def _stream_with_callback(
+    graph, initial_state: dict, on_step: OnStep, *, config: dict | None = None
+) -> dict:
     """Drive `graph` via `astream(..., stream_mode="values")` instead of a
     single `ainvoke`, calling `on_step` with each step's newly-appended
     transcript entries as they arrive.
@@ -180,7 +192,7 @@ async def _stream_with_callback(graph, initial_state: dict, on_step: OnStep) -> 
     """
     seen = 0
     state = initial_state
-    async for state in graph.astream(initial_state, stream_mode="values"):
+    async for state in graph.astream(initial_state, config=config, stream_mode="values"):
         step_entries = state.get("transcript", [])
         new_entries = step_entries[seen:]
         if new_entries:

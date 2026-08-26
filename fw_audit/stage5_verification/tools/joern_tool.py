@@ -59,6 +59,7 @@ from fw_audit.config.settings import Settings, get_settings
 from fw_audit.executors.base import Executor
 from fw_audit.executors.docker_executor import CONTAINER_WORKDIR
 from fw_audit.executors.manager import get_executor
+from fw_audit.observability import aspan
 
 CPG_FILENAME = "cpg.bin"
 SOURCE_FILENAME = "whole.c"
@@ -117,14 +118,33 @@ async def build_cpg_async(
 ) -> CpgBuildRecord:
     """The logic behind the `build_cpg` tool, factored out so `debug.py` can
     invoke it directly without going through the LLM/tool-calling machinery
-    at all (mirrors `stage4_rag.debug`'s "bypass the agent" precedent)."""
+    at all (mirrors `stage4_rag.debug`'s "bypass the agent" precedent).
+
+    Wrapped in a `run_type="tool"` span (a no-op unless tracing is on): this
+    is one of the two highest-latency operations in the whole pipeline (a
+    raw `docker run`, invisible to LangSmith's automatic LangChain
+    instrumentation) and today has no timing attribution at all beyond
+    `CpgBuildRecord.duration_seconds`, which only reaches disk inside the
+    final persisted report.
+    """
     command = joern_parse_command()
-    started = time.monotonic()
-    result = await executor.run(
-        command, files=workspace_dir, timeout=settings.stage5_cpg_build_timeout_seconds
-    )
-    duration = time.monotonic() - started
-    ok = result.ok and (workspace_dir / CPG_FILENAME).is_file()
+    async with aspan(
+        "stage5.build_cpg", run_type="tool", inputs={"command": command}
+    ) as run:
+        started = time.monotonic()
+        result = await executor.run(
+            command, files=workspace_dir, timeout=settings.stage5_cpg_build_timeout_seconds
+        )
+        duration = time.monotonic() - started
+        ok = result.ok and (workspace_dir / CPG_FILENAME).is_file()
+        if run is not None:
+            run.end(
+                outputs={
+                    "ok": ok,
+                    "duration_seconds": duration,
+                    "stderr": result.stderr[:500],
+                }
+            )
     return CpgBuildRecord(command=command, ok=ok, duration_seconds=duration, stderr=result.stderr)
 
 
@@ -136,15 +156,33 @@ async def run_joern_script_async(
     executor: Executor,
     settings: Settings,
 ) -> JoernScriptAttempt:
+    """The logic behind the `run_script` tool — see `build_cpg_async`'s
+    docstring for why this is also wrapped in a `run_type="tool"` span:
+    the other of the pipeline's two highest-latency raw `docker run` calls.
+    """
     from fw_audit.stage5_verification import layout
 
     script_path = layout.script_path(workspace_dir, attempt_index)
     script_path.write_text(script, encoding="utf-8")
 
     command = joern_script_command(script_path.name)
-    result = await executor.run(
-        command, files=workspace_dir, timeout=settings.stage5_joern_timeout_seconds
-    )
+    async with aspan(
+        "stage5.run_joern_script",
+        run_type="tool",
+        inputs={"command": command, "attempt_index": attempt_index},
+    ) as run:
+        result = await executor.run(
+            command, files=workspace_dir, timeout=settings.stage5_joern_timeout_seconds
+        )
+        if run is not None:
+            run.end(
+                outputs={
+                    "returncode": result.returncode,
+                    "ok": result.ok,
+                    "stdout": result.stdout[:500],
+                    "stderr": result.stderr[:500],
+                }
+            )
     return JoernScriptAttempt(
         attempt_index=attempt_index,
         script=script,

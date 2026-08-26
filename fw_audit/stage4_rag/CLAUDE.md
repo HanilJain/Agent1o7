@@ -64,6 +64,15 @@ Stage 1's rootfs directory + Stage 2's `stage2/binaries/` (C1+C2); Stage 3's
 
 ## Debugging
 
+- `--trace` (or `LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`) traces every
+  `run`: one `stage4.finding` root run per finding (C3->C4->C5), with C4's
+  `retrieve()` as a `run_type="retriever"` span recording per-query
+  chunk ids and distances — the fastest way to see whether C3 wrote bad
+  queries or C4 returned bad chunks. See root `CLAUDE.md`'s Observability
+  section.
+
+## Debugging
+
 - `fw-trace debug parity` first if retrieval looks wrong — near-zero cosine
   similarity means the query/document embedder setup has drifted.
 - `VectorStoreUnavailableError` before `run`/`debug retrieve|taint`: run

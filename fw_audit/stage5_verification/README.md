@@ -78,6 +78,11 @@ location all overridable, without touching `stage5/verifications/`. See
 [CLAUDE.md](CLAUDE.md)'s Debugging section for the full command reference
 and common errors.
 
+`--trace` (or `LANGSMITH_TRACING=true`) additionally traces a run in
+LangSmith: one root run per candidate, with `run_type="tool"` spans around
+each Joern `docker run` call — see the project root `CLAUDE.md`'s
+Observability section.
+
 ## Explicitly deferred (not designed away)
 
 - QEMU+GDB dynamic verification — a second tool module reusing

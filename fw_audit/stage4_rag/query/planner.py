@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings
+from fw_audit.observability import run_config
 from fw_audit.stage4_rag.query.prompts import build_messages
 from fw_audit.stage4_rag.query.schemas import MultiQueryPlan
 from fw_audit.stage4_rag.sink_index import SinkCandidate
@@ -54,7 +55,13 @@ async def generate_queries(
     last_error: ValidationError | None = None
     for attempt in range(attempts_allowed):
         try:
-            parsed = await structured_llm.ainvoke(messages)
+            config = run_config(
+                run_name="stage4.c3.plan_queries",
+                tags=["repair"] if attempt else [],
+                metadata={"attempt": attempt, "global_id": candidate.global_id},
+                settings=settings,
+            )
+            parsed = await structured_llm.ainvoke(messages, config=config)
         except (OSError, TimeoutError) as exc:
             raise QueryPlannerUnavailableError(f"LLM call failed: {exc}") from exc
         except ValidationError as exc:

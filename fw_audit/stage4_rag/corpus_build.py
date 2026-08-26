@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fw_audit.config.settings import Settings, get_settings
+from fw_audit.observability import span
 from fw_audit.stage4_rag import layout
 from fw_audit.stage4_rag.colab.chunk_and_embed import (
     Chunk,
@@ -78,29 +79,55 @@ def build_corpus(
         embed_max_seq_length=settings.stage4_embed_max_seq_length,
     )
 
-    logger.info("rootfs: %s", rootfs_dir)
-    logger.info("stage2 binaries dir: %s", stage2_binaries_dir)
-    chunks: list[Chunk] = build_corpus_chunks(config)
-    logger.info("%d chunks discovered", len(chunks))
-    if not chunks:
-        logger.warning("zero chunks discovered — check rootfs_dir/stage2_binaries_dir above")
+    # One coarse span for the whole build — not per-chunk (that would be
+    # thousands of spans for one corpus rebuild with no debugging payoff);
+    # this makes a rebuild attributable (duration, chunk count, embedding
+    # model) rather than invisible, same rationale as the retrieval spans
+    # in retrieval/engine.py.
+    with span(
+        "stage4.build_corpus",
+        run_type="chain",
+        inputs={
+            "rootfs_dir": str(rootfs_dir),
+            "stage2_binaries_dir": str(stage2_binaries_dir),
+            "embedding_model": config.embedding_model,
+            "chroma_collection_name": config.chroma_collection_name,
+        },
+    ) as run:
+        logger.info("rootfs: %s", rootfs_dir)
+        logger.info("stage2 binaries dir: %s", stage2_binaries_dir)
+        chunks: list[Chunk] = build_corpus_chunks(config)
+        logger.info("%d chunks discovered", len(chunks))
+        if not chunks:
+            logger.warning("zero chunks discovered — check rootfs_dir/stage2_binaries_dir above")
 
-    logger.info("loading embedding model: %s", config.embedding_model)
-    embedder = _build_embedder(config)
+        logger.info("loading embedding model: %s", config.embedding_model)
+        embedder = _build_embedder(config)
 
-    logger.info("embedding + upserting into Chroma collection %r", config.chroma_collection_name)
-    collection = get_or_create_collection(
-        persist_dir=chroma_dir_, collection_name=config.chroma_collection_name
-    )
-    embed_and_upsert(
-        chunks=chunks,
-        embedder=embedder,
-        collection=collection,
-        batch_size=config.embed_batch_size,
-    )
+        logger.info(
+            "embedding + upserting into Chroma collection %r", config.chroma_collection_name
+        )
+        collection = get_or_create_collection(
+            persist_dir=chroma_dir_, collection_name=config.chroma_collection_name
+        )
+        embed_and_upsert(
+            chunks=chunks,
+            embedder=embedder,
+            collection=collection,
+            batch_size=config.embed_batch_size,
+        )
 
-    report = write_corpus_report(chunks=chunks, config=config, report_path=report_path)
-    logger.info("corpus_report.json written: %s", report_path)
+        report = write_corpus_report(chunks=chunks, config=config, report_path=report_path)
+        logger.info("corpus_report.json written: %s", report_path)
+
+        if run is not None:
+            run.end(
+                outputs={
+                    "total_files": report["total_files"],
+                    "total_chunks": report["total_chunks"],
+                    "chunks_by_kind": report["chunks_by_kind"],
+                }
+            )
 
     return CorpusBuildReport(
         total_files=report["total_files"],

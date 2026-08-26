@@ -213,6 +213,14 @@ class VerificationReport(BaseModel):
     recommended_next_steps: list[str] = Field(default_factory=list)
     started_at: datetime
     finished_at: datetime | None = None
+    trace_url: str | None = None
+    """Best-effort LangSmith URL for this run's live trace — set only when
+    tracing was active for the call that produced this report (see
+    `fw_audit.observability.current_trace_url`). `None` by default so
+    existing persisted reports (written before this field existed) still
+    validate unchanged; this is a cross-link ALONGSIDE `transcript` above,
+    not a replacement for it — `transcript` remains the offline artifact of
+    record and needs no network/LangSmith retention to read."""
 
 
 # --------------------------------------------------------------------- #
