@@ -64,6 +64,7 @@ concerns (Executor abstraction, LLM routing, Settings).
 fw-verify run --db-subfolder data/db/<stem>
 fw-verify run --db-subfolder data/db/<stem> --only "<chunk_id>::<finding_id>"
 fw-verify run --db-subfolder data/db/<stem> --model ollama:qwen3:32b --keep-workspace
+fw-verify run --db-subfolder data/db/<stem> --decisions CONTEXT_REQUIRED,ESCALATE
 
 fw-verify debug build-cpg --db-subfolder data/db/<stem> --bin-id <bin_id>
 fw-verify debug script --workspace data/db/<stem>/stage5/workspace/<gid> --script-file q.sc
@@ -98,9 +99,6 @@ to resolve each binary's `normalized/joern/whole.c`).
   trace when tracing was on; `agent/transcript.py`'s hand-rolled transcript
   remains the offline artifact of record either way. See root `CLAUDE.md`'s
   Observability section.
-
-## Debugging
-
 - `docker build -f docker/Dockerfile.joern -t fw-audit-joern:latest .` —
   the `JOERN_CLI_SHA256` build arg is already populated with a
   locally-verified hash; build context must be the repo root (the
@@ -116,6 +114,14 @@ to resolve each binary's `normalized/joern/whole.c`).
   `AgentRole.STAGE5_SCRIPT_GENERATOR` or `AgentRole.STAGE5_RESULT_EVALUATOR`;
   set `ANTHROPIC_API_KEY` (paid API key — a Claude Code/claude.ai login does
   not work here) or `FWA_STAGE5_VERIFIER_MODEL=ollama:qwen3:32b`.
+- `Status: no_targets` with 0 candidates, even though `stage3/findings/*.json`
+  clearly has content → check each finding's `decision` field
+  (`grep -o '"decision": *"[A-Z_]*"' stage3/findings/*.json`). Only
+  `ESCALATE` is verified by default; `CONTEXT_REQUIRED`/`MERGE`/`DISCARD`
+  findings are silently excluded — pass `--decisions CONTEXT_REQUIRED` (or
+  a comma-separated list) to force them through. `--only` alone does NOT
+  bypass this filter — it only narrows the set `--decisions` already
+  selected.
 - `fw-verify debug build-cpg` / `debug script` bypass the LLM entirely —
   use these first to confirm the Joern image/tool mechanics work, and to
   validate the `println("RESULT: ...")` contract with a hand-written

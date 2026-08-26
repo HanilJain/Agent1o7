@@ -2,16 +2,19 @@
 
 Registered as the `fw-verify` console script (see pyproject.toml). Usage:
 
-    fw-verify run --db-subfolder DIR [--only GID ...] [--model P:M] [--keep-workspace]
+    fw-verify run --db-subfolder DIR [--only GID ...] [--decisions D[,D...]]
+                  [--model P:M] [--keep-workspace]
     fw-verify debug build-cpg --db-subfolder DIR --bin-id BIN_ID
     fw-verify debug script --workspace DIR --script-file PATH
     fw-verify debug verify --db-subfolder DIR --gid GID [--prompt-file PATH]
                             [--model P:M] [--max-iterations N] [--output PATH]
 
 `run` verifies every Stage 3 finding with `decision == ESCALATE` by default
-(`candidate_index.discover_candidates`) through the worker-pool driver.
-`debug` dispatches to `debug.py`'s per-component, dry-run inspection
-functions — none of them persist into `stage5/verifications/`/`reports/`.
+(`candidate_index.discover_candidates`) through the worker-pool driver —
+`--decisions` overrides which decision(s) qualify (e.g. `CONTEXT_REQUIRED`,
+on the chance a CPG resolves what Stage 3 itself couldn't). `debug`
+dispatches to `debug.py`'s per-component, dry-run inspection functions —
+none of them persist into `stage5/verifications/`/`reports/`.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from fw_audit.common.findings import Decision
 from fw_audit.common.verification import TranscriptEntry
 from fw_audit.config.settings import get_settings
 from fw_audit.observability import configure_tracing, flush_traces
@@ -91,7 +95,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="GID",
-        help="Restrict to this global id. Repeatable.",
+        help="Restrict to this global id. Repeatable. NOTE: this only narrows the "
+        "set already selected by --decisions — it does not itself bypass the "
+        "decision filter, so a finding excluded by --decisions is still excluded "
+        "even if you name it here explicitly.",
+    )
+    run.add_argument(
+        "--decisions",
+        type=str,
+        default=None,
+        metavar="DECISION[,DECISION...]",
+        help=(
+            "Comma-separated Stage 3 decisions to verify, overriding the default "
+            "ESCALATE-only filter — e.g. 'CONTEXT_REQUIRED' or 'ESCALATE,"
+            "CONTEXT_REQUIRED'. Valid values: "
+            + ", ".join(d.value for d in Decision)
+            + ". CONTEXT_REQUIRED findings are excluded by default because they "
+            "name context (callers/globals/macros/ABI facts) a single binary's "
+            "CPG often can't supply either — passing this flag runs them through "
+            "Joern anyway, on the chance the CPG resolves what Stage 3 couldn't."
+        ),
     )
     run.add_argument("--model", type=str, default=None, metavar="PROVIDER:MODEL")
     run.add_argument("--run-id", type=str, default=None)
@@ -138,6 +161,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _parse_decisions(raw: str) -> frozenset[Decision]:
+    """Parse `--decisions`' comma-separated string into a `frozenset[Decision]`,
+    raising `ValueError` with the exact bad token named on a typo rather than
+    letting an unrecognized value silently fall through as an empty filter."""
+    values = [v.strip() for v in raw.split(",") if v.strip()]
+    if not values:
+        raise ValueError("--decisions given but empty after parsing — pass at least one value.")
+    result = set()
+    for value in values:
+        try:
+            result.add(Decision(value))
+        except ValueError as exc:
+            valid = ", ".join(d.value for d in Decision)
+            raise ValueError(
+                f"Unknown --decisions value {value!r}. Valid values: {valid}."
+            ) from exc
+    return frozenset(result)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     settings = get_settings()
     updates: dict[str, object] = {}
@@ -150,6 +192,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     db_subfolder = Path(args.db_subfolder)
     only = frozenset(args.only) if args.only else None
+
+    decisions_kwargs: dict[str, object] = {}
+    if args.decisions is not None:
+        try:
+            decisions_kwargs["decisions"] = _parse_decisions(args.decisions)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
     try:
         summary = asyncio.run(
             run_queue(
@@ -157,6 +208,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 settings=settings,
                 only_global_ids=only,
                 run_id=args.run_id,
+                **decisions_kwargs,
             )
         )
     except Stage5InputError as exc:
