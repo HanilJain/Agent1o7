@@ -1,0 +1,91 @@
+{
+  "chunk_id": "vulnbin#0000",
+  "function_id": "vuln_path",
+  "findings": [
+    {
+      "finding_id": "candidate_001",
+      "title": "OS command injection via unsanitized argv[1] in vuln_path",
+      "category": "command_execution",
+      "cwe": ["CWE-78", "CWE-88"],
+      "severity": {
+        "impact": 5,
+        "exploitability": 4,
+        "reachability": 4
+      },
+      "confidence": "CONFIRMED",
+      "decision": "ESCALATE",
+      "tags": ["UNSAFE_OPERATION", "DATA_FLOW", "COMMAND_INJECTION"],
+      "evidence_span": {
+        "function_id": "vuln_path",
+        "line_start": 8,
+        "line_end": 19,
+        "code": "strcpy(buf, argv[1]);\nsnprintf(cmd, sizeof(cmd), \"echo %s\", buf);\nsystem(cmd);"
+      },
+      "source": {
+        "expression": "argv[1]",
+        "type": "FUNCTION_PARAMETER",
+        "attacker_control": "YES"
+      },
+      "sink": {
+        "expression": "system(cmd)",
+        "type": "COMMAND_EXECUTION"
+      },
+      "data_flow": [
+        "argv[1] copied unchecked into buf via strcpy",
+        "buf formatted unchecked into cmd via snprintf",
+        "cmd passed directly to system()"
+      ],
+      "security_condition": "attacker-controlled argv[1] reaches system() with no sanitization",
+      "exploitability": "any caller-supplied argv[1] containing shell metacharacters executes arbitrary commands",
+      "impact": "arbitrary command execution",
+      "why_vulnerable": "no length check, no shell-metacharacter escaping before system()",
+      "why_not_false_positive": "direct, unguarded data flow from parameter to system() with no intervening validation",
+      "missing_context": [],
+      "recommended_next_analysis": ["confirm dynamically with a crafted argv[1] payload"]
+    },
+    {
+      "finding_id": "candidate_002",
+      "title": "Candidate command execution in safe_path (expected: refuted)",
+      "category": "command_execution",
+      "cwe": ["CWE-78"],
+      "severity": {
+        "impact": 3,
+        "exploitability": 2,
+        "reachability": 3
+      },
+      "confidence": "MEDIUM",
+      "decision": "ESCALATE",
+      "tags": ["UNSAFE_OPERATION", "DATA_FLOW"],
+      "evidence_span": {
+        "function_id": "safe_path",
+        "line_start": 24,
+        "line_end": 31,
+        "code": "strncpy(buf, argv[1], sizeof(buf) - 1);\nsystem(\"echo fixed-safe-command\");"
+      },
+      "source": {
+        "expression": "argv[1]",
+        "type": "FUNCTION_PARAMETER",
+        "attacker_control": "YES"
+      },
+      "sink": {
+        "expression": "system(\"echo fixed-safe-command\")",
+        "type": "COMMAND_EXECUTION"
+      },
+      "data_flow": [
+        "argv[1] copied bounds-checked into buf via strncpy",
+        "buf is never referenced by the system() call, which uses a fixed string literal"
+      ],
+      "security_condition": "argv[1] does NOT reach the system() call at all -- the command argument is a constant",
+      "exploitability": "none established -- the sink's argument does not depend on the source",
+      "impact": "none if the flow is genuinely absent, as claimed",
+      "why_vulnerable": "flagged defensively due to co-located strncpy + system() calls in the same function",
+      "why_not_false_positive": "included to exercise the verifier's REFUTED path -- a real analyst would likely have discarded this, but it is a legitimate reachability question for Joern to settle",
+      "missing_context": [],
+      "recommended_next_analysis": ["confirm via CPG dataflow query that buf never reaches the system() argument"]
+    }
+  ],
+  "checked_categories": [],
+  "analysis_limitations": [
+    "Synthetic fixture source written for Stage 5 integration testing -- not real firmware."
+  ]
+}

@@ -1,4 +1,5 @@
-"""Stage 5: sandboxed verification — Joern tool-calling agent (v1).
+"""Stage 5: sandboxed verification — a deterministic generator/evaluator
+Joern loop with two LLM roles and no tool-calling (v1).
 
 Proves/disproves a Stage 3 finding by actually building a CPG for its
 binary and running Joern/CPGQL queries against it, rather than trusting the

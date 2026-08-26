@@ -1,195 +1,300 @@
-"""Tests for `fw_audit.stage5_verification.agent.graph` — routing and the
-iteration cap, using a duck-typed fake LLM (not a real `BaseChatModel`
-subclass — `build_verifier_graph` only ever calls `.bind_tools()` and
-`.with_structured_output()` on `llm`, so a minimal stand-in exercising
-exactly that surface is enough, and keeps this test independent of any
-provider SDK)."""
+"""Tests for `fw_audit.stage5_verification.agent.graph` — the
+generate/run/evaluate loop. Uses a duck-typed fake LLM (the graph only ever
+calls `.ainvoke(messages) -> AIMessage` — no `bind_tools`, no
+`with_structured_output`; that IS the point of this design) and the shared
+`FakeExecutor` fixture for Joern (no real Docker/Joern involved)."""
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage
-from langchain_core.tools import tool
+import json
+from pathlib import Path
 
-from fw_audit.common.verification import VerificationVerdict, VerifierVerdict
+from langchain_core.messages import AIMessage
+
+from fw_audit.common.verification import VerificationVerdict
+from fw_audit.config.settings import Settings
+from fw_audit.executors.base import ExecutionResult
 from fw_audit.stage5_verification.agent.graph import build_verifier_graph
 
 
-@tool
-async def fake_tool(x: str) -> str:
-    """A trivial tool for routing tests."""
-    return f"handled {x}"
+class _ScriptedLLM:
+    """The new graph only ever calls `.ainvoke(messages) -> AIMessage` —
+    that is the whole surface. No bind_tools, no with_structured_output."""
 
-
-class _ScriptedRunnable:
-    """Returns/raises each item of `outputs` in turn on successive
-    `ainvoke` calls — an `Exception` instance in the sequence is raised
-    instead of returned."""
-
-    def __init__(self, outputs: list) -> None:
-        self._outputs = list(outputs)
+    def __init__(self, responses: list) -> None:
+        self._responses = list(responses)
         self.calls: list = []
 
     async def ainvoke(self, messages):
         self.calls.append(messages)
-        item = self._outputs.pop(0)
+        item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        return AIMessage(content=item)
 
 
-class _FakeLLM:
-    def __init__(
-        self,
-        *,
-        tool_call_outputs: list,
-        verdict: VerifierVerdict,
-        structured_outputs: list | None = None,
-    ) -> None:
-        self._tool_call_outputs = tool_call_outputs
-        # `structured_outputs`, when given, overrides the single-verdict
-        # default — lets a test script a ValidationError followed by a
-        # real verdict, to exercise the finalize node's repair retry.
-        self._structured_outputs = (
-            structured_outputs if structured_outputs is not None else [verdict]
+def _make_executor(fake_executor_cls, *, script_outputs: list[str] | None = None):
+    """A FakeExecutor that succeeds `joern-parse` (writing cpg.bin) and
+    returns each of `script_outputs` in turn for successive `joern --script`
+    calls (defaulting to empty stdout if exhausted)."""
+    script_outputs = list(script_outputs or [])
+
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            (files / "cpg.bin").write_bytes(b"cpg")
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
+            )
+        stdout = script_outputs.pop(0) if script_outputs else ""
+        return ExecutionResult(
+            command=command, returncode=0, stdout=stdout, stderr="", timed_out=False
         )
-        self.bound_runnable: _ScriptedRunnable | None = None
-        self.structured_runnable: _ScriptedRunnable | None = None
 
-    def bind_tools(self, tools):
-        self.bound_runnable = _ScriptedRunnable(self._tool_call_outputs)
-        return self.bound_runnable
-
-    def with_structured_output(self, schema):
-        self.structured_runnable = _ScriptedRunnable(self._structured_outputs)
-        return self.structured_runnable
+    return fake_executor_cls(on_run)
 
 
-def _tool_call_message(tool_name: str, call_id: str = "call_1") -> AIMessage:
-    return AIMessage(
-        content="",
-        tool_calls=[{"name": tool_name, "args": {"x": "1"}, "id": call_id}],
+def _verdict_json(
+    verdict: str, *, confidence: str = "HIGH", reasoning: str = "ok", feedback: str = ""
+) -> str:
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "feedback_for_retry": feedback,
+        }
     )
 
 
-def _final_message() -> AIMessage:
-    return AIMessage(content="done, no more tools needed.")
+def _failing_cpg_executor(fake_executor_cls):
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            return ExecutionResult(
+                command=command, returncode=1, stdout="", stderr="parse error", timed_out=False
+            )
+        return None
+
+    return fake_executor_cls(on_run)
 
 
-def _verdict(verdict: VerificationVerdict = VerificationVerdict.CONFIRMED) -> VerifierVerdict:
-    return VerifierVerdict(
-        verdict=verdict,
-        confidence="HIGH",
-        summary="s",
-        evidence="e",
-        recommended_next_steps=[],
+async def _run_graph(
+    *,
+    workspace_dir: Path,
+    executor,
+    generator_responses: list,
+    evaluator_responses: list,
+    max_iterations: int = 5,
+    repair_attempts: int = 1,
+):
+    cpg_build_holder: list = []
+    attempts: list = []
+    generator = _ScriptedLLM(generator_responses)
+    evaluator = _ScriptedLLM(evaluator_responses)
+    settings = Settings(_env_file=None, stage5_repair_attempts=repair_attempts)
+
+    graph = build_verifier_graph(
+        llm=generator,
+        evaluator_llm=evaluator,
+        workspace_dir=workspace_dir,
+        executor=executor,
+        settings=settings,
+        max_iterations=max_iterations,
+        cpg_build_holder=cpg_build_holder,
+        attempts=attempts,
     )
+    initial_state = {
+        "brief": "brief text",
+        "system_prompt": "system prompt text",
+        "max_iterations": max_iterations,
+        "transcript": [],
+    }
+    result = await graph.ainvoke(initial_state)
+    return result, generator, evaluator, cpg_build_holder, attempts
 
 
-async def test_agent_stops_when_llm_calls_no_tools():
-    llm = _FakeLLM(tool_call_outputs=[_final_message()], verdict=_verdict())
-    graph = build_verifier_graph(llm=llm, tools=[fake_tool], max_iterations=5)
-
-    result = await graph.ainvoke({"messages": [], "iterations": 0, "verdict": None})
-
+async def test_pass_with_flow_found_marker_yields_confirmed(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_FOUND (1 path(s))"])
+    result, generator, evaluator, cpg_holder, attempts = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=['println("RESULT: FLOW_FOUND (1 path(s))")'],
+        evaluator_responses=[_verdict_json("PASS", reasoning="found it")],
+    )
     assert result["verdict"] == VerificationVerdict.CONFIRMED
-    assert result["iterations"] == 1
-    assert len(llm.bound_runnable.calls) == 1  # only one agent turn
+    assert len(generator.calls) == 1
+    assert len(attempts) == 1
+    assert attempts[0].evaluator_verdict == "PASS"
 
 
-async def test_agent_loops_through_tool_call_then_finalizes():
-    llm = _FakeLLM(
-        tool_call_outputs=[_tool_call_message("fake_tool"), _final_message()],
-        verdict=_verdict(VerificationVerdict.REFUTED),
+async def test_pass_with_flow_not_found_marker_yields_refuted(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_NOT_FOUND"])
+    result, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=['println("RESULT: FLOW_NOT_FOUND")'],
+        evaluator_responses=[_verdict_json("PASS", reasoning="clean not-found")],
     )
-    graph = build_verifier_graph(llm=llm, tools=[fake_tool], max_iterations=5)
-
-    result = await graph.ainvoke({"messages": [], "iterations": 0, "verdict": None})
-
     assert result["verdict"] == VerificationVerdict.REFUTED
-    assert result["iterations"] == 2  # one turn that called a tool, one final turn
-    # the ToolMessage from fake_tool should be present in the transcript
-    tool_messages = [m for m in result["messages"] if getattr(m, "type", None) == "tool"]
-    assert any("handled 1" in m.content for m in tool_messages)
 
 
-async def test_iteration_cap_forces_finalize_even_with_pending_tool_call():
-    # The LLM always wants to call a tool — without the cap this would loop forever.
-    llm = _FakeLLM(
-        tool_call_outputs=[_tool_call_message("fake_tool", f"call_{i}") for i in range(10)],
-        verdict=_verdict(VerificationVerdict.INCONCLUSIVE),
+async def test_pass_without_any_marker_yields_inconclusive(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["some output with no marker"])
+    result, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=["println(cpg.method.name.l)"],
+        evaluator_responses=[_verdict_json("PASS", confidence="LOW", reasoning="inconclusive")],
     )
-    graph = build_verifier_graph(llm=llm, tools=[fake_tool], max_iterations=2)
-
-    result = await graph.ainvoke({"messages": [], "iterations": 0, "verdict": None})
-
     assert result["verdict"] == VerificationVerdict.INCONCLUSIVE
-    assert result["iterations"] == 2
 
 
-async def test_dangling_tool_call_gets_placeholder_before_finalize():
-    """Regression test: if the cap is hit right as the agent requests a
-    tool call, finalize must not send a dangling tool_calls entry."""
-    llm = _FakeLLM(
-        tool_call_outputs=[_tool_call_message("fake_tool")],
-        verdict=_verdict(),
+async def test_fail_stop_yields_error(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["RESULT: QUERY_ERROR"])
+    result, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=["broken script"],
+        evaluator_responses=[
+            _verdict_json("FAIL_STOP", confidence="LOW", reasoning="unrecoverable")
+        ],
     )
-    graph = build_verifier_graph(llm=llm, tools=[fake_tool], max_iterations=1)
+    assert result["verdict"] == VerificationVerdict.ERROR
 
-    await graph.ainvoke({"messages": [], "iterations": 0, "verdict": None})
 
-    finalize_messages = llm.structured_runnable.calls[0]
-    # The AIMessage with the tool call must be immediately followed by a
-    # ToolMessage response before any later HumanMessage.
-    ai_idx = next(
-        i for i, m in enumerate(finalize_messages) if getattr(m, "tool_calls", None)
+async def test_fail_retry_regenerates_with_feedback_in_prompt(fake_executor, tmp_path):
+    executor = _make_executor(
+        fake_executor, script_outputs=["broken", "RESULT: FLOW_FOUND (1 path(s))"]
     )
-    assert getattr(finalize_messages[ai_idx + 1], "type", None) == "tool"
-
-
-async def test_repair_retry_on_validation_error():
-    """A structured-output call that raises ValidationError once should be
-    retried with the error fed back, per stage3's established pattern."""
-    from pydantic import ValidationError
-
-    try:
-        VerifierVerdict.model_validate({"verdict": "not-a-real-verdict"})
-        raise AssertionError("expected ValidationError")
-    except ValidationError as exc:
-        validation_error = exc
-
-    llm = _FakeLLM(
-        tool_call_outputs=[_final_message()],
-        verdict=_verdict(),
-        structured_outputs=[validation_error, _verdict()],
+    result, generator, evaluator, _, attempts = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=["bad script v1", "fixed script v2"],
+        evaluator_responses=[
+            _verdict_json(
+                "FAIL_RETRY", confidence="LOW", reasoning="broken", feedback="you forgot println"
+            ),
+            _verdict_json("PASS", reasoning="found it"),
+        ],
     )
-    graph = build_verifier_graph(llm=llm, tools=[fake_tool], max_iterations=5, repair_attempts=1)
-
-    result = await graph.ainvoke({"messages": [], "iterations": 0, "verdict": None})
-
-    assert len(llm.structured_runnable.calls) == 2
     assert result["verdict"] == VerificationVerdict.CONFIRMED
-    # the second call's messages must include the repair-request feedback
-    second_call_text = " ".join(str(m.content) for m in llm.structured_runnable.calls[1])
-    assert "failed schema validation" in second_call_text
+    assert len(generator.calls) == 2
+    assert len(attempts) == 2
+    second_call_text = " ".join(str(m.content) for m in generator.calls[1])
+    assert "you forgot println" in second_call_text
+    assert "bad script v1" in second_call_text
 
 
-async def test_repair_attempts_exhausted_raises():
-    from pydantic import ValidationError
-
-    try:
-        VerifierVerdict.model_validate({"verdict": "not-a-real-verdict"})
-        raise AssertionError("expected ValidationError")
-    except ValidationError as exc:
-        validation_error = exc
-
-    llm = _FakeLLM(
-        tool_call_outputs=[_final_message()],
-        verdict=_verdict(),
-        structured_outputs=[validation_error, validation_error],
+async def test_fail_retry_at_cap_downgrades_to_fail_stop_and_errors(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["broken", "still broken"])
+    result, generator, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=["bad v1", "bad v2"],
+        evaluator_responses=[
+            _verdict_json("FAIL_RETRY", confidence="LOW", reasoning="broken v1", feedback="fix it"),
+            _verdict_json(
+                "FAIL_RETRY", confidence="LOW", reasoning="broken v2", feedback="fix more"
+            ),
+        ],
+        max_iterations=2,
     )
-    graph = build_verifier_graph(llm=llm, tools=[fake_tool], max_iterations=5, repair_attempts=1)
+    assert len(generator.calls) == 2
+    assert result["verdict"] == VerificationVerdict.ERROR
+    assert "max_iterations" in result["verdict_summary"]
 
-    import pytest
 
-    with pytest.raises(ValidationError):
-        await graph.ainvoke({"messages": [], "iterations": 0, "verdict": None})
+async def test_cpg_build_failure_short_circuits_to_error_without_calling_llm(
+    fake_executor, tmp_path
+):
+    executor = _failing_cpg_executor(fake_executor)
+    result, generator, evaluator, cpg_holder, attempts = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=[],
+        evaluator_responses=[],
+    )
+    assert result["verdict"] == VerificationVerdict.ERROR
+    assert len(generator.calls) == 0
+    assert len(evaluator.calls) == 0
+    assert len(attempts) == 0
+    assert cpg_holder[0].ok is False
+
+
+async def test_evaluator_think_block_and_fences_are_stripped(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_FOUND (1 path(s))"])
+    result, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=['println("RESULT: FLOW_FOUND (1 path(s))")'],
+        evaluator_responses=[
+            "<think>let me consider this</think>```json\n" + _verdict_json("PASS") + "\n```"
+        ],
+    )
+    assert result["verdict"] == VerificationVerdict.CONFIRMED
+
+
+async def test_unparseable_evaluator_response_becomes_fail_stop(fake_executor, tmp_path):
+    # Behaviour INVERTS from the old tool-calling graph: that graph RAISED
+    # when repair attempts were exhausted on a bad structured-output call.
+    # This graph never raises -- it degrades to FAIL_STOP -> ERROR, since a
+    # local model's evaluator response failing to parse is an expected,
+    # recoverable-at-the-report-level outcome, not a program bug.
+    executor = _make_executor(fake_executor, script_outputs=["some output"])
+    result, generator, evaluator, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=["a script"],
+        evaluator_responses=["not json at all", "still not json"],
+        repair_attempts=1,
+    )
+    assert len(evaluator.calls) == 2
+    assert result["verdict"] == VerificationVerdict.ERROR
+
+
+async def test_evaluator_json_repair_retry_succeeds_on_second_attempt(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_NOT_FOUND"])
+    result, generator, evaluator, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=["a script"],
+        evaluator_responses=["garbage, not json", _verdict_json("PASS", reasoning="clean")],
+        repair_attempts=1,
+    )
+    assert len(evaluator.calls) == 2
+    assert result["verdict"] == VerificationVerdict.REFUTED
+
+
+async def test_attempts_list_records_evaluator_verdict_per_attempt(fake_executor, tmp_path):
+    executor = _make_executor(
+        fake_executor, script_outputs=["broken", "RESULT: FLOW_FOUND (1 path(s))"]
+    )
+    result, generator, evaluator, _, attempts = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=["v1", "v2"],
+        evaluator_responses=[
+            _verdict_json("FAIL_RETRY", confidence="LOW", reasoning="broken", feedback="fix"),
+            _verdict_json("PASS", reasoning="found"),
+        ],
+    )
+    assert len(attempts) == 2
+    assert attempts[0].evaluator_verdict == "FAIL_RETRY"
+    assert attempts[0].iteration == 1
+    assert attempts[1].evaluator_verdict == "PASS"
+    assert attempts[1].iteration == 2
+    assert attempts[1].result_marker == "FLOW_FOUND"
+
+
+async def test_transcript_entries_emitted_in_order_with_contiguous_turns(fake_executor, tmp_path):
+    executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_FOUND (1 path(s))"])
+    result, *_ = await _run_graph(
+        workspace_dir=tmp_path,
+        executor=executor,
+        generator_responses=['println("RESULT: FLOW_FOUND (1 path(s))")'],
+        evaluator_responses=[_verdict_json("PASS", reasoning="found it")],
+    )
+    transcript = result["transcript"]
+    turns = [e.turn for e in transcript]
+    assert turns == list(range(len(transcript)))
+    roles = [e.role for e in transcript]
+    assert roles == ["tool", "ai", "tool", "ai", "ai"]

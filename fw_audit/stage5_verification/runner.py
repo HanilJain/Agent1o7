@@ -1,4 +1,4 @@
-"""CLI entry point for Stage 5 (Sandboxed Verification — Joern agent).
+"""CLI entry point for Stage 5 (Sandboxed Verification — Joern generate/evaluate pipeline).
 
 Registered as the `fw-verify` console script (see pyproject.toml). Usage:
 
@@ -63,7 +63,7 @@ def _print_transcript_entries(entries: list[TranscriptEntry]) -> None:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="fw-verify",
-        description="Stage 5: sandboxed verification — Joern tool-calling agent.",
+        description="Stage 5: sandboxed verification — Joern generate/run/evaluate pipeline.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

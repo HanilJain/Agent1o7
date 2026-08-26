@@ -1,9 +1,12 @@
-"""The verification agent's entry point: one `VerificationCandidate` in,
+"""The verification pipeline's entry point: one `VerificationCandidate` in,
 one validated `VerificationReport` out.
 
 Mirrors `stage3_analysis.agent.analyst.analyze_chunk`'s shape (`get_llm_for_agent`
 -> build a graph/chain -> invoke -> funnel failures into one module-specific
-error), extended for the multi-turn tool-calling loop `graph.py` wires.
+error), extended for the two-role generate/run/evaluate loop `graph.py` wires.
+Signature, return type, and the `on_step`/`system_prompt` contracts are
+UNCHANGED from the previous tool-calling agent — `driver.py`/`debug.py`/
+`runner.py` needed no changes for this replacement.
 """
 
 from __future__ import annotations
@@ -23,14 +26,18 @@ from fw_audit.common.verification import (
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings
 from fw_audit.stage5_verification import layout
-from fw_audit.stage5_verification.agent.graph import build_verifier_graph, messages_to_transcript
-from fw_audit.stage5_verification.agent.prompts import build_messages
+from fw_audit.stage5_verification.agent import transcript as tx
+from fw_audit.stage5_verification.agent.graph import build_verifier_graph
+from fw_audit.stage5_verification.agent.prompts import (
+    GENERATOR_SYSTEM_PROMPT,
+    render_finding_brief,
+)
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.errors import (
     SandboxUnavailableError,
     VerifierModelUnavailableError,
 )
-from fw_audit.stage5_verification.tools.joern_tool import build_joern_tools, joern_executor
+from fw_audit.stage5_verification.tools.joern_tool import joern_executor
 
 OnStep = Callable[[list[TranscriptEntry]], None]
 """Called once per graph step (see `verify_candidate`'s `on_step` param)
@@ -47,31 +54,31 @@ async def verify_candidate(
     system_prompt: str | None = None,
     on_step: OnStep | None = None,
 ) -> VerificationReport:
-    """Run the full build-CPG -> tool-calling-loop -> finalize pipeline for
-    one candidate, returning a `VerificationReport`. Does NOT persist
-    anything — that's `driver.py`'s job (or a debug caller's, for a dry run).
+    """Run the full build-CPG -> generate/run/evaluate loop -> conclude
+    pipeline for one candidate, returning a `VerificationReport`. Does NOT
+    persist anything — that's `driver.py`'s job (or a debug caller's, for a
+    dry run).
 
     Raises `SandboxUnavailableError` if `candidate.source_path` never
     resolved (see `candidate_index.discover_candidates`'s docstring) or the
     sandbox executor isn't reachable, and `VerifierModelUnavailableError` if
-    the configured `AgentRole.STAGE5_VERIFIER` model/credential can't be
-    resolved — both checked before any tool call, mirroring
-    `AnalysisUnavailableError`'s "no repair possible" transport-failure
-    contract.
+    either `AgentRole.STAGE5_SCRIPT_GENERATOR`/`AgentRole.STAGE5_RESULT_EVALUATOR`
+    model/credential can't be resolved — both checked before any Joern
+    invocation, mirroring `AnalysisUnavailableError`'s "no repair possible"
+    transport-failure contract.
 
-    `system_prompt` overrides `agent.prompts.SYSTEM_PROMPT` for this call
-    only — the `--prompt-file` debugging control (see `runner.py`).
+    `system_prompt` overrides `agent.prompts.GENERATOR_SYSTEM_PROMPT` for
+    this call only — the `--prompt-file` debugging control (see `runner.py`).
 
-    `on_step`, when given, is called after every graph node (agent turn,
-    tool execution, or finalize) with that step's newly-appended
-    `TranscriptEntry` objects — this is what lets `fw-verify debug verify`
-    print the agent's reasoning and tool calls live, turn by turn, instead
-    of only showing the finished report. When omitted (the default —
-    `driver.py`'s production path never passes one), the graph still runs
-    to completion the same way; only the live callback is skipped. Either
-    way, the RETURNED report's `transcript` field always has the complete
-    conversation — `on_step` is purely an additional live view, not the
-    only way to get this data.
+    `on_step`, when given, is called after every graph node (CPG build,
+    script generation, script execution, or evaluation) with that step's
+    newly-appended `TranscriptEntry` objects — this is what lets
+    `fw-verify debug verify` print the pipeline's progress live, turn by
+    turn, instead of only showing the finished report. When omitted (the
+    default — `driver.py`'s production path never passes one), the graph
+    still runs to completion the same way; only the live callback is
+    skipped. Either way, the RETURNED report's `transcript` field always
+    has the complete record — `on_step` is purely an additional live view.
     """
     if candidate.source_path is None:
         raise SandboxUnavailableError(
@@ -87,7 +94,8 @@ async def verify_candidate(
         )
 
     try:
-        llm = get_llm_for_agent(AgentRole.STAGE5_VERIFIER, settings=settings)
+        generator_llm = get_llm_for_agent(AgentRole.STAGE5_SCRIPT_GENERATOR, settings=settings)
+        evaluator_llm = get_llm_for_agent(AgentRole.STAGE5_RESULT_EVALUATOR, settings=settings)
     except (ImportError, ValueError) as exc:
         raise VerifierModelUnavailableError(str(exc)) from exc
 
@@ -98,35 +106,39 @@ async def verify_candidate(
 
     cpg_build_holder: list[CpgBuildRecord] = []
     attempts: list[JoernScriptAttempt] = []
-    tools = build_joern_tools(
+    graph = build_verifier_graph(
+        llm=generator_llm,
+        evaluator_llm=evaluator_llm,
         workspace_dir=workspace_dir_,
+        executor=executor,
         settings=settings,
+        max_iterations=settings.stage5_max_agent_iterations,
         cpg_build_holder=cpg_build_holder,
         attempts=attempts,
     )
-    graph = build_verifier_graph(
-        llm=llm,
-        tools=tools,
-        max_iterations=settings.stage5_max_agent_iterations,
-        repair_attempts=settings.stage5_repair_attempts,
+
+    brief = render_finding_brief(candidate)
+    effective_system_prompt = (
+        system_prompt if system_prompt is not None else GENERATOR_SYSTEM_PROMPT
     )
 
-    messages = build_messages(candidate)
-    if system_prompt is not None:
-        messages[0] = messages[0].model_copy(update={"content": system_prompt})
-
     started_at = datetime.now(UTC)
-    initial_state = {"messages": messages, "iterations": 0, "verdict": None}
+    initial_state = {
+        "brief": brief,
+        "system_prompt": system_prompt,
+        "max_iterations": settings.stage5_max_agent_iterations,
+        "transcript": tx.initial_transcript(system_prompt=effective_system_prompt, brief=brief),
+    }
     try:
         if on_step is None:
             final_state = await graph.ainvoke(initial_state)
         else:
             final_state = await _stream_with_callback(graph, initial_state, on_step)
     except (OSError, TimeoutError) as exc:
-        raise VerifierModelUnavailableError(f"verification agent call failed: {exc}") from exc
+        raise VerifierModelUnavailableError(f"verification pipeline call failed: {exc}") from exc
     finished_at = datetime.now(UTC)
 
-    transcript = messages_to_transcript(final_state.get("messages", []))
+    transcript = final_state.get("transcript", [])
 
     # Workspace cleanup (when Settings.stage5_keep_workspace is False) happens
     # in driver.py, AFTER the report is persisted — not here, so a debug
@@ -135,13 +147,13 @@ async def verify_candidate(
 
     verdict = final_state.get("verdict")
     if verdict is None:
-        # Should be unreachable: finalize_node always sets it or raises.
+        # Should be unreachable: conclude_node always sets it.
         verdict = VerificationVerdict.ERROR  # pragma: no cover - defensive
 
     return VerificationReport(
         global_id=candidate.global_id,
         bin_id=candidate.bin_id,
-        model=f"{_model_label(llm)}",
+        model=f"generator={_model_label(generator_llm)}, evaluator={_model_label(evaluator_llm)}",
         cpg_build=cpg_build_holder[0] if cpg_build_holder else CpgBuildRecord(),
         attempts=attempts,
         transcript=transcript,
@@ -161,19 +173,19 @@ async def _stream_with_callback(graph, initial_state: dict, on_step: OnStep) -> 
     transcript entries as they arrive.
 
     `stream_mode="values"` yields the FULL accumulated state after every
-    node runs (not a diff) — the previous message count is tracked here so
-    only the slice a given step actually added gets passed to `on_step`,
+    node runs (not a diff) — the previous transcript length is tracked here
+    so only the slice a given step actually added gets passed to `on_step`,
     never a growing prefix the caller would have to de-duplicate itself.
     Returns the final state, same shape `ainvoke` would have returned.
     """
     seen = 0
     state = initial_state
     async for state in graph.astream(initial_state, stream_mode="values"):
-        step_messages = state.get("messages", [])
-        new_messages = step_messages[seen:]
-        if new_messages:
-            on_step(messages_to_transcript(new_messages, start_turn=seen))
-        seen = len(step_messages)
+        step_entries = state.get("transcript", [])
+        new_entries = step_entries[seen:]
+        if new_entries:
+            on_step(new_entries)
+        seen = len(step_entries)
     return state
 
 

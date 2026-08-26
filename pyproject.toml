@@ -64,11 +64,13 @@ stage3 = ["tree-sitter==0.23.2", "tree-sitter-c==0.23.2"]
 # but installs the identical two packages either way.
 stage4 = ["chromadb>=0.5", "sentence-transformers>=3.0"]
 stage4-colab = ["chromadb>=0.5", "sentence-transformers>=3.0"]
-# Stage 5's verification agent (fw_audit.stage5_verification) needs no new
-# Python dependency of its own: tool-calling comes from langgraph/langchain-core
-# (already core deps), and qwen3-via-Ollama / Claude Sonnet routing reuses the
-# existing `ollama`/`anthropic` extras below. Kept as an explicit alias for
-# symmetry with stage2/stage4's `pip install -e ".[stage5]"` convention.
+# Stage 5's verification pipeline (fw_audit.stage5_verification) needs no
+# new Python dependency of its own: the generate/run/evaluate loop comes
+# from langgraph/langchain-core (already core deps; neither LLM role uses
+# tool-calling or with_structured_output), and qwen3-via-Ollama / Claude
+# Sonnet routing reuses the existing `ollama`/`anthropic` extras below.
+# Kept as an explicit alias for symmetry with stage2/stage4's
+# `pip install -e ".[stage5]"` convention.
 stage5 = ["langchain-ollama>=1.0.0", "langchain-anthropic>=1.0.0"]
 dev = [
     "pytest>=8.0",

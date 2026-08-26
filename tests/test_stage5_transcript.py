@@ -1,12 +1,10 @@
-"""Tests for the agent transcript feature: `agent.graph.messages_to_transcript`,
+"""Tests for the transcript feature: `agent.transcript`'s entry builders,
 `agent.verifier.verify_candidate`'s `on_step` streaming, and
 `report_writer`'s "Agent transcript" section."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from fw_audit.common.findings import (
     Confidence,
@@ -19,58 +17,102 @@ from fw_audit.common.findings import (
 )
 from fw_audit.common.verification import (
     CpgBuildRecord,
+    EvaluationVerdict,
+    EvaluatorVerdict,
+    JoernScriptAttempt,
     VerificationReport,
     VerificationVerdict,
 )
-from fw_audit.stage5_verification.agent.graph import messages_to_transcript
+from fw_audit.stage5_verification.agent import transcript as tx
 from fw_audit.stage5_verification.report_writer import render_report
 
+# --------------------------------------------------------------------- #
+# agent.transcript emitter functions
+# --------------------------------------------------------------------- #
 
-def test_messages_to_transcript_maps_each_role():
-    messages = [
-        SystemMessage(content="be a verifier"),
-        HumanMessage(content="verify this finding"),
-        AIMessage(
-            content="I'll build the CPG first.",
-            tool_calls=[{"name": "build_cpg", "args": {}, "id": "call_1"}],
-        ),
-        ToolMessage(content="CPG built successfully in 2.0s.", tool_call_id="call_1"),
-        AIMessage(content="CONFIRMED, based on the query output."),
-    ]
 
-    entries = messages_to_transcript(messages)
+def test_next_turn_is_current_transcript_length():
+    assert tx.next_turn({}) == 0
+    assert tx.next_turn({"transcript": []}) == 0
+    assert tx.next_turn({"transcript": [1, 2, 3]}) == 3
 
-    assert [e.role for e in entries] == ["system", "human", "ai", "tool", "ai"]
+
+def test_initial_transcript_maps_system_and_human_roles():
+    entries = tx.initial_transcript(system_prompt="be a verifier", brief="verify this finding")
+    assert [e.role for e in entries] == ["system", "human"]
     assert entries[0].turn == 0
+    assert entries[0].content == "be a verifier"
+    assert entries[1].turn == 1
     assert entries[1].content == "verify this finding"
-    assert entries[2].content == "I'll build the CPG first."
-    assert entries[2].tool_calls[0].name == "build_cpg"
-    assert entries[2].tool_calls[0].id == "call_1"
-    assert entries[3].tool_call_id == "call_1"
-    assert entries[3].content == "CPG built successfully in 2.0s."
-    assert entries[4].tool_calls == []
 
 
-def test_messages_to_transcript_start_turn_continues_numbering():
-    messages = [AIMessage(content="second batch")]
-    entries = messages_to_transcript(messages, start_turn=5)
-    assert entries[0].turn == 5
+def test_cpg_build_entry_ok():
+    record = CpgBuildRecord(command="joern-parse", ok=True, duration_seconds=2.0)
+    entry = tx.cpg_build_entry(2, record)
+    assert entry.role == "tool"
+    assert entry.tool_call_id == "build_cpg"
+    assert "successfully" in entry.content
 
 
-def test_messages_to_transcript_flattens_anthropic_style_content_blocks():
-    """Anthropic-style content is a list of blocks mixing text and tool_use
-    — only the text blocks should surface in `content`; the tool_use block
-    is redundant with `AIMessage.tool_calls` and would just duplicate noise."""
-    message = AIMessage(
-        content=[
-            {"type": "text", "text": "Let me check the CPG."},
-            {"type": "tool_use", "name": "run_joern_script", "input": {"script": "cpg.method.l"}},
-        ],
-        tool_calls=[{"name": "run_joern_script", "args": {"script": "cpg.method.l"}, "id": "c1"}],
+def test_cpg_build_entry_failure_includes_stderr():
+    record = CpgBuildRecord(command="joern-parse", ok=False, duration_seconds=1.0, stderr="boom")
+    entry = tx.cpg_build_entry(2, record)
+    assert "FAILED" in entry.content
+    assert "boom" in entry.content
+
+
+def test_generator_entry_synthesizes_tool_call():
+    entry = tx.generator_entry(3, script="println(1)", attempt_index=0, iteration=1)
+    assert entry.role == "ai"
+    assert entry.tool_calls[0].name == "run_joern_script"
+    assert entry.tool_calls[0].args == {"script": "println(1)"}
+    assert entry.tool_calls[0].id == "attempt_000"
+
+
+def test_execution_entry_ok_uses_stdout():
+    attempt = JoernScriptAttempt(
+        attempt_index=0, script="s", stdout="output", ok=True, returncode=0
     )
-    entries = messages_to_transcript([message])
-    assert entries[0].content == "Let me check the CPG."
-    assert "tool_use" not in entries[0].content
+    entry = tx.execution_entry(4, attempt)
+    assert entry.role == "tool"
+    assert entry.tool_call_id == "attempt_000"
+    assert entry.content == "output"
+
+
+def test_execution_entry_failure_includes_stderr():
+    attempt = JoernScriptAttempt(
+        attempt_index=2, script="s", stderr="syntax error", ok=False, returncode=1
+    )
+    entry = tx.execution_entry(4, attempt)
+    assert "FAILED" in entry.content
+    assert "syntax error" in entry.content
+    assert entry.tool_call_id == "attempt_002"
+
+
+def test_evaluator_entry_includes_verdict_and_feedback():
+    verdict = EvaluatorVerdict(
+        verdict=EvaluationVerdict.FAIL_RETRY,
+        confidence="LOW",
+        reasoning="broken script",
+        feedback_for_retry="add println",
+    )
+    entry = tx.evaluator_entry(5, verdict)
+    assert entry.role == "ai"
+    assert "FAIL_RETRY" in entry.content
+    assert "broken script" in entry.content
+    assert "add println" in entry.content
+
+
+def test_conclusion_entry():
+    entry = tx.conclusion_entry(6, verdict=VerificationVerdict.CONFIRMED, summary="looks good")
+    assert entry.role == "ai"
+    assert "CONFIRMED" in entry.content
+    assert "looks good" in entry.content
+
+
+# --------------------------------------------------------------------- #
+# verify_candidate on_step streaming
+# --------------------------------------------------------------------- #
 
 
 async def test_verify_candidate_on_step_receives_incremental_new_turns(tmp_path, monkeypatch):
@@ -113,26 +155,23 @@ async def test_verify_candidate_on_step_receives_incremental_new_turns(tmp_path,
 
         async def astream(self, initial_state, stream_mode):
             assert stream_mode == "values"
-            messages = list(initial_state["messages"])
-            yield {**initial_state, "messages": messages}
+            transcript = list(initial_state["transcript"])
+            yield {**initial_state, "transcript": transcript}
 
-            messages = [
-                *messages,
-                AIMessage(
-                    content="calling build_cpg",
-                    tool_calls=[{"name": "build_cpg", "args": {}, "id": "c1"}],
-                ),
-            ]
-            yield {**initial_state, "messages": messages, "iterations": 1}
+            transcript = [*transcript, tx.cpg_build_entry(len(transcript), CpgBuildRecord(ok=True))]
+            yield {**initial_state, "transcript": transcript}
 
-            messages = [*messages, ToolMessage(content="CPG built.", tool_call_id="c1")]
-            yield {**initial_state, "messages": messages, "iterations": 1}
+            attempt = JoernScriptAttempt(attempt_index=0, script="s", stdout="CPG built.", ok=True)
+            transcript = [*transcript, tx.execution_entry(len(transcript), attempt)]
+            yield {**initial_state, "transcript": transcript}
 
-            messages = [*messages, AIMessage(content="done")]
+            verdict = EvaluatorVerdict(
+                verdict=EvaluationVerdict.PASS, confidence="HIGH", reasoning="done"
+            )
+            transcript = [*transcript, tx.evaluator_entry(len(transcript), verdict)]
             yield {
                 **initial_state,
-                "messages": messages,
-                "iterations": 2,
+                "transcript": transcript,
                 "verdict": VerificationVerdict.CONFIRMED,
                 "verdict_confidence": "HIGH",
                 "verdict_summary": "s",
@@ -144,7 +183,6 @@ async def test_verify_candidate_on_step_receives_incremental_new_turns(tmp_path,
 
     monkeypatch.setattr(verifier_mod, "joern_executor", lambda settings: _FakeAvailableExecutor())
     monkeypatch.setattr(verifier_mod, "get_llm_for_agent", lambda role, settings=None: object())
-    monkeypatch.setattr(verifier_mod, "build_joern_tools", lambda **kwargs: [])
     monkeypatch.setattr(verifier_mod, "build_verifier_graph", lambda **kwargs: _FakeStreamGraph())
 
     received_batches: list[list] = []
@@ -159,14 +197,13 @@ async def test_verify_candidate_on_step_receives_incremental_new_turns(tmp_path,
         on_step=on_step,
     )
 
-    # LangGraph's stream_mode="values" yields the initial input state as its
-    # first value too (system+human, the task handed to the agent), so that
+    # stream_mode="values" yields the initial input state as its first
+    # value too (system+human, the task handed to the pipeline), so that
     # counts as one batch; the following 3 steps each add exactly one new
-    # message -> 4 callbacks total.
+    # entry -> 4 callbacks total.
     assert len(received_batches) == 4
     assert [e.role for e in received_batches[0]] == ["system", "human"]
-    assert received_batches[1][0].role == "ai"
-    assert received_batches[1][0].tool_calls[0].name == "build_cpg"
+    assert received_batches[1][0].role == "tool"
     assert received_batches[2][0].role == "tool"
     assert received_batches[2][0].content == "CPG built."
     assert received_batches[3][0].role == "ai"
@@ -180,7 +217,12 @@ async def test_verify_candidate_on_step_receives_incremental_new_turns(tmp_path,
     # and the returned report's full transcript must match what was streamed.
     assert report.verdict == VerificationVerdict.CONFIRMED
     non_system_roles = [e.role for e in report.transcript if e.role != "system"]
-    assert non_system_roles == ["human", "ai", "tool", "ai"]
+    assert non_system_roles == ["human", "tool", "tool", "ai"]
+
+
+# --------------------------------------------------------------------- #
+# report_writer's transcript rendering (unchanged behaviour, still exercised)
+# --------------------------------------------------------------------- #
 
 
 def _report_with_transcript() -> VerificationReport:
@@ -189,7 +231,7 @@ def _report_with_transcript() -> VerificationReport:
     return VerificationReport(
         global_id="bin#0000::c1",
         bin_id="bin",
-        model="anthropic:claude-sonnet-4-5",
+        model="generator=anthropic:claude-sonnet-4-5, evaluator=anthropic:claude-sonnet-4-5",
         cpg_build=CpgBuildRecord(command="joern-parse", ok=True, duration_seconds=1.0),
         transcript=[
             TranscriptEntry(turn=0, role="system", content="be a verifier"),

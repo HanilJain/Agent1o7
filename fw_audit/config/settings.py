@@ -392,13 +392,28 @@ class Settings(BaseSettings):
     )
     """Per-role override for `AgentRole.STAGE4_TAINT_ANALYST`."""
 
-    # ---- Stage 5: sandboxed verification (Joern tool-calling agent) ------
+    # ---- Stage 5: sandboxed verification (generator/evaluator Joern loop) -
     stage5_verifier_model: str | None = Field(
         default=None, validation_alias="FWA_STAGE5_VERIFIER_MODEL"
     )
-    """Per-role override for `AgentRole.STAGE5_VERIFIER`, same
-    `"<provider>:<model>"` syntax as `stage3_analyst_model` — e.g.
-    `"ollama:qwen3:8b"` to run verification against a local model."""
+    """Shared override applied to BOTH Stage 5 roles
+    (`AgentRole.STAGE5_SCRIPT_GENERATOR` and `AgentRole.STAGE5_RESULT_EVALUATOR`)
+    unless a role-specific override below is also set — same
+    `"<provider>:<model>"` syntax as `stage3_analyst_model`. This is what
+    `fw-verify run --model ...` writes, and the common way to point the
+    whole pipeline at one local model, e.g. `ollama:qwen3:32b`."""
+    stage5_generator_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_GENERATOR_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_SCRIPT_GENERATOR` specifically
+    — takes precedence over `stage5_verifier_model` for that role only.
+    Lets the script-writing role be pointed at a different model than the
+    judging role (e.g. a bigger/cheaper split)."""
+    stage5_evaluator_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_EVALUATOR_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_RESULT_EVALUATOR` specifically
+    — takes precedence over `stage5_verifier_model` for that role only."""
     stage5_joern_image: str = Field(
         default="fw-audit-joern:latest", validation_alias="FWA_STAGE5_JOERN_IMAGE"
     )
@@ -416,17 +431,22 @@ class Settings(BaseSettings):
     stage5_max_agent_iterations: int = Field(
         default=6, ge=1, validation_alias="FWA_STAGE5_MAX_AGENT_ITERATIONS"
     )
-    """Hard cap on tool-call round-trips in the verification agent's
-    LangGraph loop (`stage5_verification.agent.graph`) — once hit, the graph
-    force-routes to the finalize node regardless of pending tool calls.
-    Bounds runaway loops, especially important against a smaller local
-    model (e.g. Ollama qwen3) that may not reliably converge."""
+    """Hard cap on generate -> run -> evaluate rounds in the verification
+    pipeline (`stage5_verification.agent.graph`) — once hit, a `FAIL_RETRY`
+    verdict is downgraded to `FAIL_STOP` inside the evaluate node instead of
+    looping again, so `conclude` always sees a decisive verdict. Bounds
+    runaway loops, especially important against a smaller local model
+    (e.g. Ollama qwen3) that may not reliably converge."""
     stage5_repair_attempts: int = Field(
         default=1, ge=0, validation_alias="FWA_STAGE5_REPAIR_ATTEMPTS"
     )
-    """Extra in-process re-invocations the graph's finalize node makes when
-    the LLM's structured `VerifierVerdict` output fails Pydantic validation
-    — same pattern as `stage3_repair_attempts`/`stage4_repair_attempts`."""
+    """Extra in-process re-invocations the evaluate node makes when the
+    evaluator LLM's response never parses as `EvaluatorVerdict` JSON (after
+    `agent.cleaning` strips `<think>` blocks/fences) — before giving up and
+    treating it as `FAIL_STOP`. Same pattern as
+    `stage3_repair_attempts`/`stage4_repair_attempts`; matters more here
+    than it used to, since a local model's first response can occasionally
+    be nothing but an unterminated `<think>` block."""
     stage5_sandbox_memory: str = Field(
         default="4g", pattern=r"^\d+[mMgG]$", validation_alias="FWA_STAGE5_SANDBOX_MEMORY"
     )

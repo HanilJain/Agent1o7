@@ -113,11 +113,6 @@ async def test_verify_candidate_assembles_report_from_graph_state(tmp_path, monk
     source.write_text("int main(){}", encoding="utf-8")
     monkeypatch.setattr(verifier_mod, "joern_executor", lambda settings: _FakeAvailableExecutor())
     monkeypatch.setattr(verifier_mod, "get_llm_for_agent", lambda role, settings=None: object())
-    monkeypatch.setattr(
-        verifier_mod,
-        "build_joern_tools",
-        lambda **kwargs: [],
-    )
 
     final_state = {
         "verdict": VerificationVerdict.CONFIRMED,
@@ -154,7 +149,6 @@ async def test_system_prompt_override_replaces_system_message(tmp_path, monkeypa
     source.write_text("int main(){}", encoding="utf-8")
     monkeypatch.setattr(verifier_mod, "joern_executor", lambda settings: _FakeAvailableExecutor())
     monkeypatch.setattr(verifier_mod, "get_llm_for_agent", lambda role, settings=None: object())
-    monkeypatch.setattr(verifier_mod, "build_joern_tools", lambda **kwargs: [])
 
     final_state = {
         "verdict": VerificationVerdict.INCONCLUSIVE,
@@ -173,5 +167,6 @@ async def test_system_prompt_override_replaces_system_message(tmp_path, monkeypa
         system_prompt="CUSTOM PROMPT TEXT",
     )
 
-    sent_messages = fake_graph.invocations[0]["messages"]
-    assert sent_messages[0].content == "CUSTOM PROMPT TEXT"
+    invocation = fake_graph.invocations[0]
+    assert invocation["system_prompt"] == "CUSTOM PROMPT TEXT"
+    assert invocation["transcript"][0].content == "CUSTOM PROMPT TEXT"

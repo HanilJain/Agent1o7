@@ -113,14 +113,15 @@ async def debug_verify(
     settings: Settings | None = None,
     on_step: OnStep | None = None,
 ) -> VerificationReport:
-    """Runs the full agent loop for ONE finding — a dry run: returns the
-    `VerificationReport` without persisting it to `stage5/verifications/`
-    or `stage5/reports/` (use `fw-verify run` for the persisting version).
-    `prompt_override` replaces `agent.prompts.SYSTEM_PROMPT` for this call
-    only — the `--prompt-file` debugging control. `on_step`, when given, is
-    forwarded straight through to `agent.verifier.verify_candidate` — see
-    that function's docstring; `runner.py`'s `fw-verify debug verify` uses
-    this to print the agent's reasoning and tool calls live as they happen."""
+    """Runs the full generate/run/evaluate pipeline for ONE finding — a dry
+    run: returns the `VerificationReport` without persisting it to
+    `stage5/verifications/` or `stage5/reports/` (use `fw-verify run` for
+    the persisting version). `prompt_override` replaces
+    `agent.prompts.GENERATOR_SYSTEM_PROMPT` for this call only — the
+    `--prompt-file` debugging control. `on_step`, when given, is forwarded
+    straight through to `agent.verifier.verify_candidate` — see that
+    function's docstring; `runner.py`'s `fw-verify debug verify` uses this
+    to print the pipeline's progress live as it happens."""
     settings = settings or get_settings()
     candidate = _find_candidate(db_subfolder, global_id)
     return await verify_candidate(

@@ -1,10 +1,10 @@
-"""The Joern tool: `build_cpg` + `run_joern_script`, bound to the
-verification agent via LangGraph.
+"""The Joern invocation primitives: `build_cpg_async` + `run_joern_script_async`,
+called directly by `agent.graph`'s `build_cpg`/`run_script` nodes.
 
-Command composition lives here, never in the LLM's control — the agent
-supplies only WHEN to call which tool and, for `run_joern_script`, the
-Scala/CPGQL script BODY. Everything else (the `docker run`/`joern-parse`/
-`joern --script` invocation itself) is composed by this module.
+Command composition lives here, never in the LLM's control — the generator
+LLM supplies only the Scala/CPGQL script BODY (see `agent/prompts.py`).
+Everything else (the `docker run`/`joern-parse`/`joern --script` invocation
+itself) is composed by this module.
 
 CPG lifecycle (see `stage5_verification`'s `README.md`/`CLAUDE.md` for the
 full rationale): `build_cpg` writes `cpg.bin` into the host-mounted
@@ -53,8 +53,6 @@ from __future__ import annotations
 import shlex
 import time
 from pathlib import Path
-
-from langchain_core.tools import BaseTool, tool
 
 from fw_audit.common.verification import CpgBuildRecord, JoernScriptAttempt
 from fw_audit.config.settings import Settings, get_settings
@@ -157,77 +155,6 @@ async def run_joern_script_async(
     )
 
 
-def build_joern_tools(
-    *,
-    workspace_dir: Path,
-    settings: Settings,
-    cpg_build_holder: list[CpgBuildRecord],
-    attempts: list[JoernScriptAttempt],
-) -> list[BaseTool]:
-    """Construct the two Joern tools, closure-bound to one candidate's
-    workspace/settings and to shared mutable result lists.
-
-    The shared lists are how the graph recovers full attempt detail
-    (returncode/stderr/timing) for `VerificationReport` — the `ToolNode`
-    only ever sees each tool's returned STRING (what the LLM reads), not
-    these richer records. Appended to only from within an awaited tool
-    call on the single event loop, no lock needed — same reasoning
-    `stage3_analysis.agent.consumer.AnalysisConsumer.records` documents
-    for its own shared list.
-    """
-    executor = joern_executor(settings)
-
-    @tool
-    async def build_cpg() -> str:
-        """Parse the candidate's source file into a Code Property Graph
-        (CPG) via `joern-parse`. Call this FIRST, exactly once, before any
-        `run_joern_script` call — every script call loads the CPG this
-        produces. Returns a short success/failure summary; on failure the
-        summary includes the tail of Joern's stderr."""
-        record = await build_cpg_async(
-            workspace_dir=workspace_dir, executor=executor, settings=settings
-        )
-        cpg_build_holder.clear()
-        cpg_build_holder.append(record)
-        if record.ok:
-            return f"CPG built successfully in {record.duration_seconds:.1f}s."
-        return (
-            f"CPG build FAILED after {record.duration_seconds:.1f}s. "
-            f"stderr:\n{record.stderr[-2000:]}"
-        )
-
-    @tool
-    async def run_joern_script(script: str) -> str:
-        """Run a Scala/CPGQL Joern script against the CPG `build_cpg`
-        already produced. `script` is the full body of a `.sc` file — the
-        CPG is already loaded as `cpg` when your script runs. IMPORTANT:
-        headless execution does NOT auto-print expression results the way
-        the interactive Joern shell does — wrap whatever you want to see in
-        `println(...)` (e.g. `println(cpg.method.name.l)`), or your script
-        will "succeed" with empty output. If the script errors, or its
-        output doesn't clearly confirm or refute the finding, write a
-        different or refined script and call this again — you have a
-        bounded number of attempts. Returns Joern's stdout (or an error
-        summary) as plain text."""
-        attempt_index = len(attempts)
-        attempt = await run_joern_script_async(
-            script,
-            attempt_index=attempt_index,
-            workspace_dir=workspace_dir,
-            executor=executor,
-            settings=settings,
-        )
-        attempts.append(attempt)
-        if not attempt.ok:
-            return (
-                f"Script attempt {attempt_index} FAILED (returncode={attempt.returncode}). "
-                f"stderr:\n{attempt.stderr[-2000:]}"
-            )
-        return attempt.stdout or "(script ran successfully but produced no stdout output)"
-
-    return [build_cpg, run_joern_script]
-
-
 def container_source_path() -> str:
     """The in-container path `build_cpg`'s `joern-parse` reads — the
     workspace is bind-mounted at `CONTAINER_WORKDIR`, and the source file
@@ -239,7 +166,6 @@ __all__ = [
     "CPG_FILENAME",
     "SOURCE_FILENAME",
     "build_cpg_async",
-    "build_joern_tools",
     "joern_executor",
     "joern_parse_command",
     "joern_script_command",

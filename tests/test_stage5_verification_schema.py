@@ -9,24 +9,48 @@ from datetime import UTC, datetime
 from fw_audit.common.verification import (
     CandidateRunRecord,
     CpgBuildRecord,
+    EvaluationVerdict,
+    EvaluatorVerdict,
     JoernScriptAttempt,
     VerificationReport,
     VerificationRunSummary,
     VerificationVerdict,
-    VerifierVerdict,
 )
 
 
-def test_verifier_verdict_round_trips_through_json():
-    verdict = VerifierVerdict(
-        verdict=VerificationVerdict.CONFIRMED,
+def test_evaluator_verdict_round_trips_through_json():
+    verdict = EvaluatorVerdict(
+        verdict=EvaluationVerdict.PASS,
         confidence="HIGH",
-        summary="s",
-        evidence="e",
-        recommended_next_steps=["do x"],
+        reasoning="the script ran and clearly settled the question",
+        feedback_for_retry="",
     )
-    parsed = VerifierVerdict.model_validate_json(verdict.model_dump_json())
+    parsed = EvaluatorVerdict.model_validate_json(verdict.model_dump_json())
     assert parsed == verdict
+
+
+def test_evaluator_verdict_rejects_unknown_verdict():
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        EvaluatorVerdict.model_validate({"verdict": "NOT_A_REAL_VERDICT"})
+
+
+def test_evaluation_verdict_enum_values():
+    assert {v.value for v in EvaluationVerdict} == {"PASS", "FAIL_RETRY", "FAIL_STOP"}
+
+
+def test_joern_script_attempt_evaluator_fields_default_empty():
+    # Guards backward compatibility: an already-persisted verifications/*.json
+    # written before these fields existed must still validate.
+    attempt = JoernScriptAttempt(attempt_index=0, script="cpg.method.l", ok=True)
+    assert attempt.iteration == 0
+    assert attempt.result_marker is None
+    assert attempt.evaluator_verdict is None
+    assert attempt.evaluator_confidence == ""
+    assert attempt.evaluator_reasoning == ""
+    assert attempt.evaluator_feedback == ""
 
 
 def test_verification_report_round_trips_through_json():

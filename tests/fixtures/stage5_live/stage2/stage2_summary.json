@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-run-0001",
+  "stage1_run_id": "fixture-stage1-0001",
+  "status": "completed",
+  "db_subfolder": "tests/fixtures/stage5_live",
+  "rootfs_dir": "tests/fixtures/stage5_live/rootfs",
+  "stage2_dir": "tests/fixtures/stage5_live/stage2",
+  "decompiled_tree_dir": "",
+  "ghidra_image": "fw-audit-ghidra:latest",
+  "ghidra_version": null,
+  "binaries": [
+    {
+      "bin_id": "vulnbin",
+      "rootfs_path": "bin/vulnbin",
+      "requested_path": "bin/vulnbin",
+      "aliases": [],
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 12345,
+      "elf": null,
+      "ghidra_language_id": null,
+      "status": "succeeded",
+      "function_count": 3,
+      "decompiled_function_count": 3,
+      "skipped_function_count": 0,
+      "functions": [],
+      "imports": [],
+      "exports": [],
+      "cleaned_function_count": 3,
+      "dropped_line_count": 0,
+      "artifacts": {
+        "raw_c": null,
+        "raw_header": null,
+        "metadata_json": null,
+        "normalized_joern_c": "stage2/binaries/vulnbin/normalized/joern/whole.c",
+        "ghidra_log": null,
+        "decompiled_tree_c": null,
+        "cleaned_c": null,
+        "cleaned_index_json": null
+      },
+      "warnings": [],
+      "errors": []
+    }
+  ],
+  "unresolved": [],
+  "warnings": [],
+  "errors": [],
+  "started_at": "2026-08-26T00:00:00Z",
+  "finished_at": "2026-08-26T00:00:01Z"
+}

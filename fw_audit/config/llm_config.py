@@ -92,14 +92,32 @@ class AgentRole(str, Enum):
     Component 4's retrieved context + the original Stage 3 finding to build
     a structured `TaintPathReport`. No tool access."""
     STAGE5_VERIFIER = "stage5_verifier"
-    """Stage 5's Joern verification agent (`stage5_verification.agent`): the
-    first role in this repo with actual tool access (`build_cpg`,
-    `run_joern_script`, bound via LangGraph) rather than a one-shot
-    structured-output call. Routed to HIGH_REASONING by default (Claude
-    Sonnet) — same reasoning as Stage 3/4's roles — but commonly overridden
-    to a local Ollama model (e.g. `FWA_STAGE5_VERIFIER_MODEL=ollama:qwen3:8b`)
-    for offline/cheap iteration; a weaker model just means the bounded
-    `stage5_max_agent_iterations`/`stage5_repair_attempts` retries matter more."""
+    """Kept as the SHARED fallback override for both Stage 5 roles below
+    (see `_ROLE_OVERRIDE_SETTINGS_FIELD`) — not used to build a model
+    directly. `Settings.stage5_verifier_model`/`--model` set this role's
+    override field, which both `STAGE5_SCRIPT_GENERATOR` and
+    `STAGE5_RESULT_EVALUATOR` fall back to when their own role-specific
+    override isn't set — so one `FWA_STAGE5_VERIFIER_MODEL=ollama:qwen3:32b`
+    (or `fw-verify run --model ...`) still points the whole pipeline at one
+    model, exactly as before this role split existed."""
+    STAGE5_SCRIPT_GENERATOR = "stage5_script_generator"
+    """Stage 5's script-writing role (`stage5_verification.agent.graph`'s
+    `generate_script` node): given one finding, writes a Joern/CPGQL script
+    per round. Plain text in/text out — no tool-calling, no structured
+    output — specifically so this runs reliably on a local Ollama model
+    (e.g. `FWA_STAGE5_GENERATOR_MODEL=ollama:qwen3:32b`). Routed to
+    HIGH_REASONING by default (Claude Sonnet, via the Anthropic API — this
+    requires a paid `ANTHROPIC_API_KEY`, not merely a Claude Code/claude.ai
+    login) like Stage 3/4's roles, but the local-Ollama path is the
+    supported, tested-against configuration for this role specifically."""
+    STAGE5_RESULT_EVALUATOR = "stage5_result_evaluator"
+    """Stage 5's judging role (`stage5_verification.agent.graph`'s
+    `evaluate` node): reads one round's script + Joern output and returns a
+    `common.verification.EvaluatorVerdict` as plain JSON text (parsed via
+    `agent.cleaning`, not `with_structured_output` — see that module's
+    docstring). Independently overridable
+    (`FWA_STAGE5_EVALUATOR_MODEL=ollama:qwen3:32b`) from the generator role,
+    e.g. to mix a cheap local generator with a stronger judge."""
 
 
 @dataclass(frozen=True)
@@ -137,11 +155,13 @@ ROLE_TO_TIER: dict[AgentRole, ModelTier] = {
     # let either be pointed at a local Ollama model independently.
     AgentRole.STAGE4_QUERY_PLANNER: ModelTier.HIGH_REASONING,
     AgentRole.STAGE4_TAINT_ANALYST: ModelTier.HIGH_REASONING,
-    # Stage 5's verification agent gets the same HIGH_REASONING default —
-    # it drives real tool calls (Joern CPG queries) and a final structured
-    # verdict, both reasoning-heavy. `FWA_STAGE5_VERIFIER_MODEL` overrides
-    # this role specifically (e.g. to a local Ollama qwen3 model).
-    AgentRole.STAGE5_VERIFIER: ModelTier.HIGH_REASONING,
+    # Stage 5's two roles get the same HIGH_REASONING default — writing a
+    # correct CPGQL script and judging its output are both reasoning-heavy.
+    # `FWA_STAGE5_GENERATOR_MODEL`/`FWA_STAGE5_EVALUATOR_MODEL` (falling
+    # back to `FWA_STAGE5_VERIFIER_MODEL`) override either independently,
+    # commonly to a local Ollama qwen3 model.
+    AgentRole.STAGE5_SCRIPT_GENERATOR: ModelTier.HIGH_REASONING,
+    AgentRole.STAGE5_RESULT_EVALUATOR: ModelTier.HIGH_REASONING,
 }
 
 # ---------------------------------------------------------------------- #
@@ -185,17 +205,23 @@ TIER_TO_SPEC: dict[ModelTier, ModelSpec] = {
 GEMINI_HIGH_REASONING = ModelSpec(provider=ModelProvider.GOOGLE, model="gemini-2.5-flash")
 
 # ---------------------------------------------------------------------- #
-# Role -> per-role Settings override field name
+# Role -> per-role Settings override field name(s)
 # ---------------------------------------------------------------------- #
-# Maps a role to the `Settings` attribute holding its own
-# `"<provider>:<model>"` override (checked before the global `llm_model`
-# override — see resolve_spec()). Add an entry here, not another `if`
-# branch, when a new role gets its own override field.
-_ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, str] = {
-    AgentRole.STAGE3_VULN_ANALYST: "stage3_analyst_model",
-    AgentRole.STAGE4_QUERY_PLANNER: "stage4_query_planner_model",
-    AgentRole.STAGE4_TAINT_ANALYST: "stage4_taint_analyst_model",
-    AgentRole.STAGE5_VERIFIER: "stage5_verifier_model",
+# Maps a role to a TUPLE of `Settings` attribute names holding
+# `"<provider>:<model>"` overrides, checked in order — the first one with a
+# truthy value wins (checked before the global `llm_model` override — see
+# resolve_spec()). Most roles have exactly one; Stage 5's two roles each
+# check their own field first, then fall back to the shared
+# `stage5_verifier_model` field, so `FWA_STAGE5_VERIFIER_MODEL=...` (or
+# `--model`) alone still points BOTH roles at one model. Add an entry here,
+# not another `if` branch, when a new role gets its own override field.
+_ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, tuple[str, ...]] = {
+    AgentRole.STAGE3_VULN_ANALYST: ("stage3_analyst_model",),
+    AgentRole.STAGE4_QUERY_PLANNER: ("stage4_query_planner_model",),
+    AgentRole.STAGE4_TAINT_ANALYST: ("stage4_taint_analyst_model",),
+    AgentRole.STAGE5_VERIFIER: ("stage5_verifier_model",),
+    AgentRole.STAGE5_SCRIPT_GENERATOR: ("stage5_generator_model", "stage5_verifier_model"),
+    AgentRole.STAGE5_RESULT_EVALUATOR: ("stage5_evaluator_model", "stage5_verifier_model"),
 }
 
 
@@ -236,8 +262,10 @@ def resolve_spec(
 
     Override precedence, most specific first:
     1. A per-role override — see `_ROLE_OVERRIDE_SETTINGS_FIELD` for which
-       `Settings` attribute backs which role (e.g.
-       `Settings.stage3_analyst_model` for `STAGE3_VULN_ANALYST`).
+       `Settings` attribute(s) back which role (e.g.
+       `Settings.stage3_analyst_model` for `STAGE3_VULN_ANALYST`; Stage 5's
+       two roles each check their own field, then fall back to
+       `Settings.stage5_verifier_model` — the first truthy field wins).
     2. `Settings.llm_model` — a global override applied to every role.
     3. `Settings.use_local_model` picks which half of the tier table to
        prefer: the tier's own (API-backed) spec when `False` (default), or
@@ -255,8 +283,7 @@ def resolve_spec(
     """
     settings = settings or get_settings()
 
-    override_field = _ROLE_OVERRIDE_SETTINGS_FIELD.get(role)
-    if override_field:
+    for override_field in _ROLE_OVERRIDE_SETTINGS_FIELD.get(role, ()):
         override_value = getattr(settings, override_field, None)
         if override_value:
             return _parse_model_override(override_value)

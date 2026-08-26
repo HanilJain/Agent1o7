@@ -12,7 +12,6 @@ from fw_audit.stage5_verification.tools.joern_tool import (
     CPG_FILENAME,
     SOURCE_FILENAME,
     build_cpg_async,
-    build_joern_tools,
     joern_parse_command,
     joern_script_command,
     run_joern_script_async,
@@ -119,39 +118,3 @@ async def test_run_joern_script_async_reports_failure(fake_executor, tmp_path: P
     assert attempt.stderr == "syntax error"
     assert attempt.attempt_index == 3
     assert (tmp_path / "query_003.sc").is_file()
-
-
-async def test_build_joern_tools_records_shared_state(fake_executor, tmp_path: Path, monkeypatch):
-    from fw_audit.stage5_verification.tools import joern_tool as jt
-
-    def on_run(command, files):
-        if command.startswith("joern-parse"):
-            (tmp_path / CPG_FILENAME).write_bytes(b"cpg")
-            return ExecutionResult(
-                command=command, returncode=0, stdout="", stderr="", timed_out=False
-            )
-        return ExecutionResult(
-            command=command, returncode=0, stdout="script ran", stderr="", timed_out=False
-        )
-
-    executor = fake_executor(on_run)
-    monkeypatch.setattr(jt, "joern_executor", lambda settings: executor)
-
-    cpg_build_holder: list = []
-    attempts: list = []
-    build_cpg_tool, run_joern_script_tool = build_joern_tools(
-        workspace_dir=tmp_path,
-        settings=Settings(_env_file=None),
-        cpg_build_holder=cpg_build_holder,
-        attempts=attempts,
-    )
-
-    build_result = await build_cpg_tool.ainvoke({})
-    assert "successfully" in build_result
-    assert len(cpg_build_holder) == 1
-    assert cpg_build_holder[0].ok
-
-    script_result = await run_joern_script_tool.ainvoke({"script": "cpg.method.l"})
-    assert script_result == "script ran"
-    assert len(attempts) == 1
-    assert attempts[0].script == "cpg.method.l"
