@@ -68,6 +68,52 @@ Single `Settings` (pydantic-settings) object, cached via `get_settings()`. No mo
 
 LangSmith tracing for the three LLM-driven stages (3, 4, 5). `configure_tracing(settings)` — called once in each of `fw-analyze`/`fw-trace`/`fw-verify`'s `main()` — is the codebase's one sanctioned `os.environ` write (LangSmith is configured by env, not by constructor); `flush_traces()` runs at the end of each `main()` so a short-lived CLI process doesn't drop buffered runs on exit. `trace_context()` (a `contextvars.ContextVar`) carries `run_id`/`chunk_id`/`bin_id`/`global_id` across each stage's `asyncio.create_task` worker-pool fan-out — entered per-unit inside `AnalysisConsumer.__call__`/`stage4_rag.driver._process_one`/`stage5_verification.driver._process_one`, never once around the whole pool, so sibling tasks never see each other's context. `traced()`/`span()`/`aspan()` wrap the non-LangChain work LangSmith can't see on its own (Chroma retrieval, the Qwen3 embedder, Joern's Docker CPG-build/script-run calls); `run_config()` builds the `RunnableConfig` passed to `.ainvoke(messages, config=...)` at every structured-output call site. Every function in this package is a true no-op — same behavior, no `langsmith` import attempted — when `Settings.langsmith_tracing` is `False` (the default, via `LANGSMITH_TRACING`) or the package isn't installed (`pip install "fw-audit[observability]"`); a firmware run never fails because of a tracing misconfiguration. Model-level `tags`/`metadata` are attached as `init_chat_model` constructor kwargs in `llm_config._build_from_spec`, never via `.with_config()` — `with_structured_output()` (used at every LLM call site in this repo) returns a `RunnableBinding` with no `with_config` counterpart, so per-call identity has to be set at construction time or passed through `config=` on `.ainvoke`, not chained on afterward. See each stage's own `CLAUDE.md` for its specific spans/root-run names.
 
+### LangSmith tracing is mandatory for agentic work — never optional at the call site
+
+Every agentic AI workflow — every LangGraph node/graph invocation, every
+`.invoke()`/`.ainvoke()` call against an LLM or a `RunnableBinding`
+(including `with_structured_output()` chains), every tool call an agent
+makes, and every indirect trigger of one of these (a worker-pool task that
+fans out into an agent call, a CLI command that drives a graph, a `debug.py`
+helper that bypasses the CLI but still invokes the same node/graph code) —
+**must be covered by LangSmith tracing.** This applies across all
+LLM-driven stages (3, 4, 5, and any future agentic stage), not just the
+three that exist today.
+
+Concretely, when adding or touching agentic code:
+
+- A LangGraph `StateGraph` compile/`ainvoke()` is auto-traced by LangChain's
+  native LangSmith integration — no manual wrapping needed for the graph
+  itself, but confirm `configure_tracing(settings)` runs in that entry
+  point's `main()` (see Observability above) or the whole tree is silently
+  unrecorded.
+- Any raw async/sync work an agent depends on that LangChain's
+  auto-instrumentation **cannot** see on its own — a raw `docker run` via
+  `Executor.run()`, a non-LangChain retrieval call (Chroma, an embedder),
+  any other tool invoked outside the LangChain runnable graph — must be
+  wrapped in `traced()`/`span()`/`aspan()` (`fw_audit/observability/`) with
+  a `run_type="tool"` span and a descriptive name (`"<stage>.<action>"`,
+  e.g. `stage5.build_cpg`), following the precedent in
+  `stage5_verification/tools/joern_tool.py`.
+- Every `.ainvoke(messages, config=...)` call at an LLM/structured-output
+  call site must pass `config=run_config(...)` so the run lands correctly
+  nested under its parent span/trace_context — never call `.ainvoke()`
+  without `config=` in agentic code.
+- An indirect trigger — a driver's worker-pool task, a graph node that
+  itself invokes another chain, a debug/bypass helper that still exercises
+  agent logic — must still enter `trace_context()` per unit of work (see
+  Observability above) so its spans nest correctly and sibling tasks don't
+  bleed into each other's trace.
+- New agentic roles/stages must follow the same discipline from day one:
+  do not ship a new LangGraph node, tool, or `.invoke()` call site without
+  first checking whether it needs its own span, and document its
+  spans/root-run names in that stage's own `CLAUDE.md` (see Stage 5's for
+  the template).
+- This must never be able to break a real run: every tracing helper is a
+  true no-op when `Settings.langsmith_tracing` is `False` or the
+  `observability` extra isn't installed (see Observability above) — never
+  make tracing a hard dependency of the workflow actually completing.
+
 ### Cross-stage schemas (`fw_audit/common/schemas.py`, `findings.py`, `taint.py`, `verification.py`)
 
 `schemas.py` carries the pipeline-plumbing contracts passed between stages (`FirmwareMetadata`, `IdentifiedBinary`, `Stage1Summary`, `DecompiledBinary`, `Stage2Summary`, `Stage3Summary`, ...) — later stages import these rather than re-deriving ad-hoc dicts. `findings.py` carries Stage 3 Component 2's `AnalysisReport`/`Finding`/`AnalysisRunSummary`; `taint.py` carries Stage 4's `TaintPathReport`; `verification.py` carries Stage 5's `VerificationReport`/`EvaluatorVerdict` — each the exact structured-output contract for its stage's LLM call(s), kept separate from `schemas.py` (and from each other) to avoid bloating any one file, following the same "genuinely different concern" split each module's own docstring explains. `Stage2Summary` paths are relative to `db_subfolder`, with one documented exception (`decompiled_tree_dir` — see its docstring).
