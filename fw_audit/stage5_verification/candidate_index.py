@@ -24,7 +24,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from fw_audit.common.findings import AnalysisReport, Decision, Finding
-from fw_audit.common.schemas import Stage2Summary
+from fw_audit.common.schemas import ELFInfo, GhidraFunction, Stage2Summary
 from fw_audit.stage5_verification.errors import Stage5InputError
 
 logger = logging.getLogger("fw_audit.stage5_verification.candidate_index")
@@ -41,7 +41,8 @@ via `discover_candidates(..., decisions=...)`."""
 
 @dataclass(frozen=True)
 class VerificationCandidate:
-    """One Stage 3 finding selected for Joern verification."""
+    """One Stage 3 finding selected for verification — by the existing
+    Joern static track, the new QEMU+GDB dynamic track, or both (FVVW v3)."""
 
     global_id: str
     """`f"{chunk_id}::{finding.finding_id}"` — same format as
@@ -55,7 +56,36 @@ class VerificationCandidate:
     (binary removed/renamed since Stage 3 ran, or Stage 2 never produced a
     Joern artifact for it) — such candidates are still discovered but
     `driver.py` records them as `failed` rather than attempting a CPG build
-    against a file that doesn't exist."""
+    against a file that doesn't exist. UNCHANGED by the fields below — the
+    existing static track keeps using ONLY this field, exactly as before."""
+
+    # ---- FVVW v3 additions (Phase 1) — resolved for the DYNAMIC track and
+    # `characterize_target`. All `None`/empty when unresolved; a candidate
+    # missing these can still run the static track normally, it just can't
+    # run the dynamic track (characterize_target reports "target mismatch"
+    # / the dynamic track terminates not_run — see fvvw.dynamic_track). ----
+    binary_path: Path | None = None
+    """Absolute host path to the REAL target ELF —
+    `Path(stage2_summary.rootfs_dir) / DecompiledBinary.rootfs_path` — what
+    the dynamic track actually emulates. `None` if `bin_id` didn't resolve
+    or `rootfs_dir` isn't a real directory."""
+    rootfs_dir: Path | None = None
+    """Absolute host path to the extracted firmware filesystem root
+    (`stage2_summary.rootfs_dir`) — what `bringup_stabilize` chroots/binds
+    into the dynamic-track session container. Shared by every candidate
+    from the same firmware run, not just this one binary."""
+    elf: ELFInfo | None = None
+    """Arch/endianness/stripped/interpreter facts already computed by
+    Stage 2 (`DecompiledBinary.elf`) — `characterize_target` seeds
+    `mem.target` from this and only shells out for what it doesn't carry
+    (PIE, offset validation). `None` if Stage 2 never resolved ELF facts
+    for this binary (e.g. `readelf` failed at Stage 2 time)."""
+    functions: tuple[GhidraFunction, ...] = ()
+    """The function/offset table (`DecompiledBinary.functions`) —
+    `characterize_target` looks up `finding.evidence_span.function_id`'s
+    `entry_point` here to validate the claimed offset against the real
+    binary. A tuple (not `list`) to keep this frozen dataclass genuinely
+    immutable."""
 
 
 def _chunk_id_from_findings_filename(path: Path) -> str:
@@ -103,6 +133,72 @@ def resolve_source_path(
         candidate = (db_subfolder / relpath).resolve()
         return candidate if candidate.is_file() else None
     return None
+
+
+@dataclass(frozen=True)
+class ResolvedBinaryTarget:
+    """The dynamic-track resolution result — a plain return value rather
+    than mutating `VerificationCandidate` in place (this whole dataclass
+    tree stays immutable, per this project's coding-style convention).
+    `discover_candidates` unpacks this into the matching
+    `VerificationCandidate` fields."""
+
+    binary_path: Path | None
+    rootfs_dir: Path | None
+    elf: ELFInfo | None
+    functions: tuple[GhidraFunction, ...]
+
+
+_EMPTY_BINARY_TARGET = ResolvedBinaryTarget(
+    binary_path=None, rootfs_dir=None, elf=None, functions=()
+)
+
+
+def resolve_binary_target(
+    bin_id: str, *, stage2_summary: Stage2Summary
+) -> ResolvedBinaryTarget:
+    """Resolve the REAL target ELF + rootfs + already-computed ELF/function
+    facts for `bin_id`, for the dynamic (QEMU+GDB) track and
+    `characterize_target` — the counterpart to `resolve_source_path`, which
+    resolves the DECOMPILED C the static track needs instead.
+
+    `stage2_summary.rootfs_dir` is Stage 1's originally-published absolute
+    host path to the extracted firmware filesystem (see
+    `common.schemas.Stage2Summary.rootfs_dir`'s docstring) — NOT relative to
+    `db_subfolder` like `DecompiledBinary.artifacts.*` are, so it is used
+    directly rather than joined onto `db_subfolder`. `binary.rootfs_path` IS
+    relative to it (POSIX, per `DecompiledBinary.rootfs_path`'s docstring):
+    the real ELF is `rootfs_dir / binary.rootfs_path`.
+
+    Returns `_EMPTY_BINARY_TARGET` (all `None`/empty) if `bin_id` isn't
+    found, `rootfs_dir` isn't set, or the resolved ELF path doesn't exist on
+    disk — never raises; a candidate can still run the static track without
+    this resolving (see `VerificationCandidate`'s field docstrings).
+    """
+    if not stage2_summary.rootfs_dir:
+        return _EMPTY_BINARY_TARGET
+    rootfs_dir = Path(stage2_summary.rootfs_dir)
+    if not rootfs_dir.is_dir():
+        return _EMPTY_BINARY_TARGET
+
+    for binary in stage2_summary.binaries:
+        if binary.bin_id != bin_id:
+            continue
+        binary_path = (rootfs_dir / binary.rootfs_path).resolve()
+        if not binary_path.is_file():
+            return ResolvedBinaryTarget(
+                binary_path=None,
+                rootfs_dir=rootfs_dir,
+                elf=binary.elf,
+                functions=tuple(binary.functions),
+            )
+        return ResolvedBinaryTarget(
+            binary_path=binary_path,
+            rootfs_dir=rootfs_dir,
+            elf=binary.elf,
+            functions=tuple(binary.functions),
+        )
+    return _EMPTY_BINARY_TARGET
 
 
 def discover_candidates(
@@ -156,6 +252,18 @@ def discover_candidates(
                 bin_id,
                 chunk_id,
             )
+        binary_target = resolve_binary_target(bin_id, stage2_summary=stage2_summary)
+        if binary_target.binary_path is None:
+            # Not a warning-level event on its own: the static track (the
+            # only track that existed before FVVW v3) never needed this,
+            # so plenty of legitimate runs will hit this path — logged at
+            # debug, not warning, unlike the source_path miss above.
+            logger.debug(
+                "no real ELF resolved for bin_id=%s (chunk_id=%s) — dynamic track "
+                "will report not_run for candidates from this chunk",
+                bin_id,
+                chunk_id,
+            )
 
         for finding in report.findings:
             if finding.decision not in decisions:
@@ -167,6 +275,10 @@ def discover_candidates(
                     bin_id=bin_id,
                     finding=finding,
                     source_path=source_path,
+                    binary_path=binary_target.binary_path,
+                    rootfs_dir=binary_target.rootfs_dir,
+                    elf=binary_target.elf,
+                    functions=binary_target.functions,
                 )
             )
     return candidates
@@ -174,8 +286,10 @@ def discover_candidates(
 
 __all__ = [
     "DEFAULT_DECISIONS",
+    "ResolvedBinaryTarget",
     "VerificationCandidate",
     "discover_candidates",
     "load_stage2_summary",
+    "resolve_binary_target",
     "resolve_source_path",
 ]
