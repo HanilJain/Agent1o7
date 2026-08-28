@@ -1,96 +1,148 @@
-# Stage 5 — Sandboxed Verification (Joern generate/evaluate pipeline, v1)
+# Stage 5 — Sandboxed Verification (FVVW v3 fork-join)
 
-Proves or disproves one Stage 3 finding by actually building a Code
-Property Graph (CPG) for its binary and running Joern/CPGQL queries against
-it — the first stage in this pipeline that executes anything, rather than
-reasoning over static text alone.
+Proves or disproves one Stage 3 finding by verifying it **two independent
+ways** — actually building a Code Property Graph (CPG) and running Joern/
+CPGQL queries against it (the **static track**), and actually emulating the
+real binary under QEMU with GDB attached (the **dynamic track**) — under
+one LLM-authored strategy plan, then reconciling both witnesses into a
+two-axis verdict (mechanism confidence × reachability confidence) plus a
+disclosure report. This is the first stage in the pipeline that executes
+anything, rather than reasoning over static text alone.
 
-**v1 scope: the Joern tool only.** Two independently-configurable LLM
-roles — a **generator** that writes a Joern/CPGQL script per round, and an
-**evaluator** that judges that round's output — iterate: build the CPG,
-generate a query, run it, evaluate the result, and if the script itself was
-broken (not just "the finding wasn't confirmed"), regenerate with feedback,
-up to a bounded number of rounds. Neither role does tool-calling or
-structured-output — both are plain text in/text out, specifically so this
-runs reliably on a local model (e.g. Ollama qwen3:32b), not just Claude via
-the Anthropic API (which requires a paid `ANTHROPIC_API_KEY` — a Claude
-Code/claude.ai login does not work here). QEMU+GDB dynamic verification is a
-planned second tool, not built yet.
+`fw-verify run` drives the full fork-join **by default**.
+`fw-verify run --joern-only` reaches the original static-only pipeline
+(build/run/evaluate against Joern, nothing else) exactly as it behaved
+before FVVW v3 — that pipeline is reused **completely unmodified** as the
+fork-join's static-track building block.
 
 ## What it does
 
-- **`candidate_index.py`**: reads `stage3/findings/*.json` (ESCALATE
-  findings by default) and resolves each one's binary to Stage 2's
-  `normalized/joern/whole.c` via `stage2_summary.json`.
-- **`tools/joern_tool.py`**: the Joern invocation primitives `agent/graph.py`
-  calls directly, backed by `SandboxExecutor` (Docker, `--network=none`,
-  resource-limited). `build_cpg_async` parses the binary's source into a CPG
-  once, persisted to a per-candidate workspace directory on the host; every
-  `run_joern_script_async` call is its own fresh one-shot container loading
-  that CPG back from disk.
-- **`agent/cleaning.py`**: strips `<think>` reasoning blocks and markdown
-  fences from a local model's raw response before it's treated as a script
-  or parsed as evaluator JSON.
-- **`agent/graph.py`**: a LangGraph loop — `build_cpg` -> `generate_script` ->
-  `run_script` -> `evaluate`, looping back to `generate_script` on a
-  `FAIL_RETRY` verdict, until the evaluator settles the question or the
-  iteration cap forces a `FAIL_STOP`. `conclude` mechanically derives the
-  final `VerificationVerdict` (CONFIRMED / REFUTED / INCONCLUSIVE / ERROR)
-  from the evaluator's verdict plus the script's `RESULT:` marker — no LLM
-  call at that step.
-- **`driver.py`**: runs this for every candidate through a bounded worker
-  pool, persisting a JSON report and a human-readable Markdown explanation
-  for each.
+- **`candidate_index.py`**: reads `stage3/findings/*.json` (ESCALATE by
+  default) and resolves each finding's binary to Stage 2's
+  `normalized/joern/whole.c` (for the static track) — and now ALSO to the
+  real ELF + `rootfs_dir` + Stage 2's already-computed `elf`/`functions`
+  facts (for `characterize_target`/the dynamic track), via
+  `resolve_binary_target()`.
+- **`tools/characterize_tool.py`**: `characterize_target()` builds
+  `mem.target` — arch/endianness/stripped/libc seeded from Stage 2's
+  already-computed `ELFInfo`, plus PIE (a cheap, dependency-free ELF-header
+  read) and function-offset validation the earlier stages never captured.
+- **`fvvw/strategy.py`**: one LLM pass (`strategy_agent`) produces a
+  `StrategyPlan` — a threat model, a hypothesis A/B pair with one decisive
+  observable, and BOTH tracks' plans (`StaticPlan`, `DynamicPlan`) —
+  translating the finding's prose guards into the dynamic track's
+  structured `guards` list.
+- **`fvvw/static_track.py`**: wraps the ORIGINAL Joern
+  `build_verifier_graph()` unchanged, feeding it a strategy-enriched brief.
+- **`tools/crosscheck_tool.py`**: `static_crosscheck()` independently
+  disassembles the real ELF to confirm/refute the static plan's expected
+  calls and sanitizer patterns — a signal from the real binary, not the
+  decompiled C the Joern track works from.
+- **`tools/qemu_gdb_tool.py`** + **`fvvw/dynamic_track.py`**: the QEMU+GDB
+  dynamic track. `plan_emulation` picks user- vs system-mode; `bringup_
+  stabilize` starts (and repairs) a session container running the target
+  under QEMU; `reach_target`/`satisfy_guards`/`instrument_trigger`/
+  `collect_signals` drive a shared GDB session to reach the claimed
+  vulnerable path, force each guard (logging its real default value
+  first), inject a validated BENIGN marker at the sink, and gather ≥3
+  independent corroborating signals; `dynamic_evaluate` is a deterministic
+  rule engine implementing the hypothesis A/B switch — keep testing A;
+  if it stalls, switch to proving B; terminate the moment either is
+  proved.
+- **`fvvw/joint.py`**: `joint_evaluate()` — the ONE function that reads
+  both tracks' results — classifies their agreement
+  (concordant/discordant/one-sided), the mechanism-confidence axis (a
+  `discordant` disagreement NEVER auto-resolves to trusting one track), and
+  the reachability-confidence axis (a forced guard caps this and never
+  raises it).
+- **`fvvw/graph.py`**: `run_fvvw()` wires it all together — characterize →
+  strategy → fork the static and dynamic tracks (running concurrently) →
+  await both → `joint_evaluate`.
+- **`fvvw/report.py`**: `write_report()` — one LLM call composing the
+  seven-layer disclosure document plus a reconciliation section, with every
+  raw tool output (Joern script output, GDB transcript) quoted verbatim.
+- **`fvvw/driver.py`**: `run_fvvw_queue()` — a bounded worker pool over
+  candidates, persisting `FVVWReport` JSON + Markdown for each, entirely
+  separate from the original `driver.py`'s own queue.
 
 ## Files
 
-See [CLAUDE.md](CLAUDE.md) for the full file-by-file table.
+See [CLAUDE.md](CLAUDE.md) for the full file-by-file table (static track
+and fork-join sections).
 
 ## How to run
 
 ```bash
+# Fork-join (default) — both tracks, joint verdict, disclosure report
 fw-verify run --db-subfolder data/db/<stem>
-fw-verify run --db-subfolder data/db/<stem> --model ollama:qwen3:32b
-fw-verify debug build-cpg --db-subfolder data/db/<stem> --bin-id <bin_id>
-fw-verify debug verify --db-subfolder data/db/<stem> --gid "<gid>" --output report.json
+
+# Original static-only pipeline
+fw-verify run --db-subfolder data/db/<stem> --joern-only --model ollama:qwen3:32b
+
+# Each track individually
+fw-verify debug build-cpg --db-subfolder data/db/<stem> --bin-id <bin_id>   # Joern, no LLM
+fw-verify debug verify --db-subfolder data/db/<stem> --gid "<gid>"          # Joern track only
+fw-verify debug dynamic --db-subfolder data/db/<stem> --gid "<gid>"        # QEMU+GDB track only
+fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report.json  # both, dry run
 ```
 
 ## Input
 
-`stage3/findings/*.json` (Stage 3) + `stage2/stage2_summary.json` (Stage 2).
+`stage3/findings/*.json` (Stage 3) + `stage2/stage2_summary.json` (Stage 2
+— resolves the static track's decompiled C AND, new for the dynamic track,
+the real ELF/rootfs/arch facts).
 
 ## Output
 
-`data/db/<stem>/stage5/`: `verifications/<gid>.json` (the standard JSON
-report — `common.verification.VerificationReport`), `reports/<gid>.md`
-(human-readable, includes an exact reproduction command), and
-`stage5_summary.json` (run-level bookkeeping). Never writes into an earlier
-stage's tree.
+`data/db/<stem>/stage5/`:
+
+- **Static track** (`--joern-only`): `verifications/<gid>.json`
+  (`common.verification.VerificationReport`), `reports/<gid>.md`,
+  `stage5_summary.json` — unchanged from before FVVW v3.
+- **Fork-join** (default), a SEPARATE subtree: `fvvw/reports/<gid>.json`
+  (`common.verification.FVVWReport` — both tracks' results, the two-axis
+  verdict, residual unknowns), `fvvw/reports/<gid>.md` (the LLM-composed
+  disclosure document), `fvvw_summary.json`.
+
+Neither path writes into an earlier stage's tree, and the two output
+subtrees never collide even against the same `db_subfolder`.
 
 ## Debugging
 
-Every control point you'd want while iterating on this is exposed
-independently: `fw-verify debug build-cpg` and `debug script` bypass the
-LLM entirely (test the Joern tool mechanics on their own); `fw-verify debug
-verify --prompt-file ... --output ...` runs the full generate/run/evaluate
-loop for one finding with the generator system prompt, model, and output
-location all overridable, without touching `stage5/verifications/`. See
-[CLAUDE.md](CLAUDE.md)'s Debugging section for the full command reference
-and common errors.
+Every control point is exposed independently: `fw-verify debug build-cpg`/
+`debug script` bypass the LLM entirely for the Joern mechanics;
+`fw-verify debug strategy` runs just the strategy agent; `fw-verify debug
+dynamic` runs ONLY the QEMU+GDB track; `fw-verify debug verify` runs the
+Joern track alone; `fw-verify debug fvvw` runs the complete fork-join as a
+dry run. See [CLAUDE.md](CLAUDE.md)'s Debugging section for the full
+command reference and common errors.
 
-`--trace` (or `LANGSMITH_TRACING=true`) additionally traces a run in
-LangSmith: one root run per candidate, with `run_type="tool"` spans around
-each Joern `docker run` call — see the project root `CLAUDE.md`'s
+`--trace` additionally traces every LLM call and sandboxed tool call in
+LangSmith — one root run per candidate (`stage5.fvvw.candidate` or
+`stage5.candidate` for `--joern-only`), with `run_type="tool"` spans around
+every Docker/QEMU/GDB call. See the project root `CLAUDE.md`'s
 Observability section.
+
+## What changed from v1 (pre-FVVW-v3)
+
+The original v1 pipeline (Joern-only, `agent/graph.py`'s generate/run/
+evaluate loop) is **completely unchanged** — every file it touches is
+reused verbatim by the fork-join's static track, and remains directly
+reachable via `--joern-only`. Everything else described above is additive:
+a new `fvvw/` package, new `tools/characterize_tool.py`/
+`crosscheck_tool.py`/`qemu_gdb_tool.py`/`verification_sandbox.py`, a
+session capability added alongside (never replacing) `SandboxExecutor`'s
+one-shot `run()`, and a second Docker image
+(`docker/Dockerfile.verification`) kept separate from `docker/
+Dockerfile.joern`.
 
 ## Explicitly deferred (not designed away)
 
-- QEMU+GDB dynamic verification — a second tool module reusing
-  `agent/graph.py`'s shape.
 - A real MCP server exposing these tools over JSON-RPC, if cross-client
   interop is ever wanted.
-- A persistent/session-based `SandboxExecutor` capability — needed once an
-  interactive debugging session (not a one-shot command) is required.
+- `Settings.stage5_checkpoint_backend="sqlite"` needs
+  `pip install -e ".[stage5-fvvw]"` (`langgraph-checkpoint-sqlite`) — the
+  default `"memory"` backend needs nothing extra.
 
 See the [project CLAUDE.md](../../CLAUDE.md) and
 [project README.md](../../README.md) for the overall pipeline, the
