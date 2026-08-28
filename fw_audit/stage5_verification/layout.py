@@ -14,6 +14,15 @@ Layout, under `<db_subfolder>/stage5/`::
     debug/                     (debug.py's own scratch — never read back)
     stage5_summary.json        (run-level summary, written by driver.run_queue)
 
+FVVW v3's fork-join adds one more subtree, kept entirely separate from the
+above (which stays the static track's own layout, unchanged)::
+
+    fvvw/reports/<gid>.json    (the fork-join artifact — common.verification.FVVWReport)
+    fvvw/reports/<gid>.md      (the LLM-composed disclosure Markdown — fvvw.report.write_report)
+    fvvw/dynamic_workspace/<gid>/  (dynamic-track scratch: GDB recipes, session
+                                     bookkeeping — kept only if Settings.stage5_keep_workspace)
+    fvvw_summary.json          (fork-join run-level summary, written by driver.run_fvvw_queue)
+
 `<gid>` is the global finding id `f"{chunk_id}::{finding_id}"` — same format
 and same `::` -> `__` filename sanitization as `stage4_rag.layout`.
 """
@@ -85,3 +94,46 @@ def stage5_summary_path(stage5_dir_: Path) -> Path:
     `stage4_rag.layout.stage4_summary_path`'s precedent — see
     `common.verification.VerificationRunSummary`."""
     return stage5_dir_ / "stage5_summary.json"
+
+
+# --------------------------------------------------------------------- #
+# FVVW v3 fork-join layout — deliberately separate from the static
+# track's own `verifications/`/`reports/`/`workspace/` above (untouched).
+# --------------------------------------------------------------------- #
+
+
+def fvvw_dir(stage5_dir_: Path) -> Path:
+    return stage5_dir_ / "fvvw"
+
+
+def fvvw_reports_dir(fvvw_dir_: Path) -> Path:
+    """The `FVVWReport` JSON + disclosure Markdown live together here (one
+    dir, not split `verifications/`+`reports/` like the static track) —
+    the fork-join has fewer, richer artifacts per candidate than the
+    static-only path's per-attempt scratch files."""
+    return fvvw_dir_ / "reports"
+
+
+def fvvw_dynamic_workspace_root(fvvw_dir_: Path) -> Path:
+    return fvvw_dir_ / "dynamic_workspace"
+
+
+def fvvw_dynamic_workspace_dir(fvvw_dir_: Path, global_id: str) -> Path:
+    return fvvw_dynamic_workspace_root(fvvw_dir_) / _sanitize_gid(global_id)
+
+
+def fvvw_report_json_filename(global_id: str) -> str:
+    return f"{_sanitize_gid(global_id)}.json"
+
+
+def fvvw_report_markdown_filename(global_id: str) -> str:
+    return f"{_sanitize_gid(global_id)}.md"
+
+
+def fvvw_summary_path(stage5_dir_: Path) -> Path:
+    """Written by `driver.run_fvvw_queue()` itself — kept as a SEPARATE
+    file from `stage5_summary_path()`'s `stage5_summary.json` (the static
+    track's own run summary), so a `--joern-only` run and a fork-join run
+    against the same `db_subfolder` never overwrite each other's
+    bookkeeping."""
+    return stage5_dir_ / "fvvw_summary.json"

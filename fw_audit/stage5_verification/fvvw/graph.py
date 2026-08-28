@@ -162,7 +162,7 @@ async def resolve_fvvw_deps(
     )
 
 
-async def _run_dynamic_track(
+async def run_dynamic_track_only(
     candidate: VerificationCandidate,
     plan,
     target,
@@ -320,7 +320,7 @@ async def run_fvvw(
         )
     )
     dynamic_task = asyncio.ensure_future(
-        _run_dynamic_track(candidate, plan.dynamic_plan, target, deps=deps)
+        run_dynamic_track_only(candidate, plan.dynamic_plan, target, deps=deps)
     )
 
     # ---- await_both_tracks: the hard barrier ----------------------------
@@ -357,5 +357,6 @@ __all__ = [
     "FVVWDeps",
     "resolve_checkpointer",
     "resolve_fvvw_deps",
+    "run_dynamic_track_only",
     "run_fvvw",
 ]
