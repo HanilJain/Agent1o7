@@ -257,14 +257,23 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
         # "." — the bind-mounted workspace root itself IS the rootfs root
         # (see `_workspace_dir_for`'s docstring); `chroot .` inside
         # CONTAINER_WORKDIR is what actually changes root correctly here.
-        rootfs_relpath = "." if ctx.candidate.rootfs_dir is not None else None
+        chrooting = ctx.candidate.rootfs_dir is not None
+        rootfs_relpath = "." if chrooting else None
         target_relpath = _target_relpath_in_workspace(ctx.candidate)
+
+        # After `chroot`, the container's own /usr/bin/qemu-<arch> is no
+        # longer reachable — the emulator binary has to live INSIDE the
+        # rootfs. qemu-user-static's binaries are statically linked exactly
+        # for this, so a plain copy into the rootfs works with no library
+        # dependencies inside the foreign-arch tree.
+        qemu_binary_in_chroot = f"/{arch_spec.user_binary}" if chrooting else None
 
         launch_cmd = build_qemu_user_launch_command(
             arch_spec=arch_spec,
             target_relpath=target_relpath,
             argv=list(ctx.plan.argv_template),
             rootfs_relpath=rootfs_relpath,
+            qemu_binary_in_chroot=qemu_binary_in_chroot,
         )
         ctx.launch_cmd = launch_cmd
 
@@ -275,6 +284,27 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
                 network=network_name,
             )
             ctx.applied_fixes.append(f"started session {ctx.handle.container_name}")
+
+        # Stage the static QEMU binary into the rootfs so `chroot . <qemu>`
+        # can find it (see build_qemu_user_launch_command). Resolve the
+        # real path via `command -v` (the Dockerfile symlinks
+        # qemu-<arch> -> qemu-<arch>-static under /usr/bin) and copy it to
+        # the rootfs root as `<arch>`-named, matching qemu_binary_in_chroot.
+        if chrooting:
+            copy_cmd = (
+                f"cp \"$(command -v {arch_spec.user_binary})\" "
+                f"{CONTAINER_WORKDIR}/{arch_spec.user_binary}"
+            )
+            copy_result = await ctx.session_executor.exec_in_session(
+                ctx.handle, copy_cmd, timeout=ctx.settings.stage5_qemu_timeout_seconds
+            )
+            if not copy_result.ok:
+                raise DynamicFault(
+                    f"{ctx.candidate.global_id}: failed to stage QEMU binary "
+                    f"{arch_spec.user_binary!r} into the rootfs for chroot: "
+                    f"{copy_result.stderr.strip() or copy_result.stdout.strip()!r}"
+                )
+            ctx.applied_fixes.append(f"staged {arch_spec.user_binary} into rootfs")
 
         # Launch QEMU in the background inside the session so this call
         # returns quickly and reach_target can connect the GDB stub next —

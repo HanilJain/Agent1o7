@@ -142,6 +142,7 @@ def build_qemu_user_launch_command(
     argv: list[str] | None = None,
     rootfs_relpath: str | None = None,
     gdb_port: int = 1234,
+    qemu_binary_in_chroot: str | None = None,
 ) -> str:
     """Assemble the exact user-mode QEMU launch command
     (`bringup_stabilize`'s job per the design doc), in order: chroot prefix
@@ -153,16 +154,34 @@ def build_qemu_user_launch_command(
 
     All paths are relative to the bind-mounted session workspace
     (`CONTAINER_WORKDIR`) — this function never sees or needs a host path.
-    """
+
+    When chrooting (`rootfs_relpath` given), the QEMU emulator binary must
+    exist INSIDE the rootfs to be reachable after `chroot`, and the `-L`
+    sysroot resolves against the POST-chroot root (`/`), not the pre-chroot
+    path. The caller (`bringup_stabilize`) stages a static QEMU binary into
+    the rootfs and passes its absolute-in-chroot path as
+    `qemu_binary_in_chroot` (e.g. `/qemu-mips`); `-L /` then points QEMU at
+    the (now-root) rootfs for library resolution. Without a chroot
+    (`rootfs_relpath is None`), the container's own `qemu-<arch>` on PATH is
+    used and no `-L` is emitted."""
+    if rootfs_relpath and not qemu_binary_in_chroot:
+        raise ValueError(
+            "qemu_binary_in_chroot is required when rootfs_relpath is set: after "
+            "chroot the container's qemu-<arch> is unreachable, so the caller must "
+            "stage a static QEMU binary into the rootfs and pass its in-chroot path."
+        )
     parts: list[str] = []
     if rootfs_relpath:
         parts += ["chroot", shlex.quote(rootfs_relpath)]
     for key, value in arch_spec.cpu_probe_env.items():
         parts.append(f"{key}={shlex.quote(value)}")
-    parts.append(arch_spec.user_binary)
+    # After chroot, the container's /usr/bin/qemu-<arch> is no longer
+    # reachable — use the copy the caller staged inside the rootfs.
+    parts.append(shlex.quote(qemu_binary_in_chroot) if rootfs_relpath else arch_spec.user_binary)
     parts += ["-g", str(gdb_port)]
     if rootfs_relpath:
-        parts += ["-L", shlex.quote(rootfs_relpath)]
+        # Post-chroot, the rootfs IS `/`, so that's the sysroot for -L.
+        parts += ["-L", "/"]
     parts.append(shlex.quote(target_relpath))
     if argv:
         parts += [shlex.quote(a) for a in argv]

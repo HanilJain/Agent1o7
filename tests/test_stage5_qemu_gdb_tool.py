@@ -5,6 +5,8 @@ assertions."""
 
 from __future__ import annotations
 
+import pytest
+
 from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     QEMU_ARCH_TABLE,
     build_gdb_batch_command,
@@ -112,10 +114,22 @@ def test_user_launch_command_with_chroot_and_rootfs():
     cmd = build_qemu_user_launch_command(
         arch_spec=spec,
         target_relpath="sbin/rc",
-        rootfs_relpath="rootfs",
+        rootfs_relpath=".",
         gdb_port=1234,
+        qemu_binary_in_chroot="/qemu-arm",
     )
-    assert cmd.startswith("chroot rootfs OPENSSL_armcap=0 qemu-arm -g 1234 -L rootfs sbin/rc")
+    # After chroot the emulator runs from inside the rootfs (staged static
+    # binary at /qemu-arm) and the sysroot is the new root `/`, not the
+    # pre-chroot path.
+    assert cmd.startswith("chroot . OPENSSL_armcap=0 /qemu-arm -g 1234 -L / sbin/rc")
+
+
+def test_user_launch_command_chroot_requires_qemu_binary_in_chroot():
+    spec = QEMU_ARCH_TABLE[("arm", "little")]
+    with pytest.raises(ValueError, match="qemu_binary_in_chroot is required"):
+        build_qemu_user_launch_command(
+            arch_spec=spec, target_relpath="sbin/rc", rootfs_relpath="."
+        )
 
 
 def test_user_launch_command_includes_argv():

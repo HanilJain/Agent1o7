@@ -367,6 +367,49 @@ async def test_bringup_stabilize_mounts_rootfs_dir_itself_not_its_parent(tmp_pat
     assert any("bin/vulnbin" in c and "rootfs/bin/vulnbin" not in c for c in executor.exec_calls)
 
 
+async def test_bringup_stabilize_stages_static_qemu_binary_into_rootfs(tmp_path: Path):
+    """Regression: after `chroot .` the container's own /usr/bin/qemu-<arch>
+    is unreachable, so bringup_stabilize must copy the static QEMU binary
+    INTO the rootfs before launching, else the chroot'd launch fails with
+    'chroot: failed to run command qemu-<arch>: No such file or directory'
+    (observed on real DIR-825 firmware). The launch command must then
+    reference the in-rootfs copy, not the bare container binary name."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)  # arm arch per _ctx
+
+    await bringup_stabilize(ctx)
+
+    assert any(
+        "cp " in c and "command -v qemu-arm" in c for c in executor.exec_calls
+    ), "bringup_stabilize did not stage the static QEMU binary into the rootfs"
+    assert "staged qemu-arm into rootfs" in " ".join(ctx.applied_fixes)
+    launch = next(c for c in executor.exec_calls if "-g 1234" in c)
+    assert "/qemu-arm" in launch and "-L /" in launch
+
+
+async def test_bringup_stabilize_faults_when_qemu_staging_copy_fails(tmp_path: Path):
+    """If the static QEMU binary can't be staged into the rootfs, that's a
+    DynamicFault (retriable), not a silent launch that will fail opaquely
+    later."""
+
+    def on_exec(command: str):
+        if command.startswith("cp ") and "command -v" in command:
+            return ExecutionResult(
+                command=command,
+                returncode=1,
+                stdout="",
+                stderr="cp: cannot stat qemu-arm",
+                timed_out=False,
+            )
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    with pytest.raises(DynamicFault, match="failed to stage QEMU binary"):
+        await bringup_stabilize(ctx)
+
+
 async def test_bringup_stabilize_starts_session_and_launches_qemu(tmp_path: Path):
     executor = _FakeSessionExecutor()
     ctx = _ctx(tmp_path, session_executor=executor)
