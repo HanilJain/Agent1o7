@@ -254,7 +254,10 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
             network_name = f"fvvw-{uuid.uuid4().hex[:12]}"
             ctx.applied_fixes.append(f"granted scoped network {network_name}")
 
-        rootfs_relpath = "rootfs" if ctx.candidate.rootfs_dir is not None else None
+        # "." — the bind-mounted workspace root itself IS the rootfs root
+        # (see `_workspace_dir_for`'s docstring); `chroot .` inside
+        # CONTAINER_WORKDIR is what actually changes root correctly here.
+        rootfs_relpath = "." if ctx.candidate.rootfs_dir is not None else None
         target_relpath = _target_relpath_in_workspace(ctx.candidate)
 
         launch_cmd = build_qemu_user_launch_command(
@@ -352,28 +355,34 @@ def _target_needs_network(plan: DynamicPlan) -> bool:
 
 def _target_relpath_in_workspace(candidate: VerificationCandidate) -> str:
     """The target ELF's path relative to the bind-mounted session
-    workspace — mirrors how `characterize_target`/`tools.joern_tool` stage
-    files relative to `CONTAINER_WORKDIR`. The dynamic-track workspace
-    layout mirrors the rootfs structure directly under `rootfs/`, so a
-    binary at `rootfs_dir/bin/vulnbin` becomes `rootfs/bin/vulnbin` inside
-    the container."""
+    workspace. `_workspace_dir_for` mounts `candidate.rootfs_dir` itself
+    (not its parent) directly at `CONTAINER_WORKDIR`, so a binary at
+    `rootfs_dir/sbin/vulnbin` becomes plain `sbin/vulnbin` inside the
+    container — there is no separate `rootfs/` subdirectory to descend
+    into; the workspace root IS the rootfs root. (An earlier version of
+    this mounted `rootfs_dir.parent` and prefixed `rootfs/`, assuming the
+    host directory Stage 1/2 extracted the firmware into was literally
+    named `rootfs` — false in general, e.g. binwalk's own `squashfs-root`
+    naming, which made every chroot fail with 'cannot change root
+    directory to rootfs: No such file or directory'.)"""
     if candidate.binary_path is None or candidate.rootfs_dir is None:
         return candidate.bin_id  # best-effort fallback, will fail to launch
     rel = candidate.binary_path.relative_to(candidate.rootfs_dir)
-    return f"rootfs/{rel.as_posix()}"
+    return rel.as_posix()
 
 
 def _workspace_dir_for(ctx: BringupContext) -> Path | None:
     """Resolve the host directory bind-mounted into the session container —
     `Settings.stage5_dynamic_workspace_root` override, or
-    `candidate.rootfs_dir`'s PARENT (so `rootfs/` lands correctly inside the
-    container per `_target_relpath_in_workspace`'s convention), or `None`
-    if nothing is resolvable (bring-up will then fail fast, which is
-    correct — there's nothing to emulate)."""
+    `candidate.rootfs_dir` ITSELF (mounted directly at `CONTAINER_WORKDIR`,
+    so the container's workspace root IS the rootfs root — see
+    `_target_relpath_in_workspace`'s docstring for why this must not be
+    the parent directory), or `None` if nothing is resolvable (bring-up
+    will then fail fast, which is correct — there's nothing to emulate)."""
     if ctx.settings.stage5_dynamic_workspace_root:
         return Path(ctx.settings.stage5_dynamic_workspace_root)
     if ctx.candidate.rootfs_dir is not None:
-        return ctx.candidate.rootfs_dir.parent
+        return ctx.candidate.rootfs_dir
     return None
 
 

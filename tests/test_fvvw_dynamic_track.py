@@ -325,7 +325,13 @@ def _candidate(*, binary_path: Path | None, rootfs_dir: Path | None) -> Verifica
 
 
 def _ctx(tmp_path: Path, *, session_executor, plan=None) -> BringupContext:
-    rootfs = tmp_path / "rootfs"
+    # Deliberately NOT named "rootfs" — real firmware extraction (binwalk,
+    # Stage 1) never names its output directory that (e.g. `squashfs-root`,
+    # `_firmware.bin.extracted`). A fixture literally named "rootfs" would
+    # coincidentally pass even the buggy "mount the parent, hardcode the
+    # 'rootfs' subdir name" convention this test guards against — see
+    # `_target_relpath_in_workspace`'s docstring for the actual bug.
+    rootfs = tmp_path / "squashfs-root"
     (rootfs / "bin").mkdir(parents=True, exist_ok=True)
     binary_path = rootfs / "bin" / "vulnbin"
     binary_path.write_bytes(b"\x7fELF")
@@ -337,6 +343,28 @@ def _ctx(tmp_path: Path, *, session_executor, plan=None) -> BringupContext:
         settings=Settings(_env_file=None),
         session_executor=session_executor,
     )
+
+
+async def test_bringup_stabilize_mounts_rootfs_dir_itself_not_its_parent(tmp_path: Path):
+    """Regression: bringup_stabilize used to bind-mount `rootfs_dir.parent`
+    and hardcode `chroot rootfs`, assuming the host directory Stage 1/2
+    extracted the firmware into was literally named `rootfs` — false for
+    real extractions (binwalk's `squashfs-root`, etc.), which made every
+    chroot fail with 'cannot change root directory to rootfs: No such file
+    or directory' (observed on real DIR-825 firmware). The workspace mount
+    must be `rootfs_dir` itself, and the launch command must chroot into
+    `.` (the workspace root) with a target path that has no `rootfs/`
+    prefix."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    expected_rootfs_dir = ctx.candidate.rootfs_dir
+
+    await bringup_stabilize(ctx)
+
+    assert ctx.handle.workspace_dir == expected_rootfs_dir
+    assert any("chroot ." in c for c in executor.exec_calls)
+    assert not any("chroot rootfs" in c for c in executor.exec_calls)
+    assert any("bin/vulnbin" in c and "rootfs/bin/vulnbin" not in c for c in executor.exec_calls)
 
 
 async def test_bringup_stabilize_starts_session_and_launches_qemu(tmp_path: Path):
