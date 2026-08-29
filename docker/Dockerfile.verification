@@ -96,12 +96,16 @@ RUN echo "${JOERN_CLI_SHA256}  /tmp/joern-cli.zip" | sha256sum -c - \
 FROM eclipse-temurin:17-jdk-jammy AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 ca-certificates \
-        binwalk p7zip-full unzip jefferson \
+        python3 python3-pip ca-certificates \
+        binwalk p7zip-full unzip \
         qemu-user-static qemu-system-arm qemu-system-mips \
         gdb-multiarch binutils-multiarch \
         file binutils xxd \
     && rm -rf /var/lib/apt/lists/*
+# jefferson (JFFS2 extraction) has no Debian/Ubuntu apt package — it is a
+# pip-only tool, unlike binwalk itself which apt does carry — so it is
+# installed via pip separately from the apt-installed toolchain above.
+RUN pip3 install --no-cache-dir --break-system-packages jefferson
 # sasquatch (unofficial squashfs variant support) is intentionally NOT
 # apt-installed above — Debian/Ubuntu carry no official package for it and
 # it is only needed for certain non-standard vendor squashfs images that
