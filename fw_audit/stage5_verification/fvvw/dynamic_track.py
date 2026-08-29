@@ -81,9 +81,17 @@ _DENY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+# The echo branch's content class permits quotes (`'` and `"`) in addition
+# to word chars / `.` / `/` / `-` / space, because a strategy agent
+# naturally emits `echo 'proof_of_exploit'` — quotes are cosmetic and
+# benign here (the shell strips them). This stays safe because the class
+# still EXCLUDES every shell metacharacter that would give a marker teeth:
+# no `$`, `(`, `)`, backtick, `&`, `|`, `<`, or mid-string `;`, so
+# `echo '$(evil)'` / `echo 'a'&&rm` never match the allow-list, and the
+# deny-list (checked first) independently rejects dangerous content.
 _ALLOW_MARKER_RE = re.compile(
     r"^\s*;?\s*(touch|mkdir\s+-p)\s+[\w./\-]+\s*;?\s*$"
-    r"|^\s*;?\s*echo\s+[\w./\- ]+?\s*(>\s*[\w./\-]+)?\s*;?\s*$",
+    r"|^\s*;?\s*echo\s+[\w./\-'\" ]+?\s*(>\s*[\w./\-]+)?\s*;?\s*$",
     re.IGNORECASE,
 )
 
@@ -490,7 +498,14 @@ async def reach_target(
         )
 
     transcript = gdb_transcript_so_far + result.stdout + result.stderr
-    reached = "Breakpoint" in result.stdout or result.ok
+    # A real breakpoint HIT prints "Breakpoint N, 0x... in ..." (note the
+    # comma). "Breakpoint N at 0x..." is only the SET confirmation and does
+    # NOT mean control ever reached it — the old `"Breakpoint" in stdout or
+    # result.ok` matched the set message (and any successful batch), a
+    # false positive: on real firmware (MIPS mailosd) the entry breakpoint
+    # was set but the process took SIGTERM before it fired, yet reach still
+    # reported reached=True. Require an actual hit line instead.
+    reached = bool(re.search(r"Breakpoint \d+, ", result.stdout))
     return transcript, reached
 
 
