@@ -408,6 +408,35 @@ async def test_bringup_stabilize_raises_dynamic_fault_when_gdbstub_never_ready(t
         await bringup_stabilize(ctx)
 
 
+async def test_bringup_stabilize_surfaces_qemu_log_in_fault_message(tmp_path: Path):
+    """A readiness-probe timeout with no diagnostic just says 'never
+    opened the port' — worthless for debugging why QEMU actually died
+    (bad chroot, missing interpreter, unsupported syscall, ...).
+    bringup_stabilize must read back the redirected QEMU log and include
+    it in the DynamicFault message."""
+
+    def on_exec(command: str):
+        if "04D2" in command:
+            return ExecutionResult(
+                command=command, returncode=1, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("cat "):
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout="qemu-mips: Could not open '/lib/ld-uClibc.so.0': No such file\n",
+                stderr="",
+                timed_out=False,
+            )
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    with pytest.raises(DynamicFault, match="ld-uClibc.so.0"):
+        await bringup_stabilize(ctx)
+
+
 async def test_bringup_stabilize_does_not_grant_network_by_default(tmp_path: Path):
     executor = _FakeSessionExecutor()
     plan = _dynamic_plan(

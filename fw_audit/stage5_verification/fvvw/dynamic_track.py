@@ -40,6 +40,14 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     resolve_qemu_arch_spec,
 )
 
+# Where bringup_stabilize redirects the backgrounded QEMU process's
+# stdout/stderr inside the session container — read back into the
+# DynamicFault message if the gdbstub readiness probe times out, so a
+# silent "never opened the port" failure carries QEMU's own diagnostic
+# (bad chroot, missing interpreter/libs, unsupported syscall, ...) instead
+# of forcing a manual `docker exec` to find out why.
+_QEMU_LOG_PATH = f"{CONTAINER_WORKDIR}/.fvvw_qemu.log"
+
 # --------------------------------------------------------------------- #
 # Benign-marker-only invariant (FVVW §0/§12) — a hard, validated invariant
 # on instrument_trigger. Anything matching these patterns is refused
@@ -270,10 +278,16 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
         # `&` backgrounds it inside the container's shell, `disown` detaches
         # it from the exec'd shell's job table so it survives that shell
         # exiting (the exec_in_session call itself completes once the
-        # background job is started, not once QEMU exits).
+        # background job is started, not once QEMU exits). stdout/stderr
+        # are redirected to a log file rather than discarded: if QEMU dies
+        # immediately (bad chroot, missing interpreter/libs, unsupported
+        # syscall) the only symptom would otherwise be a silent gdbstub
+        # readiness-probe timeout with no clue why — see the DynamicFault
+        # raised below, which reads this log back into its message.
         await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cd {CONTAINER_WORKDIR} && ({launch_cmd} &) ",
+            f"cd {CONTAINER_WORKDIR} && "
+            f"({launch_cmd} > {_QEMU_LOG_PATH} 2>&1 &) ",
             timeout=ctx.settings.stage5_qemu_timeout_seconds,
         )
 
@@ -302,9 +316,16 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
             timeout=ctx.settings.stage5_qemu_timeout_seconds,
         )
         if not readiness.ok:
+            log_result = await ctx.session_executor.exec_in_session(
+                ctx.handle,
+                f"cat {_QEMU_LOG_PATH} 2>/dev/null",
+                timeout=ctx.settings.stage5_qemu_timeout_seconds,
+            )
+            qemu_output = (log_result.stdout + log_result.stderr).strip() or "(empty)"
             raise DynamicFault(
                 f"{ctx.candidate.global_id}: QEMU gdbstub never opened port 1234 "
-                f"within the readiness window — launch_cmd={launch_cmd!r}"
+                f"within the readiness window — launch_cmd={launch_cmd!r} "
+                f"qemu_output={qemu_output!r}"
             )
 
         if run is not None:
