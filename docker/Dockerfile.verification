@@ -105,7 +105,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # jefferson (JFFS2 extraction) has no Debian/Ubuntu apt package — it is a
 # pip-only tool, unlike binwalk itself which apt does carry — so it is
 # installed via pip separately from the apt-installed toolchain above.
-RUN pip3 install --no-cache-dir --break-system-packages jefferson
+# No --break-system-packages: this base's pip (Ubuntu jammy) predates that
+# flag and does not enforce PEP 668 in the first place.
+RUN pip3 install --no-cache-dir jefferson
 # sasquatch (unofficial squashfs variant support) is intentionally NOT
 # apt-installed above — Debian/Ubuntu carry no official package for it and
 # it is only needed for certain non-standard vendor squashfs images that
