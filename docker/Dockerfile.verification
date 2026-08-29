@@ -118,6 +118,24 @@ RUN pip3 install --no-cache-dir jefferson
 COPY --from=fetch /opt/joern /opt/joern
 ENV PATH="/opt/joern/joern-cli:${PATH}"
 
+# Debian/Ubuntu's `qemu-user-static` package installs its binaries as
+# `qemu-<arch>-static` (e.g. `qemu-arm-static`), never the unsuffixed
+# `qemu-<arch>` name — that unsuffixed name is what the non-static
+# `qemu-user` package would provide instead (dynamically linked, requiring
+# more shared libs staged into the target rootfs, which is why this image
+# deliberately installs the *-static variant instead). `tools/
+# qemu_gdb_tool.py`'s QEMU_ARCH_TABLE composes command lines against the
+# unsuffixed name for every arch it supports, so symlink each one here
+# rather than teaching the arch table two names per entry — keeps the
+# command-composition code itself decoupled from this image's specific
+# packaging choice.
+RUN for arch in arm armeb aarch64 aarch64_be mips mipsel mips64 mips64el ppc ppc64; do \
+        static_bin="/usr/bin/qemu-${arch}-static"; \
+        if [ -e "${static_bin}" ]; then \
+            ln -sf "${static_bin}" "/usr/bin/qemu-${arch}"; \
+        fi; \
+    done
+
 # Non-root, same posture as every other sandbox image in this project — see
 # Dockerfile.joern's own comment on why a bind-mounted single-file/tree
 # workspace doesn't need root inside the container. QEMU user-mode emulation
