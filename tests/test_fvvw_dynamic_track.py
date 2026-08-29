@@ -371,6 +371,43 @@ async def test_bringup_stabilize_raises_when_repair_budget_exhausted(tmp_path: P
         await bringup_stabilize(ctx)
 
 
+async def test_bringup_stabilize_probes_gdbstub_readiness_before_returning(tmp_path: Path):
+    """Regression: launching QEMU backgrounded means bringup_stabilize
+    returns as soon as the shell accepts the job, not once the gdbstub has
+    actually bound port 1234 — reach_target's `target remote` used to race
+    that bind and fail, looping bringup_stabilize until the repair budget
+    was exhausted without ever fixing anything. bringup_stabilize must poll
+    for the port itself before returning."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    await bringup_stabilize(ctx)
+
+    assert any("04D2" in c for c in executor.exec_calls), (
+        "bringup_stabilize did not probe for the gdbstub port before returning"
+    )
+
+
+async def test_bringup_stabilize_raises_dynamic_fault_when_gdbstub_never_ready(tmp_path: Path):
+    """If the readiness probe never sees the port open, bringup_stabilize
+    must raise DynamicFault (retriable via the normal repair-budget loop),
+    not silently return a handle reach_target will immediately fail to
+    connect to."""
+
+    def on_exec(command: str):
+        if "04D2" in command:
+            return ExecutionResult(
+                command=command, returncode=1, stdout="", stderr="", timed_out=False
+            )
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    with pytest.raises(DynamicFault):
+        await bringup_stabilize(ctx)
+
+
 async def test_bringup_stabilize_does_not_grant_network_by_default(tmp_path: Path):
     executor = _FakeSessionExecutor()
     plan = _dynamic_plan(

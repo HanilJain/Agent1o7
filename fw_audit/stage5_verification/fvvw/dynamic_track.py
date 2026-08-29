@@ -277,12 +277,43 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
             timeout=ctx.settings.stage5_qemu_timeout_seconds,
         )
 
+        # Backgrounding the launch means this call returns as soon as the
+        # shell accepts the job, NOT once QEMU has actually bound the GDB
+        # stub's listening port — reach_target's very first GDB command is
+        # `target remote localhost:1234`, which races that bind and fails
+        # with "Connection refused" if it runs first. That failure matches
+        # `_looks_like_setup_fault` and used to route back to
+        # `bringup_stabilize`, which just re-launched QEMU and retried at
+        # the same speed — a repair that never addressed the actual defect,
+        # burning the whole `stage5_bringup_max_repairs` budget on a pure
+        # timing race. Poll for the port here instead, bounded by
+        # `stage5_qemu_timeout_seconds`, so `reach_target` only ever runs
+        # once QEMU is actually listening (or bringup fails fast and
+        # honestly if it never does).
+        probe = (
+            "for i in $(seq 1 50); do "
+            "grep -q ':04D2 ' /proc/net/tcp 2>/dev/null && exit 0; "
+            "sleep 0.2; "
+            "done; exit 1"
+        )
+        readiness = await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            probe,
+            timeout=ctx.settings.stage5_qemu_timeout_seconds,
+        )
+        if not readiness.ok:
+            raise DynamicFault(
+                f"{ctx.candidate.global_id}: QEMU gdbstub never opened port 1234 "
+                f"within the readiness window — launch_cmd={launch_cmd!r}"
+            )
+
         if run is not None:
             run.end(
                 outputs={
                     "launch_cmd": launch_cmd,
                     "applied_fixes": list(ctx.applied_fixes),
                     "network_granted": network_name is not None,
+                    "gdbstub_ready": readiness.ok,
                 }
             )
 

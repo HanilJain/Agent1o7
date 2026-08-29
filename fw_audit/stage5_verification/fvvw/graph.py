@@ -210,7 +210,21 @@ async def run_dynamic_track_only(
     iteration = 0
 
     try:
-        await bringup_stabilize(ctx)
+        # bringup_stabilize's own readiness probe (QEMU gdbstub never
+        # opened its port) raises DynamicFault, not BringupExhausted — that
+        # fault is retriable via the same repair-budget mechanism every
+        # other dynamic-track fault uses, not fatal on the first attempt.
+        # Retry it here the same way the in-loop DynamicFault handler below
+        # does; bringup_stabilize itself is what ends the branch by raising
+        # BringupExhausted once ctx.repair_count exceeds
+        # stage5_bringup_max_repairs, so this loop is bounded by that, not
+        # by anything new here.
+        while True:
+            try:
+                await bringup_stabilize(ctx)
+                break
+            except DynamicFault:
+                continue
 
         while True:
             iteration += 1
