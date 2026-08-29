@@ -91,11 +91,13 @@ async def debug_run_script(
     )
 
 
-def _find_candidate(db_subfolder: Path, global_id: str) -> VerificationCandidate:
-    # DEFAULT_DECISIONS may exclude the finding the caller wants to debug —
-    # debug tooling should never silently hide an item the user explicitly
-    # asked for by id, so this scans every Decision value, mirroring
-    # stage4_rag.debug._find_candidate's exact precedent.
+def find_candidate(db_subfolder: Path, global_id: str) -> VerificationCandidate:
+    """Look up one candidate by its `global_id`, scanning EVERY `Decision`
+    value (not just `DEFAULT_DECISIONS`) — debug tooling should never
+    silently hide an item the user explicitly asked for by id, mirroring
+    `stage4_rag.debug._find_candidate`'s exact precedent. Public (no
+    leading underscore) so `fvvw.debug`'s own debug entry points can reuse
+    this lookup instead of re-deriving it."""
     from fw_audit.common.findings import Decision
 
     all_candidates = discover_candidates(db_subfolder, decisions=frozenset(Decision))
@@ -103,6 +105,12 @@ def _find_candidate(db_subfolder: Path, global_id: str) -> VerificationCandidate
         if candidate.global_id == global_id:
             return candidate
     raise ValueError(f"No finding with global_id {global_id!r} found under {db_subfolder}/stage3")
+
+
+_find_candidate = find_candidate
+"""Backward-compatible private alias — kept so nothing that already
+imported the old private name breaks; `find_candidate` above is the
+public entry point new code (including `fvvw.debug`) should use."""
 
 
 async def debug_verify(
@@ -138,4 +146,5 @@ __all__ = [
     "debug_build_cpg",
     "debug_run_script",
     "debug_verify",
+    "find_candidate",
 ]

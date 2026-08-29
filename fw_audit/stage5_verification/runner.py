@@ -1,20 +1,32 @@
-"""CLI entry point for Stage 5 (Sandboxed Verification — Joern generate/evaluate pipeline).
+"""CLI entry point for Stage 5 (Sandboxed Verification — FVVW v3 fork-join,
+with a `--joern-only` fallback to the original static-only pipeline).
 
 Registered as the `fw-verify` console script (see pyproject.toml). Usage:
 
     fw-verify run --db-subfolder DIR [--only GID ...] [--decisions D[,D...]]
-                  [--model P:M] [--keep-workspace]
+                  [--model P:M] [--keep-workspace] [--joern-only]
     fw-verify debug build-cpg --db-subfolder DIR --bin-id BIN_ID
     fw-verify debug script --workspace DIR --script-file PATH
     fw-verify debug verify --db-subfolder DIR --gid GID [--prompt-file PATH]
                             [--model P:M] [--max-iterations N] [--output PATH]
+    fw-verify debug strategy --db-subfolder DIR --gid GID
+    fw-verify debug dynamic --db-subfolder DIR --gid GID
+    fw-verify debug fvvw --db-subfolder DIR --gid GID [--output PATH]
 
 `run` verifies every Stage 3 finding with `decision == ESCALATE` by default
-(`candidate_index.discover_candidates`) through the worker-pool driver —
-`--decisions` overrides which decision(s) qualify (e.g. `CONTEXT_REQUIRED`,
-on the chance a CPG resolves what Stage 3 itself couldn't). `debug`
-dispatches to `debug.py`'s per-component, dry-run inspection functions —
-none of them persist into `stage5/verifications/`/`reports/`.
+(`candidate_index.discover_candidates`). By DEFAULT this drives the full
+FVVW v3 fork-join (`fvvw.driver.run_fvvw_queue` — strategy plan, static
+Joern track + dynamic QEMU+GDB track run independently, joint two-axis
+verdict, LLM disclosure report), persisting to `stage5/fvvw/`.
+`--joern-only` routes to the ORIGINAL static-only pipeline
+(`driver.run_queue`) unchanged, persisting to `stage5/verifications/`+
+`stage5/reports/` exactly as it always has — the pre-FVVW-v3 behavior
+stays fully reachable. `--decisions` overrides which Stage 3 decision(s)
+qualify (e.g. `CONTEXT_REQUIRED`, on the chance a CPG resolves what Stage 3
+itself couldn't). `debug` dispatches to `debug.py`'s (Joern-only) and
+`fvvw.debug`'s (strategy/dynamic-only/full-fork-join) per-component,
+dry-run inspection functions — none of them persist into the pipeline's
+own tracked output directories.
 """
 
 from __future__ import annotations
@@ -36,6 +48,8 @@ from fw_audit.stage5_verification.errors import (
     Stage5InputError,
     VerifierModelUnavailableError,
 )
+from fw_audit.stage5_verification.fvvw import debug as fvvw_debug_mod
+from fw_audit.stage5_verification.fvvw.driver import run_fvvw_queue
 from fw_audit.stage5_verification.report_writer import render_report
 
 
@@ -121,6 +135,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument(
         "--keep-workspace", action="store_true", help="Don't delete stage5/workspace/<gid>/ after."
     )
+    run.add_argument(
+        "--joern-only",
+        action="store_true",
+        help="Run ONLY the original static-only Joern pipeline (pre-FVVW-v3 behavior), "
+        "persisting to stage5/verifications/+stage5/reports/ exactly as before — skips "
+        "the strategy plan, the dynamic QEMU+GDB track, and the joint two-axis verdict "
+        "entirely. Without this flag, `run` drives the full FVVW v3 fork-join by default.",
+    )
 
     dbg = sub.add_parser("debug", help="Inspect/verify one component in isolation.")
     dbg_sub = dbg.add_subparsers(dest="debug_command", required=True)
@@ -156,6 +178,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Don't print the agent's reasoning/tool calls as they happen — "
         "just wait and show the finished report (the transcript is still in "
         "the JSON/Markdown output either way).",
+    )
+
+    dbg_strategy = dbg_sub.add_parser(
+        "strategy",
+        help="Run ONLY the strategy agent for one finding — emits the StrategyPlan, "
+        "runs neither track.",
+    )
+    dbg_strategy.add_argument("--db-subfolder", type=str, required=True)
+    dbg_strategy.add_argument("--gid", type=str, required=True, help="Global finding id.")
+
+    dbg_dynamic = dbg_sub.add_parser(
+        "dynamic",
+        help="Run ONLY the dynamic (QEMU+GDB) track for one finding — no static track, "
+        "no crosscheck, no joint evaluation, no report. The QEMU-only counterpart to "
+        "`debug build-cpg`/`debug script`'s Joern-only path.",
+    )
+    dbg_dynamic.add_argument("--db-subfolder", type=str, required=True)
+    dbg_dynamic.add_argument("--gid", type=str, required=True, help="Global finding id.")
+
+    dbg_fvvw = dbg_sub.add_parser(
+        "fvvw",
+        help="Run the COMPLETE fork-join (both tracks + joint_evaluate + write_report) "
+        "for one finding, dry run — not persisted to stage5/fvvw/reports/.",
+    )
+    dbg_fvvw.add_argument("--db-subfolder", type=str, required=True)
+    dbg_fvvw.add_argument("--gid", type=str, required=True, help="Global finding id.")
+    dbg_fvvw.add_argument(
+        "--output", type=str, default=None, help="Write the JSON report here (default: stdout)."
     )
 
     return parser.parse_args(argv)
@@ -201,9 +251,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
+    joern_only = getattr(args, "joern_only", False)
+    queue_fn = run_queue if joern_only else run_fvvw_queue
+    summary_path_fn = (
+        layout.stage5_summary_path if joern_only else layout.fvvw_summary_path
+    )
+
     try:
         summary = asyncio.run(
-            run_queue(
+            queue_fn(
                 db_subfolder=db_subfolder,
                 settings=settings,
                 only_global_ids=only,
@@ -220,8 +276,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         f"Candidates: {summary.total_candidates} total, {summary.total_verified} verified, "
         f"{summary.total_failed} failed"
     )
-    print(f"Verdicts: {summary.verdicts_by_type}")
-    print(f"Summary: {layout.stage5_summary_path(layout.stage5_dir(db_subfolder))}")
+    label = "Verdicts" if joern_only else "Mechanism confidence tallies"
+    print(f"{label}: {summary.verdicts_by_type}")
+    print(f"Summary: {summary_path_fn(layout.stage5_dir(db_subfolder))}")
+    if not joern_only:
+        print(
+            "(Full FVVW v3 fork-join run — pass --joern-only for the original "
+            "static-only pipeline.)"
+        )
     return 0
 
 
@@ -277,6 +339,30 @@ def _cmd_debug(args: argparse.Namespace) -> int:
                 print(render_report(report))
             else:
                 print(payload)
+        elif args.debug_command == "strategy":
+            result = asyncio.run(
+                fvvw_debug_mod.debug_strategy(Path(args.db_subfolder), args.gid)
+            )
+            print(f"target: {result.target.model_dump_json(indent=2)}")
+            print(f"plan: {result.plan.model_dump_json(indent=2)}")
+        elif args.debug_command == "dynamic":
+            result = asyncio.run(
+                fvvw_debug_mod.debug_dynamic(Path(args.db_subfolder), args.gid)
+            )
+            print(f"verdict: {result.result.verdict.value}")
+            print(f"proved_hypothesis: {result.result.proved_hypothesis}")
+            print(f"guard_logs: {result.guard_logs}")
+            print(f"gdb_transcript:\n{result.gdb_transcript}")
+        elif args.debug_command == "fvvw":
+            outcome = asyncio.run(fvvw_debug_mod.debug_fvvw(Path(args.db_subfolder), args.gid))
+            print(f"agreement: {outcome['agreement'].value}")
+            print(f"mechanism_confidence: {outcome['mechanism_confidence'].value}")
+            print(f"reachability_confidence: {outcome['reachability_confidence'].value}")
+            if args.output:
+                Path(args.output).write_text(outcome["report_markdown"], encoding="utf-8")
+                print(f"Report written to {args.output}")
+            else:
+                print(outcome["report_markdown"])
         else:  # pragma: no cover - argparse enforces valid subcommands
             return 2
     except (

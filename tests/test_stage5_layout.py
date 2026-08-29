@@ -42,3 +42,37 @@ def test_top_level_dirs_under_stage5():
     assert layout.workspace_root(stage5_dir_) == Path("/db/stage5/workspace")
     assert layout.debug_dir(stage5_dir_) == Path("/db/stage5/debug")
     assert layout.stage5_summary_path(stage5_dir_) == Path("/db/stage5/stage5_summary.json")
+
+
+# ---------------------------------------------------------------------- #
+# FVVW v3 fork-join layout — deliberately separate subtree
+# ---------------------------------------------------------------------- #
+
+
+def test_fvvw_dir_is_separate_subtree_of_stage5():
+    stage5_dir_ = layout.stage5_dir(Path("/db"))
+    fvvw_dir_ = layout.fvvw_dir(stage5_dir_)
+    assert fvvw_dir_ == Path("/db/stage5/fvvw")
+    assert layout.fvvw_reports_dir(fvvw_dir_) == Path("/db/stage5/fvvw/reports")
+    assert layout.fvvw_dynamic_workspace_root(fvvw_dir_) == Path(
+        "/db/stage5/fvvw/dynamic_workspace"
+    )
+
+
+def test_fvvw_dynamic_workspace_dir_uses_sanitized_gid():
+    fvvw_dir_ = Path("/db/stage5/fvvw")
+    result = layout.fvvw_dynamic_workspace_dir(fvvw_dir_, "bin#0000::c1")
+    assert result == Path("/db/stage5/fvvw/dynamic_workspace/bin#0000__c1")
+
+
+def test_fvvw_report_filenames_sanitize_double_colon():
+    assert layout.fvvw_report_json_filename("bin#0000::c1") == "bin#0000__c1.json"
+    assert layout.fvvw_report_markdown_filename("bin#0000::c1") == "bin#0000__c1.md"
+
+
+def test_fvvw_summary_path_separate_from_stage5_summary_path():
+    stage5_dir_ = layout.stage5_dir(Path("/db"))
+    fvvw_summary = layout.fvvw_summary_path(stage5_dir_)
+    stage5_summary = layout.stage5_summary_path(stage5_dir_)
+    assert fvvw_summary == Path("/db/stage5/fvvw_summary.json")
+    assert fvvw_summary != stage5_summary

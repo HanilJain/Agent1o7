@@ -267,3 +267,262 @@ class VerificationRunSummary(BaseModel):
     errors: list[str] = Field(default_factory=list)
     started_at: datetime
     finished_at: datetime | None = None
+
+
+# --------------------------------------------------------------------- #
+# FVVW v3 — fork-join schema (Stage 5 Phase 1). Everything below is
+# ADDITIVE: `VerificationReport`/`VerificationVerdict`/`EvaluatorVerdict`
+# above are the existing Joern static-track contract, embedded unchanged
+# as the evidence behind `TrackResult.evidence` for the static track. See
+# the FVVW v3 implementation plan's "Architecture: FVVW nodes -> existing
+# code" table for the full node-to-schema mapping.
+# --------------------------------------------------------------------- #
+
+
+class TargetMeta(BaseModel):
+    """`mem.target.*` — written once by `characterize_target`, read by the
+    strategy agent and both tracks. Mostly seeded from Stage 2's
+    `common.schemas.DecompiledBinary`/`ELFInfo` (already computed, no need
+    to re-derive); the two fields `ELFInfo` does NOT carry
+    (`is_pie`/`dispatch_resolvable`) are the ones `characterize_target`
+    actually has to compute itself, via `readelf`/binary inspection in the
+    verification sandbox — see that tool's own module docstring."""
+
+    arch: str = Field(description="e.g. arm, aarch64, mips, mipsel — from ELFInfo.arch.")
+    endianness: str = Field(description='"little" or "big", from ELFInfo.is_little_endian.')
+    is_64bit: bool | None = None
+    pie: bool | None = Field(
+        default=None,
+        description=(
+            "Position-independent (ET_DYN + no PT_INTERP-implied fixed base) — NOT "
+            "captured by common.schemas.ELFInfo, so characterize_target re-derives it "
+            "via `readelf -h` (ET_DYN vs ET_EXEC). None if undetermined."
+        ),
+    )
+    stripped: bool | None = None
+    libc: str | None = Field(
+        default=None,
+        description="Best-effort libc flavor (e.g. glibc/musl/uClibc), from ELFInfo.interpreter "
+        "or a strings/symbol scan. None if undetermined.",
+    )
+    func_offset: str = Field(
+        default="",
+        description="The claimed function's validated entry_point address in the REAL binary "
+        "(GhidraFunction.entry_point, cross-checked against the actual ELF) — empty string if "
+        "it couldn't be resolved/validated.",
+    )
+    dispatch_resolvable: bool = Field(
+        default=False,
+        description="Best-effort: can a static caller/dispatch mechanism to the target "
+        "function be resolved from the binary alone? Drives DynamicPlan.reach_strategy "
+        "(natural_drive vs inferior_call).",
+    )
+    binary_path: str = Field(
+        default="", description="Absolute host path to the real target ELF (rootfs_dir / "
+        "DecompiledBinary.rootfs_path) — what the dynamic track actually emulates."
+    )
+    rootfs_dir: str = Field(
+        default="", description="Absolute host path to the extracted firmware filesystem root "
+        "— what bringup_stabilize chroots/binds into the session container."
+    )
+
+
+class GuardSpec(BaseModel):
+    """One named guard/branch condition the dynamic track must satisfy —
+    the structured form the strategy agent derives from a Stage 3 finding's
+    PROSE `security_condition`/`data_flow` fields (see `common.findings.
+    Finding`) plus `mem.target.func_offset`-relative addressing."""
+
+    name: str = Field(description="Human-readable guard name, e.g. 'acscli2_acs_restart'.")
+    addr: str = Field(default="", description="Address of the guard's branch/check, if resolved.")
+    forced_value: str = Field(
+        default="", description="The value satisfy_guards must force this guard to, to open "
+        "the path being tested."
+    )
+
+
+class StaticPlan(BaseModel):
+    """`mem.plan.static` — the strategy agent's translation of the finding
+    into terms the EXISTING Joern static track (`agent.graph.
+    build_verifier_graph`, reused unchanged) and the new `static_crosscheck`
+    tool can act on. `target_function`/`source_fields`/`sink_names` feed
+    `fvvw.static_track.render_static_brief`'s enrichment of the existing
+    `prompts.render_finding_brief` text; `expected_intermediate_calls`/
+    `sanitizer_patterns` feed `static_crosscheck` directly."""
+
+    target_function: str
+    source_fields: list[str] = Field(default_factory=list)
+    sink_names: list[str] = Field(default_factory=list)
+    expected_intermediate_calls: list[str] = Field(default_factory=list)
+    sanitizer_patterns: list[str] = Field(default_factory=list)
+    crosscheck_required: bool = Field(
+        default=True,
+        description="Whether static_crosscheck must run — true whenever the finding's "
+        "evidence traces back to decompiler output (the common case).",
+    )
+    decisive_observable: str = Field(
+        description="The finding's decisive observable, restated in static/CPGQL terms."
+    )
+
+
+class DynamicPlan(BaseModel):
+    """`mem.plan.dynamic` — the strategy agent's translation of the finding
+    into a concrete QEMU+GDB test the dynamic track's nodes execute
+    (`tools.qemu_gdb_tool`, `fvvw.dynamic_track`)."""
+
+    reach_strategy: str = Field(
+        description='"natural_drive" (drive via argv/env/NVRAM through the binary\'s own '
+        'dispatch) or "inferior_call" (break at the functional main and call the target '
+        "function directly) — chosen from mem.target.dispatch_resolvable."
+    )
+    entry_addr: str = Field(
+        default="", description='Functional "main": post-CRT dispatcher entry.'
+    )
+    target_addr: str = Field(
+        default="", description="The claimed vulnerable function's address."
+    )
+    sink_addr: str = Field(
+        default="", description="The sink call's address, if statically resolved."
+    )
+    guards: list[GuardSpec] = Field(default_factory=list)
+    argv_template: list[str] = Field(default_factory=list)
+    payload_marker: str = Field(
+        description="The benign, distinguishing marker to inject — e.g. "
+        "';touch /tmp/<claim_id>_proof;'. NEVER a functional exploit/reverse-shell/exfil "
+        "payload; validated by instrument_trigger before use (hard invariant)."
+    )
+    required_signals: list[str] = Field(
+        default_factory=list,
+        description="The >=3 independent signals collect_signals must gather, e.g. "
+        "['sink_argument_capture', 'target_self_report', 'filesystem_artifact'].",
+    )
+    decisive_observable: str = Field(
+        description="The finding's decisive observable, restated in dynamic/GDB terms — "
+        "must match StaticPlan.decisive_observable's underlying claim (validated post-check)."
+    )
+
+
+class Hypotheses(BaseModel):
+    """`mem.plan.hypotheses` — the A/B pair `dynamic_evaluate`'s hypothesis
+    switch (FVVW §9) tests, and `joern_evaluate`'s confirm/refute/inconclusive
+    taxonomy already implicitly expresses."""
+
+    a: str = Field(description="Hypothesis A: the exploitable scenario.")
+    b: str = Field(description="Hypothesis B: the constrained/safe scenario.")
+    decisive_observable: str = Field(
+        description="The single observable that discriminates A from B, expressible by "
+        "either track independently — must match both plans' own decisive_observable."
+    )
+
+
+class StrategyPlan(BaseModel):
+    """`mem.plan.*` — the `strategy_agent` LLM node's full output (FVVW §6
+    node 3). One LLM pass merges what the design doc calls three
+    conceptual steps (threat model, hypotheses, per-track plan
+    compilation) into one structured response."""
+
+    threat_model: dict = Field(
+        default_factory=dict,
+        description="normal_data_flow, attack_scenario, trust_boundary (precisely stated, "
+        "e.g. 'the argv[2] value', never 'network input' unless evidenced), and "
+        "access_requirement (never an unearned 'unauthenticated remote' claim).",
+    )
+    hypotheses: Hypotheses
+    static_plan: StaticPlan
+    dynamic_plan: DynamicPlan
+    static_runnable: bool = Field(
+        default=True,
+        description="False ONLY for hard infeasibility (no source for a CPG) — never merely "
+        "'expected to be hard'.",
+    )
+    dynamic_runnable: bool = Field(
+        default=True,
+        description="False ONLY for hard infeasibility (no QEMU support for mem.target.arch) "
+        "— never merely 'expected to be hard'.",
+    )
+
+
+class TrackResult(BaseModel):
+    """`mem.static.result` / `mem.dynamic.result` — one track's terminal
+    outcome, in the shape `joint_evaluate` (the only node reading both)
+    consumes. For the static track, `evidence` embeds the existing
+    `VerificationReport` (the unmodified Joern pipeline's own output) as a
+    dict; for the dynamic track, `evidence` carries the GDB transcript +
+    signal captures."""
+
+    verdict: VerificationVerdict = Field(
+        description="confirmed/refuted/inconclusive/error, reusing the SAME enum the "
+        "existing static track already produces."
+    )
+    proved_hypothesis: str = Field(
+        default="none", description='"A", "B", or "none".'
+    )
+    evidence: dict = Field(default_factory=dict)
+    iters_used: int = 0
+
+
+class Agreement(str, Enum):
+    """`mem.joint.agreement` — how the two independent tracks' terminal
+    verdicts relate. Fixed by `fvvw.joint.joint_evaluate`'s rule engine —
+    not something a downstream consumer should extend without updating
+    that function too."""
+
+    CONCORDANT_CONFIRM = "concordant_confirm"
+    CONCORDANT_REFUTE = "concordant_refute"
+    DISCORDANT = "discordant"
+    ONE_SIDED = "one_sided"
+
+
+class MechanismConfidence(str, Enum):
+    """`mem.joint.mechanism_confidence` — does unsanitized attacker data
+    reach the sink unmodified, IF the path is taken."""
+
+    CONFIRMED_STRONG = "confirmed_strong"
+    """Both tracks independently confirmed (>= 3 corroborating signals, per
+    FVVW's multi-signal-corroboration principle)."""
+    CONFIRMED_SINGLE_TRACK = "confirmed_single_track"
+    """Only one track ran to a confirmed verdict; the other was
+    inconclusive/not_run — not a discordant disagreement."""
+    DISCORDANT_HOLD = "discordant_hold"
+    """One track confirmed, the other refuted — routed to human review,
+    NEVER auto-resolved by trusting one track by default."""
+    INCONCLUSIVE = "inconclusive"
+
+
+class ReachabilityConfidence(str, Enum):
+    """`mem.joint.reachability_confidence` — can the path be reached in
+    production, independent of the mechanism axis (FVVW's two-axis-truth
+    principle: these are never collapsed into one boolean)."""
+
+    CONFIRMED = "confirmed"
+    CONDITIONAL = "conditional"
+    FORCED_UNKNOWN = "forced_unknown"
+    """A guard was forced to reach the sink rather than satisfied by
+    attacker-controlled input — caps confidence here, never raises it."""
+    REFUTED = "refuted"
+
+
+class FVVWReport(BaseModel):
+    """The fork-join run's on-disk artifact: `stage5/fvvw/<gid>.json`.
+    Assembled by `fvvw.graph`'s driver from the terminal STM after
+    `joint_evaluate`/`write_report` — embeds both tracks' own results
+    rather than replacing `VerificationReport` (which remains the static
+    track's own persisted artifact at `stage5/verifications/<gid>.json`,
+    unchanged)."""
+
+    schema_version: int = 1
+    global_id: str
+    bin_id: str
+    static_result: TrackResult
+    dynamic_result: TrackResult
+    agreement: Agreement
+    mechanism_confidence: MechanismConfidence
+    reachability_confidence: ReachabilityConfidence
+    residual_unknowns: list[str] = Field(default_factory=list)
+    report_markdown: str = ""
+    """The `write_report` LLM node's composed seven-layer disclosure
+    document plus reconciliation section (FVVW §11) — Markdown, not
+    re-parsed by anything downstream."""
+    started_at: datetime
+    finished_at: datetime | None = None
+    trace_url: str | None = None

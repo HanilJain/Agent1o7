@@ -43,3 +43,48 @@ def test_run_subcommand_decisions_defaults_to_none():
 def test_run_subcommand_decisions_flag_is_captured_raw():
     args = _parse_args(["run", "--db-subfolder", "x", "--decisions", "CONTEXT_REQUIRED"])
     assert args.decisions == "CONTEXT_REQUIRED"
+
+
+# ---------------------------------------------------------------------- #
+# --joern-only (Stage 5 FVVW v3 Phase 6) — `run` defaults to the fork-join;
+# this flag reaches the ORIGINAL static-only pipeline unchanged.
+# ---------------------------------------------------------------------- #
+
+
+def test_run_subcommand_joern_only_defaults_to_false():
+    args = _parse_args(["run", "--db-subfolder", "x"])
+    assert args.joern_only is False
+
+
+def test_run_subcommand_joern_only_flag_sets_true():
+    args = _parse_args(["run", "--db-subfolder", "x", "--joern-only"])
+    assert args.joern_only is True
+
+
+# ---------------------------------------------------------------------- #
+# New per-track debug subcommands (Stage 5 FVVW v3 Phase 6)
+# ---------------------------------------------------------------------- #
+
+
+def test_debug_strategy_subcommand_parses():
+    args = _parse_args(["debug", "strategy", "--db-subfolder", "x", "--gid", "g"])
+    assert args.debug_command == "strategy"
+    assert args.db_subfolder == "x"
+    assert args.gid == "g"
+
+
+def test_debug_dynamic_subcommand_parses():
+    args = _parse_args(["debug", "dynamic", "--db-subfolder", "x", "--gid", "g"])
+    assert args.debug_command == "dynamic"
+    assert args.gid == "g"
+
+
+def test_debug_fvvw_subcommand_parses_with_optional_output():
+    args = _parse_args(["debug", "fvvw", "--db-subfolder", "x", "--gid", "g"])
+    assert args.debug_command == "fvvw"
+    assert args.output is None
+
+    args2 = _parse_args(
+        ["debug", "fvvw", "--db-subfolder", "x", "--gid", "g", "--output", "out.md"]
+    )
+    assert args2.output == "out.md"

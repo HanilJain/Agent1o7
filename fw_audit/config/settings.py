@@ -517,6 +517,82 @@ class Settings(BaseSettings):
     cleaned up — debugging convenience, mirrors `stage3_debug_dump`'s
     "manual testing/verification only" posture."""
 
+    # ---- Stage 5 FVVW v3: fork-join orchestration (strategy agent + report) -
+    stage5_strategy_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_STRATEGY_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_STRATEGY_AGENT` — falls back
+    to `stage5_verifier_model` like the generator/evaluator roles do. The
+    strategy agent produces the threat model, A/B hypotheses, and both
+    tracks' plans in one pass (`stage5_verification.fvvw.strategy`)."""
+    stage5_report_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_REPORT_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_REPORT_WRITER` — falls back
+    to `stage5_verifier_model`. Composes the final disclosure Markdown
+    (`stage5_verification.fvvw.report`)."""
+    stage5_checkpoint_backend: str = Field(
+        default="memory", validation_alias="FWA_STAGE5_CHECKPOINT_BACKEND"
+    )
+    """`"memory"` (LangGraph `MemorySaver`, per-process, tests/dev) or
+    `"sqlite"` (persists across process restarts, needed for
+    `bringup_stabilize` repair resume in a long-running production queue).
+    Unrecognized values raise `ValueError` at graph-build time, same
+    "no silent fallback" posture as `executor_backend`."""
+
+    # ---- Stage 5 FVVW v3: dynamic (QEMU+GDB) verification track ----------
+    stage5_verification_image: str = Field(
+        default="fw-audit-verification-sandbox:latest",
+        validation_alias="FWA_STAGE5_VERIFICATION_IMAGE",
+    )
+    """The superset sandbox image (`docker/Dockerfile.verification`) backing
+    `characterize_target`, `static_crosscheck`, and the whole dynamic track
+    — Joern's own `SandboxExecutor` calls keep pointing at
+    `stage5_joern_image`/`Dockerfile.joern` unchanged; this is a SEPARATE
+    image, not a replacement, so the static track is never affected by
+    anything installed here."""
+    stage5_qemu_timeout_seconds: int = Field(
+        default=120, ge=1, validation_alias="FWA_STAGE5_QEMU_TIMEOUT_SECONDS"
+    )
+    """Wall-clock cap for one QEMU launch/bring-up step inside a dynamic
+    session (`bringup_stabilize`, `reach_target`)."""
+    stage5_gdb_timeout_seconds: int = Field(
+        default=60, ge=1, validation_alias="FWA_STAGE5_GDB_TIMEOUT_SECONDS"
+    )
+    """Wall-clock cap for one `gdb-multiarch -batch -x recipe.gdb` call
+    (`reach_target`/`satisfy_guards`/`instrument_trigger`)."""
+    stage5_bringup_max_repairs: int = Field(
+        default=5, ge=1, validation_alias="FWA_STAGE5_BRINGUP_MAX_REPAIRS"
+    )
+    """Cap on `bringup_stabilize` repair attempts within one dynamic-track
+    run before giving up and writing `mem.dynamic.result = not_run` — bounds
+    the repair loop the same way `stage5_max_agent_iterations` bounds the
+    static generate/evaluate loop."""
+    stage5_dynamic_max_iterations: int = Field(
+        default=4, ge=1, validation_alias="FWA_STAGE5_DYNAMIC_MAX_ITERATIONS"
+    )
+    """Cap on `dynamic_evaluate`'s retry/hypothesis-switch loop (reach ->
+    guards -> trigger -> collect -> evaluate), per active hypothesis, before
+    forcing an `inconclusive` terminal verdict — see FVVW's hypothesis A/B
+    switching logic."""
+    stage5_allow_network_grant: bool = Field(
+        default=False, validation_alias="FWA_STAGE5_ALLOW_NETWORK_GRANT"
+    )
+    """Master switch for `bringup_stabilize`'s scoped, per-run network grant
+    (FVVW §8/§12): when `False` (the default), every dynamic-track container
+    stays `--network=none` even if a target would otherwise need a reachable
+    socket — that repair case is instead reported as a residual unknown
+    rather than silently opening egress. Set `True` only for an operator who
+    has read and accepted that a specific run's container may gain scoped,
+    revoked-after egress."""
+    stage5_dynamic_workspace_root: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_DYNAMIC_WORKSPACE_ROOT"
+    )
+    """Override for where a dynamic-track session's rootfs copy/scratch
+    files are staged on the host before being bind-mounted — defaults to
+    `stage5/workspace/<gid>/dynamic/` under the run's own `db_subfolder`
+    (see `stage5_verification.layout`) when unset."""
+
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names
     # (binwalk/unsquashfs/etc.) are no longer configurable here — those run

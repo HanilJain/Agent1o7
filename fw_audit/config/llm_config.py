@@ -118,6 +118,21 @@ class AgentRole(str, Enum):
     docstring). Independently overridable
     (`FWA_STAGE5_EVALUATOR_MODEL=ollama:qwen3:32b`) from the generator role,
     e.g. to mix a cheap local generator with a stronger judge."""
+    STAGE5_STRATEGY_AGENT = "stage5_strategy_agent"
+    """FVVW v3's single merged strategy role
+    (`stage5_verification.fvvw.strategy`): one LLM pass produces the threat
+    model, hypothesis A/B pair, and BOTH tracks' plans (`StaticPlan`/
+    `DynamicPlan`) for one finding. Runs once per finding, before either
+    track starts — genuinely open-ended reasoning (see FVVW's own "why LLM"
+    rationale for this node), unlike the deterministic joint evaluator.
+    Overridable via `FWA_STAGE5_STRATEGY_MODEL`, falling back to
+    `stage5_verifier_model` like the generator/evaluator roles."""
+    STAGE5_REPORT_WRITER = "stage5_report_writer"
+    """FVVW v3's disclosure-report role (`stage5_verification.fvvw.report`):
+    composes the final seven-layer Markdown report plus reconciliation
+    section from the completed STM — professional narrative composition,
+    genuinely open-ended. Overridable via `FWA_STAGE5_REPORT_MODEL`,
+    falling back to `stage5_verifier_model`."""
 
 
 @dataclass(frozen=True)
@@ -162,6 +177,13 @@ ROLE_TO_TIER: dict[AgentRole, ModelTier] = {
     # commonly to a local Ollama qwen3 model.
     AgentRole.STAGE5_SCRIPT_GENERATOR: ModelTier.HIGH_REASONING,
     AgentRole.STAGE5_RESULT_EVALUATOR: ModelTier.HIGH_REASONING,
+    # FVVW v3's two new LLM roles get the same HIGH_REASONING default —
+    # both the strategy plan and the disclosure report are reasoning-heavy,
+    # genuinely open-ended generation. `FWA_STAGE5_STRATEGY_MODEL`/
+    # `FWA_STAGE5_REPORT_MODEL` (falling back to `FWA_STAGE5_VERIFIER_MODEL`)
+    # override either independently.
+    AgentRole.STAGE5_STRATEGY_AGENT: ModelTier.HIGH_REASONING,
+    AgentRole.STAGE5_REPORT_WRITER: ModelTier.HIGH_REASONING,
 }
 
 # ---------------------------------------------------------------------- #
@@ -222,6 +244,8 @@ _ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, tuple[str, ...]] = {
     AgentRole.STAGE5_VERIFIER: ("stage5_verifier_model",),
     AgentRole.STAGE5_SCRIPT_GENERATOR: ("stage5_generator_model", "stage5_verifier_model"),
     AgentRole.STAGE5_RESULT_EVALUATOR: ("stage5_evaluator_model", "stage5_verifier_model"),
+    AgentRole.STAGE5_STRATEGY_AGENT: ("stage5_strategy_model", "stage5_verifier_model"),
+    AgentRole.STAGE5_REPORT_WRITER: ("stage5_report_model", "stage5_verifier_model"),
 }
 
 

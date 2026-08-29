@@ -1,0 +1,147 @@
+# syntax=docker/dockerfile:1
+#
+# fw-audit verification-sandbox image — Stage 5 FVVW v3's SUPERSET sandbox,
+# backing the session-capable side of `fw_audit/executors/sandbox_executor.py`
+# (`start()`/`exec_in_session()`/`stop()`) for `characterize_target`,
+# `static_crosscheck`, and the whole QEMU+GDB dynamic-verification track.
+#
+# DELIBERATELY SEPARATE from docker/Dockerfile.joern, never a replacement
+# for it: the existing Joern static track keeps pointing
+# `SandboxExecutor`/`joern_executor()` at `Settings.stage5_joern_image`
+# (`fw-audit-joern:latest`, built from `Dockerfile.joern`) completely
+# unchanged. Bundling QEMU/GDB/binwalk into that image would (a) tax every
+# one-shot `run()` call the static generate/run loop already makes for zero
+# benefit to it, and (b) risk destabilizing a pipeline this project commits
+# to never touching except when strictly required — see the FVVW v3
+# implementation plan's "hard reuse constraints". This image is used ONLY
+# by the new `tools/characterize_tool.py`, `tools/crosscheck_tool.py`, and
+# `tools/qemu_gdb_tool.py` — every one of them resolves its executor via
+# `verification_executor()` (mirrors `joern_executor()`), never via the
+# Joern helper.
+#
+# Reuses `Dockerfile.joern`'s fetch stage byte-for-byte (same pinned
+# release, same sha256-verified COPY-not-curl pattern — see that file's
+# header for why network `RUN curl` mid-build isn't reliable here) so this
+# image's Joern install is bit-identical to the dedicated Joern image; the
+# runtime stage then layers the FVVW v3 dynamic-track toolchain on top:
+#
+#   - binwalk               — characterize_target's firmware/arch ID + extraction
+#     (+ p7zip, unzip, jefferson, sasquatch for squashfs where available)
+#   - qemu-user-static       — ALL user-mode QEMU targets (qemu-arm, qemu-aarch64,
+#     qemu-mips, qemu-mipsel, qemu-mips64, qemu-mips64el, qemu-ppc, qemu-ppc64, ...)
+#   - qemu-system-arm/-mips  — for plan_emulation's system-mode (full-kernel boot) path
+#   - gdb-multiarch          — the one GDB binary every dynamic session drives
+#     (never a native single-arch `gdb` — targets are cross-architecture)
+#   - binutils-multiarch     — multi-arch objdump/readelf/nm, used by
+#     characterize_target and static_crosscheck
+#   - file, strings, xxd     — standard unpacking/inspection utilities
+#
+# Network posture at runtime: `--network=none` by default (SandboxExecutor's
+# session `start()`), same as every other sandbox image in this project. The
+# ONE exception is a scoped, per-run, revoked-after grant `bringup_stabilize`
+# may request for a specific emulated target — see `Settings.
+# stage5_allow_network_grant` and `SandboxExecutor.start(network=...)`; that
+# grant is a runtime `docker network` choice this image has no opinion on.
+#
+# BUILD time needs network for apt only, plus the same pre-fetched Joern zip
+# `Dockerfile.joern` needs (this stage reuses it) — fetch it once per
+# machine (see Dockerfile.joern's header for the exact curl command) before
+# building:
+#
+#   docker build -f docker/Dockerfile.verification \
+#       -t fw-audit-verification-sandbox:latest .
+#
+# SESSION-CAPABLE, not one-shot: unlike Dockerfile.joern's image (started
+# fresh via `docker run --rm` per tool call, state on the bind-mounted
+# workspace), this image is also started via `SandboxExecutor.start()` as a
+# long-lived `docker run -d` container that `exec_in_session()` calls
+# `docker exec` into repeatedly across one dynamic-track run (QEMU stays
+# running, GDB stays attached, across `reach_target` -> `satisfy_guards` ->
+# `instrument_trigger` -> `collect_signals`) — see `executors/
+# sandbox_executor.py`'s module docstring for the full session-capability
+# rationale. `characterize_target`/`static_crosscheck` still use the plain
+# one-shot `run()` against this same image, since they're single commands.
+
+# ---------------------------------------------------------------------------
+# Stage A: fetch — verify and unpack the Joern release (identical to
+# Dockerfile.joern's fetch stage; kept in sync deliberately, see header).
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS fetch
+
+ARG JOERN_VERSION=4.0.420
+ARG JOERN_CLI_SHA256=d30760165d964e141d5cd6a1841912a5c7bbf92910b6ba022f2b74e73ba0ce81
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/.joern-cli.zip /tmp/joern-cli.zip
+RUN echo "${JOERN_CLI_SHA256}  /tmp/joern-cli.zip" | sha256sum -c - \
+    && mkdir -p /opt/joern \
+    && unzip -q /tmp/joern-cli.zip -d /opt/joern \
+    && find /opt/joern/joern-cli -maxdepth 1 -type f ! -name '*.bat' \
+        -exec chmod +x {} + \
+    && rm -f /tmp/joern-cli.zip
+
+# ---------------------------------------------------------------------------
+# Stage B: runtime — the image SandboxExecutor's session capability runs.
+# ---------------------------------------------------------------------------
+# eclipse-temurin:17-jdk-jammy (same base Dockerfile.joern uses, for the
+# same JDK-for-Joern + apt-consistency reasons) rather than a leaner base —
+# this image needs BOTH Joern's JVM toolchain (characterize_target and
+# static_crosscheck may still shell out to Joern-adjacent inspection, and
+# keeping one base means one apt cache/behavior to reason about) and the
+# dynamic-track's native toolchain (qemu/gdb/binutils), so there is no
+# meaningful size win in trying to strip Joern back out here.
+FROM eclipse-temurin:17-jdk-jammy AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 ca-certificates \
+        binwalk p7zip-full unzip jefferson \
+        qemu-user-static qemu-system-arm qemu-system-mips \
+        gdb-multiarch binutils-multiarch \
+        file binutils xxd \
+    && rm -rf /var/lib/apt/lists/*
+# sasquatch (unofficial squashfs variant support) is intentionally NOT
+# apt-installed above — Debian/Ubuntu carry no official package for it and
+# it is only needed for certain non-standard vendor squashfs images that
+# Stage 1's own extraction already handles upstream of Stage 5; add a
+# built-from-source layer here if a specific firmware later needs it inside
+# this sandbox too, rather than speculatively building it for every image.
+
+COPY --from=fetch /opt/joern /opt/joern
+ENV PATH="/opt/joern/joern-cli:${PATH}"
+
+# Non-root, same posture as every other sandbox image in this project — see
+# Dockerfile.joern's own comment on why a bind-mounted single-file/tree
+# workspace doesn't need root inside the container. QEMU user-mode emulation
+# and gdb-multiarch both run fine as a non-root user against files the
+# container itself owns (staged into /work by the tool layer before a
+# session starts); a specific dynamic-track need for elevated privilege
+# inside the sandbox (e.g. a chroot requiring root) is granted per-command
+# via `docker exec -u root` at the call site in `tools/qemu_gdb_tool.py`,
+# not baked into this image's default user.
+RUN useradd -m -u 1000 verifier && mkdir -p /work && chown -R verifier:verifier /work
+USER verifier
+
+# BUILD-TIME SMOKE TESTS — prove the two toolchains this image bundles both
+# work, at build time rather than mid-run. Joern check mirrors
+# Dockerfile.joern's own smoke test exactly (same CPG-positional,
+# println-required contract — see tools/joern_tool.py's docstring). The
+# qemu/gdb check only verifies the binaries execute and report a version;
+# it does not attempt a real emulation (that needs a target binary + rootfs,
+# which this build has neither), matching Dockerfile.ghidra/joern's own
+# "prove the tool runs, not a full pipeline" scope for a smoke test.
+RUN mkdir -p /tmp/smoke && cd /tmp/smoke \
+    && printf 'int main() { return 0; }\n' > whole.c \
+    && joern-parse whole.c --output cpg.bin \
+    && printf 'println(cpg.method.name.l)\n' > smoke.sc \
+    && joern --script smoke.sc cpg.bin \
+    && rm -rf /tmp/smoke \
+    && qemu-arm --version \
+    && qemu-mipsel --version \
+    && gdb-multiarch --version \
+    && objdump --version \
+    && binwalk --help > /dev/null
+
+WORKDIR /work
