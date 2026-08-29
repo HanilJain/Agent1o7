@@ -306,60 +306,7 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
                 )
             ctx.applied_fixes.append(f"staged {arch_spec.user_binary} into rootfs")
 
-        # Launch QEMU in the background inside the session so this call
-        # returns quickly and reach_target can connect the GDB stub next —
-        # `&` backgrounds it inside the container's shell, `disown` detaches
-        # it from the exec'd shell's job table so it survives that shell
-        # exiting (the exec_in_session call itself completes once the
-        # background job is started, not once QEMU exits). stdout/stderr
-        # are redirected to a log file rather than discarded: if QEMU dies
-        # immediately (bad chroot, missing interpreter/libs, unsupported
-        # syscall) the only symptom would otherwise be a silent gdbstub
-        # readiness-probe timeout with no clue why — see the DynamicFault
-        # raised below, which reads this log back into its message.
-        await ctx.session_executor.exec_in_session(
-            ctx.handle,
-            f"cd {CONTAINER_WORKDIR} && "
-            f"({launch_cmd} > {_QEMU_LOG_PATH} 2>&1 &) ",
-            timeout=ctx.settings.stage5_qemu_timeout_seconds,
-        )
-
-        # Backgrounding the launch means this call returns as soon as the
-        # shell accepts the job, NOT once QEMU has actually bound the GDB
-        # stub's listening port — reach_target's very first GDB command is
-        # `target remote localhost:1234`, which races that bind and fails
-        # with "Connection refused" if it runs first. That failure matches
-        # `_looks_like_setup_fault` and used to route back to
-        # `bringup_stabilize`, which just re-launched QEMU and retried at
-        # the same speed — a repair that never addressed the actual defect,
-        # burning the whole `stage5_bringup_max_repairs` budget on a pure
-        # timing race. Poll for the port here instead, bounded by
-        # `stage5_qemu_timeout_seconds`, so `reach_target` only ever runs
-        # once QEMU is actually listening (or bringup fails fast and
-        # honestly if it never does).
-        probe = (
-            "for i in $(seq 1 50); do "
-            "grep -q ':04D2 ' /proc/net/tcp 2>/dev/null && exit 0; "
-            "sleep 0.2; "
-            "done; exit 1"
-        )
-        readiness = await ctx.session_executor.exec_in_session(
-            ctx.handle,
-            probe,
-            timeout=ctx.settings.stage5_qemu_timeout_seconds,
-        )
-        if not readiness.ok:
-            log_result = await ctx.session_executor.exec_in_session(
-                ctx.handle,
-                f"cat {_QEMU_LOG_PATH} 2>/dev/null",
-                timeout=ctx.settings.stage5_qemu_timeout_seconds,
-            )
-            qemu_output = (log_result.stdout + log_result.stderr).strip() or "(empty)"
-            raise DynamicFault(
-                f"{ctx.candidate.global_id}: QEMU gdbstub never opened port 1234 "
-                f"within the readiness window — launch_cmd={launch_cmd!r} "
-                f"qemu_output={qemu_output!r}"
-            )
+        await _launch_qemu_and_wait(ctx)
 
         if run is not None:
             run.end(
@@ -367,11 +314,71 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
                     "launch_cmd": launch_cmd,
                     "applied_fixes": list(ctx.applied_fixes),
                     "network_granted": network_name is not None,
-                    "gdbstub_ready": readiness.ok,
                 }
             )
 
     return ctx.handle
+
+
+async def _launch_qemu_and_wait(ctx: BringupContext) -> None:
+    """(Re)launch the backgrounded QEMU user-mode process and block until
+    its GDB stub is listening on port 1234. Uses `ctx.launch_cmd` (built by
+    `bringup_stabilize`), redirecting QEMU's stdout/stderr to a log file so
+    a silent readiness timeout carries QEMU's own diagnostic.
+
+    Idempotent by design — it kills any prior QEMU first — because it is
+    called before EVERY GDB batch, not just once: user-mode QEMU runs the
+    target to completion and exits the instant a `gdb -batch` client
+    disconnects, so the reach/guards/trigger batches cannot share one QEMU
+    and each needs its own fresh launch. Raises `DynamicFault` (retriable
+    via bringup's repair budget) if the stub never opens.
+
+    Backgrounding means this returns as soon as the shell accepts the job,
+    NOT once QEMU has bound the port — a GDB `target remote localhost:1234`
+    that ran first would race the bind and fail with connection refused, so
+    the readiness poll here is what makes the subsequent batch reliable."""
+    if ctx.handle is None:
+        raise DynamicFault(f"{ctx.candidate.global_id}: no active session to launch QEMU in.")
+
+    arch, endianness = ctx.emulation_plan.get("arch_spec_key", ("unknown", ""))
+    arch_spec = resolve_qemu_arch_spec(arch, endianness)
+    # Kill any straggler from a previous batch (best-effort — pkill exits
+    # nonzero when nothing matches, which is fine); ` ; true` keeps the
+    # exec from reporting failure on the common "nothing to kill" case.
+    if arch_spec is not None:
+        await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            f"pkill -f {arch_spec.user_binary} 2>/dev/null ; true",
+            timeout=ctx.settings.stage5_qemu_timeout_seconds,
+        )
+
+    await ctx.session_executor.exec_in_session(
+        ctx.handle,
+        f"cd {CONTAINER_WORKDIR} && ({ctx.launch_cmd} > {_QEMU_LOG_PATH} 2>&1 &) ",
+        timeout=ctx.settings.stage5_qemu_timeout_seconds,
+    )
+
+    probe = (
+        "for i in $(seq 1 50); do "
+        "grep -q ':04D2 ' /proc/net/tcp 2>/dev/null && exit 0; "
+        "sleep 0.2; "
+        "done; exit 1"
+    )
+    readiness = await ctx.session_executor.exec_in_session(
+        ctx.handle, probe, timeout=ctx.settings.stage5_qemu_timeout_seconds
+    )
+    if not readiness.ok:
+        log_result = await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            f"cat {_QEMU_LOG_PATH} 2>/dev/null",
+            timeout=ctx.settings.stage5_qemu_timeout_seconds,
+        )
+        qemu_output = (log_result.stdout + log_result.stderr).strip() or "(empty)"
+        raise DynamicFault(
+            f"{ctx.candidate.global_id}: QEMU gdbstub never opened port 1234 "
+            f"within the readiness window — launch_cmd={ctx.launch_cmd!r} "
+            f"qemu_output={qemu_output!r}"
+        )
 
 
 def _target_needs_network(plan: DynamicPlan) -> bool:
@@ -460,6 +467,9 @@ async def reach_target(
     async with aspan(
         "stage5.reach_target", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
     ) as run:
+        # QEMU is single-use per gdb batch (it runs to completion and exits
+        # on GDB disconnect), so relaunch a fresh one for this batch.
+        await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
             ctx.handle,
             f"cat > {CONTAINER_WORKDIR}/{recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
@@ -474,7 +484,7 @@ async def reach_target(
         if run is not None:
             run.end(outputs={"ok": result.ok, "stdout_excerpt": result.stdout[:500]})
 
-    if not result.ok and _looks_like_setup_fault(result.stderr):
+    if not result.ok and _looks_like_setup_fault(result.stdout + result.stderr):
         raise DynamicFault(
             f"{ctx.candidate.global_id}: reach_target GDB/QEMU setup fault: {result.stderr}"
         )
@@ -522,6 +532,8 @@ async def satisfy_guards(
     async with aspan(
         "stage5.satisfy_guards", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
     ) as run:
+        # Fresh QEMU for this batch (single-use per gdb disconnect).
+        await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
             ctx.handle,
             f"cat > {CONTAINER_WORKDIR}/{recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
@@ -536,7 +548,7 @@ async def satisfy_guards(
         if run is not None:
             run.end(outputs={"ok": result.ok, "guard_count": len(ctx.plan.guards)})
 
-    if not result.ok and _looks_like_setup_fault(result.stderr):
+    if not result.ok and _looks_like_setup_fault(result.stdout + result.stderr):
         raise DynamicFault(
             f"{ctx.candidate.global_id}: satisfy_guards GDB/QEMU setup fault: {result.stderr}"
         )
@@ -585,7 +597,20 @@ async def instrument_trigger(
     register = arch_spec.arg_registers[0] if arch_spec else "$r0"
 
     marker = "TRIGGER:sink_arg"
-    breakpoint_commands = render_trigger_breakpoint_commands(
+    # This is a FRESH QEMU run (see _launch_qemu_and_wait) — the guards
+    # forced in `satisfy_guards`'s separate run do not carry over, so this
+    # recipe must re-force them itself BEFORE the sink breakpoint, or the
+    # real (blocking) guard return would stop the path from ever reaching
+    # the sink and the capture would spuriously report "sink not reached".
+    guard_commands: list[str] = []
+    for guard in ctx.plan.guards:
+        guard_commands += render_guard_breakpoint_commands(
+            addr=guard.addr,
+            register=register,
+            forced_value=guard.forced_value,
+            log_marker=f"GUARD:{guard.name}",
+        )
+    breakpoint_commands = guard_commands + render_trigger_breakpoint_commands(
         sink_addr=ctx.plan.sink_addr or ctx.target.func_offset,
         argument_register=register,
         capture_marker=marker,
@@ -604,6 +629,8 @@ async def instrument_trigger(
         run_type="tool",
         inputs={"global_id": ctx.candidate.global_id},
     ) as run:
+        # Fresh QEMU for this batch (single-use per gdb disconnect).
+        await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
             ctx.handle,
             f"cat > {CONTAINER_WORKDIR}/{recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
@@ -619,7 +646,7 @@ async def instrument_trigger(
         if run is not None:
             run.end(outputs={"ok": result.ok, "captured": captured})
 
-    if not result.ok and _looks_like_setup_fault(result.stderr):
+    if not result.ok and _looks_like_setup_fault(result.stdout + result.stderr):
         raise DynamicFault(
             f"{ctx.candidate.global_id}: instrument_trigger GDB/QEMU setup fault: {result.stderr}"
         )
@@ -727,6 +754,8 @@ def _looks_like_setup_fault(stderr: str) -> bool:
     fault_markers = (
         "connection refused",
         "could not connect",
+        "connection timed out",
+        "connection closed",
         "no such file or directory",
         "not found",
         "permission denied",

@@ -13,6 +13,7 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     build_qemu_system_launch_command,
     build_qemu_user_launch_command,
     gdb_binary,
+    normalize_hex_addr,
     render_gdb_recipe,
     render_guard_breakpoint_commands,
     render_trigger_breakpoint_commands,
@@ -236,3 +237,43 @@ def test_render_trigger_breakpoint_commands_captures_sink_argument():
     )
     assert commands[0] == "break *0x00020ba8"
     assert any("TRIGGER:sink_arg" in c and "(char*)$r0" in c for c in commands)
+
+
+# ---------------------------------------------------------------------- #
+# normalize_hex_addr — GDB `break *<addr>` needs a 0x prefix on bare hex
+# ---------------------------------------------------------------------- #
+
+
+def test_normalize_hex_addr_prefixes_bare_hex():
+    # Ghidra/Stage 2 emit bare hex; GDB rejects `break *00400900` with
+    # 'Invalid number "00400900"' (observed on real MIPS firmware).
+    assert normalize_hex_addr("00400900") == "0x00400900"
+
+
+def test_normalize_hex_addr_passes_through_already_prefixed():
+    assert normalize_hex_addr("0x00400900") == "0x00400900"
+    assert normalize_hex_addr("0X1A2B") == "0X1A2B"
+
+
+def test_normalize_hex_addr_leaves_symbolic_operand_alone():
+    assert normalize_hex_addr("main") == "main"
+    assert normalize_hex_addr("fn+4") == "fn+4"
+
+
+def test_render_gdb_recipe_normalizes_bare_hex_entry_addr():
+    recipe = render_gdb_recipe(
+        architecture="mips", gdb_port=1234, entry_addr="00400900", breakpoint_commands=[]
+    )
+    assert "break *0x00400900" in recipe.splitlines()
+    assert "break *00400900" not in recipe
+
+
+def test_render_guard_and_trigger_normalize_bare_hex():
+    guard = render_guard_breakpoint_commands(
+        addr="000276dc", register="$a0", forced_value="1", log_marker="GUARD:g"
+    )
+    assert guard[0] == "break *0x000276dc"
+    trigger = render_trigger_breakpoint_commands(
+        sink_addr="00020ba8", argument_register="$a0", capture_marker="TRIGGER:t"
+    )
+    assert trigger[0] == "break *0x00020ba8"

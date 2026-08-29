@@ -236,6 +236,23 @@ def build_gdb_batch_command(recipe_relpath: str, target_relpath: str) -> str:
     )
 
 
+def normalize_hex_addr(addr: str) -> str:
+    """Normalize a code address to the `0x`-prefixed hex form GDB requires
+    for `break *<addr>`. Ghidra/Stage 2 emit bare hex (`00400900`), and a
+    strategy agent may echo that verbatim — GDB rejects a bare-hex operand
+    to `break *` with `Invalid number "00400900"`, since without `0x` it is
+    parsed as decimal and `0x`-less hex digits like `f` are invalid. Accept
+    both forms (already-prefixed passes through untouched) and leave a
+    genuinely symbolic operand (e.g. `main`, `*fn+4`) alone."""
+    a = addr.strip()
+    if a.lower().startswith("0x"):
+        return a
+    # Bare hex (only 0-9a-f) -> prefix it; anything else is symbolic, leave it.
+    if a and all(c in "0123456789abcdefABCDEF" for c in a):
+        return f"0x{a}"
+    return a
+
+
 def render_gdb_recipe(
     *,
     architecture: str,
@@ -256,7 +273,7 @@ def render_gdb_recipe(
         "set pagination off",
         "set confirm off",
         f"target remote localhost:{gdb_port}",
-        f"break *{entry_addr}",
+        f"break *{normalize_hex_addr(entry_addr)}",
         "continue",
         *breakpoint_commands,
     ]
@@ -274,7 +291,7 @@ def render_guard_breakpoint_commands(
     first return-value-bearing register (`arg_registers[0]`) unless the
     caller names a different one."""
     return [
-        f"break *{addr}",
+        f"break *{normalize_hex_addr(addr)}",
         "continue",
         f'printf "{log_marker}:real=%d\\n", {register}',
         f"set {register} = {forced_value}",
@@ -290,7 +307,7 @@ def render_trigger_breakpoint_commands(
     sink-argument-capture signal `collect_signals`/`dynamic_evaluate` reads
     to test the decisive observable."""
     return [
-        f"break *{sink_addr}",
+        f"break *{normalize_hex_addr(sink_addr)}",
         "continue",
         f'printf "{capture_marker}:%s\\n", (char*){argument_register}',
     ]
@@ -304,6 +321,7 @@ __all__ = [
     "build_qemu_system_launch_command",
     "build_qemu_user_launch_command",
     "gdb_binary",
+    "normalize_hex_addr",
     "render_gdb_recipe",
     "render_guard_breakpoint_commands",
     "render_trigger_breakpoint_commands",

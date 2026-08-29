@@ -642,6 +642,54 @@ async def test_instrument_trigger_captures_sink_argument(tmp_path: Path):
     assert captured == ";touch /tmp/claim_001_proof;"
 
 
+async def test_instrument_trigger_forces_guards_before_sink_in_same_run(tmp_path: Path):
+    """Regression: the trigger runs in a FRESH QEMU (single-use per gdb
+    disconnect), so guards forced in satisfy_guards' separate run do not
+    carry over — the trigger recipe must re-force the guards BEFORE the
+    sink breakpoint, or the real (blocking) guard return stops the path
+    from ever reaching the sink and the capture spuriously reports 'sink
+    not reached'."""
+    written_recipes: list[str] = []
+
+    def on_exec(command):
+        if "recipe_trigger.gdb" in command and command.startswith("cat >"):
+            written_recipes.append(command)
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    plan = _dynamic_plan(
+        entry_addr="0x1000",
+        sink_addr="0x2000",
+        guards=[GuardSpec(name="auth_check", addr="0x1500", forced_value="1")],
+    )
+    ctx = _ctx(tmp_path, session_executor=executor, plan=plan)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    await instrument_trigger(ctx)
+
+    assert written_recipes, "trigger recipe was never written"
+    recipe = written_recipes[0]
+    guard_bp = recipe.index("break *0x1500")
+    sink_bp = recipe.index("break *0x2000")
+    force = recipe.index("set $r0 = 1")  # _ctx fixture is ARM -> arg_registers[0] = $r0
+    assert guard_bp < sink_bp, "guard breakpoint must precede the sink breakpoint"
+    assert force < sink_bp, "guard must be forced before the sink is reached"
+
+
+async def test_instrument_trigger_relaunches_qemu_for_its_own_batch(tmp_path: Path):
+    """Each GDB node relaunches QEMU (it exited when the prior batch's gdb
+    disconnected) — the readiness probe must appear in this node's calls."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    await instrument_trigger(ctx)
+
+    assert any("04D2" in c for c in executor.exec_calls), (
+        "instrument_trigger did not relaunch + probe a fresh QEMU for its batch"
+    )
+
+
 async def test_collect_signals_reports_filesystem_artifact_and_self_report(tmp_path: Path):
     def on_exec(command):
         if command.startswith("test -e"):
