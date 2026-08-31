@@ -21,7 +21,14 @@ above (which stays the static track's own layout, unchanged)::
     fvvw/reports/<gid>.md      (the LLM-composed disclosure Markdown — fvvw.report.write_report)
     fvvw/dynamic_workspace/<gid>/  (dynamic-track scratch: GDB recipes, session
                                      bookkeeping — kept only if Settings.stage5_keep_workspace)
+    fvvw/logs/<gid>.dynamic.jsonl  (every QEMU/GDB command + full result — cmdlog.CommandLog)
+    fvvw/logs/<gid>.static.jsonl   (every Joern command + full result — cmdlog.CommandLog)
     fvvw_summary.json          (fork-join run-level summary, written by driver.run_fvvw_queue)
+
+`fvvw/logs/` is a SIBLING of `fvvw/dynamic_workspace/`, not nested under
+it — it survives workspace cleanup (`Settings.stage5_keep_workspace=False`
+still `rmtree`s the workspace but never touches `logs/`), since it's the
+one artifact meant to outlive an ordinary run regardless of that flag.
 
 `<gid>` is the global finding id `f"{chunk_id}::{finding_id}"` — same format
 and same `::` -> `__` filename sanitization as `stage4_rag.layout`.
@@ -137,3 +144,18 @@ def fvvw_summary_path(stage5_dir_: Path) -> Path:
     against the same `db_subfolder` never overwrite each other's
     bookkeeping."""
     return stage5_dir_ / "fvvw_summary.json"
+
+
+def fvvw_logs_dir(fvvw_dir_: Path) -> Path:
+    """Where both tracks' `cmdlog.CommandLog` JSONL files live — a sibling
+    of `dynamic_workspace/`, never cleaned up by `Settings.
+    stage5_keep_workspace`'s rmtree (see this module's docstring)."""
+    return fvvw_dir_ / "logs"
+
+
+def fvvw_command_log_path(fvvw_dir_: Path, global_id: str, track: str) -> Path:
+    """`track` is `"dynamic"` or `"static"` — one JSONL file per
+    (candidate, track), never shared, so the two tracks' command histories
+    stay independently greppable and neither can race the other's
+    `CommandLog` instance."""
+    return fvvw_logs_dir(fvvw_dir_) / f"{_sanitize_gid(global_id)}.{track}.jsonl"

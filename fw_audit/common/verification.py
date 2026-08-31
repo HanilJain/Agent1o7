@@ -523,6 +523,34 @@ class FVVWReport(BaseModel):
     """The `write_report` LLM node's composed seven-layer disclosure
     document plus reconciliation section (FVVW §11) — Markdown, not
     re-parsed by anything downstream."""
+    guard_logs: list[dict] = Field(default_factory=list)
+    """`fvvw.dynamic_track.satisfy_guards`'s per-guard
+    name/addr/real_value/forced_value log — computed by `run_fvvw` and
+    previously fed to `write_report` as LLM input only, then dropped.
+    Persisted here so a guard's REAL (un-overridden) default is checkable
+    without re-running the dynamic track, and so
+    `reachability_confidence=forced_unknown` has durable supporting
+    evidence."""
+    dynamic_gdb_transcript: str = ""
+    """The dynamic track's full concatenated GDB session transcript
+    (`run_dynamic_track_only`'s return value) — previously fed to
+    `write_report` as LLM input only, then dropped. This is the raw
+    material `fvvw/logs/<gid>.dynamic.jsonl`'s individual records are
+    assembled from; kept here too as one contiguous record matching what
+    the disclosure document was actually written from."""
+    crosscheck_evidence: dict = Field(default_factory=dict)
+    """`tools.crosscheck_tool.static_crosscheck`'s
+    `CrosscheckResult.to_evidence_dict()` — the disassembly-based
+    confirm/refute of `StaticPlan.expected_intermediate_calls`/
+    `.sanitizer_patterns`, an independent signal from the decompiled-C-based
+    Joern track. Previously computed and returned by `run_fvvw` but never
+    persisted."""
+    command_log_paths: dict[str, str] = Field(default_factory=dict)
+    """`{"static": "<path>", "dynamic": "<path>"}` — where each track's
+    `cmdlog.CommandLog` JSONL landed for THIS run, so a reader of the
+    report JSON doesn't have to re-derive `fvvw/logs/<gid>.<track>.jsonl`
+    from `global_id` by hand. Empty when `Settings.stage5_command_log` was
+    `False` for this run."""
     started_at: datetime
     finished_at: datetime | None = None
     trace_url: str | None = None

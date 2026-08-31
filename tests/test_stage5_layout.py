@@ -76,3 +76,19 @@ def test_fvvw_summary_path_separate_from_stage5_summary_path():
     stage5_summary = layout.stage5_summary_path(stage5_dir_)
     assert fvvw_summary == Path("/db/stage5/fvvw_summary.json")
     assert fvvw_summary != stage5_summary
+
+
+def test_fvvw_logs_dir_is_sibling_of_dynamic_workspace():
+    fvvw_dir_ = Path("/db/stage5/fvvw")
+    logs_dir = layout.fvvw_logs_dir(fvvw_dir_)
+    assert logs_dir == Path("/db/stage5/fvvw/logs")
+    assert logs_dir.parent == layout.fvvw_dynamic_workspace_root(fvvw_dir_).parent
+
+
+def test_fvvw_command_log_path_per_track_and_sanitized():
+    fvvw_dir_ = Path("/db/stage5/fvvw")
+    dynamic_path = layout.fvvw_command_log_path(fvvw_dir_, "bin#0000::c1", "dynamic")
+    static_path = layout.fvvw_command_log_path(fvvw_dir_, "bin#0000::c1", "static")
+    assert dynamic_path == Path("/db/stage5/fvvw/logs/bin#0000__c1.dynamic.jsonl")
+    assert static_path == Path("/db/stage5/fvvw/logs/bin#0000__c1.static.jsonl")
+    assert dynamic_path != static_path

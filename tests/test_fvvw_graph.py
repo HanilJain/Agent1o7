@@ -81,7 +81,10 @@ class _FakeSessionExecutor:
             return ExecutionResult(
                 command=command, returncode=0, stdout="FOUND\n", stderr="", timed_out=False
             )
-        if "target_stdout.log" in command:
+        # collect_signals reads the QEMU log path (`.fvvw_qemu.log`), not
+        # the never-written `target_stdout.log` — see dynamic_track.py's
+        # `_QEMU_LOG_PATH` and the fix in collect_signals.
+        if ".fvvw_qemu.log" in command and command.startswith("cat"):
             return ExecutionResult(
                 command=command,
                 returncode=0,
@@ -308,6 +311,20 @@ async def test_run_fvvw_concordant_confirm(monkeypatch, fake_executor, tmp_path:
     assert result["plan"].static_plan.target_function == "FUN_1"
     assert result["target"].arch == "arm"
 
+    # cmdlog: both tracks' JSONL command logs land on disk under
+    # stage5/fvvw/logs/, with real command/result content — not just the
+    # LangSmith span (which is a no-op without --trace).
+    deps = result["deps"]
+    dynamic_records = deps.dynamic_command_log.read_all()
+    static_records = deps.static_command_log.read_all()
+    assert dynamic_records, "dynamic track issued no commands to the log"
+    assert static_records, "static track issued no commands to the log"
+    assert any(r["kind"] == "exec_in_session" for r in dynamic_records)
+    assert any("gdb-multiarch" in r["command"] for r in dynamic_records)
+    assert deps.dynamic_command_log.path.exists()
+    assert deps.static_command_log.path.exists()
+    assert deps.dynamic_command_log.path != deps.static_command_log.path
+
 
 async def test_run_fvvw_static_confirmed_dynamic_unsupported_arch_is_one_sided(
     monkeypatch, fake_executor, tmp_path: Path
@@ -382,3 +399,100 @@ async def test_run_fvvw_raises_stage5_input_error_without_source_path(tmp_path: 
     candidate = _candidate(source_path=None, binary_path=None, rootfs_dir=None)
     with pytest.raises(Stage5InputError):
         await run_fvvw(candidate, db_subfolder=tmp_path, settings=Settings(_env_file=None))
+
+
+async def test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself(
+    monkeypatch, fake_executor, tmp_path: Path
+):
+    """Regression (Bug C): a DynamicFault raised by bringup_stabilize
+    ITSELF (staging failure, readiness-probe timeout) used to escape
+    run_dynamic_track_only uncaught — it was raised from inside the
+    `except DynamicFault:` handler in the main reach/guards/trigger loop,
+    which does not re-catch its own body's exceptions. That propagated all
+    the way out of run_fvvw as an unhandled DynamicFault instead of being
+    retried like every other dynamic-track fault. Model a session executor
+    whose FIRST exec_in_session call (the QEMU-staging copy inside
+    bringup_stabilize) fails, forcing a DynamicFault mid-loop, and assert
+    run_fvvw completes normally instead of raising."""
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+
+    class _FlakyThenOkSessionExecutor(_FakeSessionExecutor):
+        """Fails the QEMU-staging `cp` exactly once (triggering
+        DynamicFault from inside bringup_stabilize's in-loop repair call),
+        then behaves normally on every retry."""
+
+        def __init__(self):
+            super().__init__()
+            self._stage_attempts = 0
+
+        async def exec_in_session(self, handle, command, *, timeout=None):
+            if command.startswith("cp ") and "$(command -v" in command:
+                self._stage_attempts += 1
+                if self._stage_attempts == 1:
+                    return ExecutionResult(
+                        command=command,
+                        returncode=1,
+                        stdout="",
+                        stderr="cp: cannot stat: No such file or directory",
+                        timed_out=False,
+                    )
+            return await super().exec_in_session(handle, command, timeout=timeout)
+
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            (files / "cpg.bin").write_bytes(b"cpg")
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout="disasm\n", stderr="", timed_out=False
+            )
+        return ExecutionResult(
+            command=command,
+            returncode=0,
+            stdout="RESULT: FLOW_FOUND (1 path(s))",
+            stderr="",
+            timed_out=False,
+        )
+
+    joern_exec = fake_executor(on_run)
+    crosscheck_exec = fake_executor(on_run)
+    flaky_session = _FlakyThenOkSessionExecutor()
+
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.joern_executor", lambda settings: joern_exec
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_executor",
+        lambda settings: crosscheck_exec,
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_session_executor",
+        lambda settings: flaky_session,
+    )
+
+    settings = Settings(
+        _env_file=None, FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=2, FWA_STAGE5_BRINGUP_MAX_REPAIRS=5
+    )
+    # Must complete without raising DynamicFault.
+    result = await run_fvvw(candidate, db_subfolder=db_subfolder, settings=settings)
+    assert result["dynamic_result"] is not None
+    assert flaky_session._stage_attempts >= 2  # failed once, then retried successfully

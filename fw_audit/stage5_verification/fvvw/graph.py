@@ -42,6 +42,7 @@ from fw_audit.executors.base import Executor
 from fw_audit.executors.sandbox_executor import SandboxExecutor
 from fw_audit.stage5_verification import layout
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
+from fw_audit.stage5_verification.cmdlog import CommandLog, LoggingSessionExecutor
 from fw_audit.stage5_verification.errors import (
     Stage5InputError,
     VerifierModelUnavailableError,
@@ -51,6 +52,7 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BringupExhausted,
     DynamicFault,
     bringup_stabilize,
+    cleanup_marker_artifact,
     collect_signals,
     dynamic_evaluate,
     instrument_trigger,
@@ -106,7 +108,13 @@ class FVVWDeps:
     """Every resolved dependency the fork-join graph's nodes need, built
     once per `run_fvvw` call (mirrors `agent.verifier.verify_candidate`'s
     up-front role/executor resolution) — kept as one object rather than a
-    long parameter list threaded through every node closure."""
+    long parameter list threaded through every node closure.
+
+    `static_command_log`/`dynamic_command_log` are `CommandLog.disabled()`
+    no-ops when `Settings.stage5_command_log` is `False` — every consumer
+    (`run_static_track`'s `JsonlRecordingList`s, `dynamic_session_executor`
+    when wrapped in `LoggingSessionExecutor`) works unchanged either way, so
+    this flag never needs its own branch anywhere but here."""
 
     settings: Settings
     strategy_llm: BaseChatModel
@@ -118,6 +126,8 @@ class FVVWDeps:
     dynamic_session_executor: SandboxExecutor
     static_workspace_dir: Path
     dynamic_workspace_dir: Path
+    static_command_log: CommandLog
+    dynamic_command_log: CommandLog
     system_prompt: str | None = None
 
 
@@ -130,7 +140,13 @@ async def resolve_fvvw_deps(
     two new roles and the two new executor kinds. Raises
     `VerifierModelUnavailableError` if any of the four LLM roles can't be
     resolved — a fork-join run needs all of them, not just the static
-    track's two."""
+    track's two.
+
+    Also resolves the per-track `CommandLog`s (`stage5/fvvw/logs/<gid>.
+    <static|dynamic>.jsonl`) and wraps `dynamic_session_executor` in a
+    `LoggingSessionExecutor` so every dynamic-track command is captured
+    centrally — see `cmdlog`'s module docstring for why this is composition
+    over the executor, never an edit to `SandboxExecutor` itself."""
     try:
         strategy_llm = get_llm_for_agent(AgentRole.STAGE5_STRATEGY_AGENT, settings=settings)
         static_generator_llm = get_llm_for_agent(
@@ -145,8 +161,25 @@ async def resolve_fvvw_deps(
 
     stage5_dir_ = layout.stage5_dir(db_subfolder)
     static_workspace_dir = layout.workspace_dir(stage5_dir_, candidate.global_id)
-    sanitized_gid = candidate.global_id.replace("::", "__")
-    dynamic_workspace_dir = stage5_dir_ / "fvvw" / "dynamic_workspace" / sanitized_gid
+    fvvw_dir_ = layout.fvvw_dir(stage5_dir_)
+    dynamic_workspace_dir = layout.fvvw_dynamic_workspace_dir(fvvw_dir_, candidate.global_id)
+
+    if settings.stage5_command_log:
+        static_command_log = CommandLog(
+            layout.fvvw_command_log_path(fvvw_dir_, candidate.global_id, "static"),
+            track="static",
+        )
+        dynamic_command_log = CommandLog(
+            layout.fvvw_command_log_path(fvvw_dir_, candidate.global_id, "dynamic"),
+            track="dynamic",
+        )
+    else:
+        static_command_log = CommandLog.disabled()
+        dynamic_command_log = CommandLog.disabled()
+
+    dynamic_session_executor = LoggingSessionExecutor(
+        verification_session_executor(settings), dynamic_command_log
+    )
 
     return FVVWDeps(
         settings=settings,
@@ -156,9 +189,11 @@ async def resolve_fvvw_deps(
         report_llm=report_llm,
         static_executor=joern_executor(settings),
         crosscheck_executor=verification_executor(settings),
-        dynamic_session_executor=verification_session_executor(settings),
+        dynamic_session_executor=dynamic_session_executor,
         static_workspace_dir=static_workspace_dir,
         dynamic_workspace_dir=dynamic_workspace_dir,
+        static_command_log=static_command_log,
+        dynamic_command_log=dynamic_command_log,
     )
 
 
@@ -226,6 +261,13 @@ async def run_dynamic_track_only(
             except DynamicFault:
                 continue
 
+        # Best-effort: remove any stale marker artifact left behind by an
+        # earlier run against the same rootfs — otherwise the
+        # filesystem_artifact signal in collect_signals would report FOUND
+        # unconditionally, regardless of whether THIS run's sink is ever
+        # reached. See cleanup_marker_artifact's own docstring.
+        await cleanup_marker_artifact(ctx)
+
         while True:
             iteration += 1
             try:
@@ -241,7 +283,24 @@ async def run_dynamic_track_only(
                 else:
                     signals = []
             except DynamicFault:
-                await bringup_stabilize(ctx)
+                # bringup_stabilize's own readiness probe can ALSO raise
+                # DynamicFault (staging failure, gdbstub-never-opened
+                # timeout) — that fault must not escape this handler
+                # uncaught (it did before this fix: raised from inside an
+                # `except DynamicFault:` block, it was not re-caught here,
+                # so it propagated all the way out of run_dynamic_track_only
+                # into the driver's blanket `except Exception`, recording
+                # the candidate as "failed" with a message that looked
+                # nothing like a QEMU problem). Retry bring-up itself the
+                # same bounded way the pre-loop stand-up does — bounded by
+                # bringup_stabilize's own repair_count check, which raises
+                # BringupExhausted (caught below) once the budget is spent.
+                while True:
+                    try:
+                        await bringup_stabilize(ctx)
+                        break
+                    except DynamicFault:
+                        continue
                 continue
 
             outcome = dynamic_evaluate(
@@ -323,6 +382,7 @@ async def run_fvvw(
             executor=deps.static_executor,
             settings=settings,
             system_prompt=deps.system_prompt,
+            command_log=deps.static_command_log,
         )
     )
     crosscheck_task = asyncio.ensure_future(

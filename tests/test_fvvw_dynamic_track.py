@@ -34,6 +34,7 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BringupExhausted,
     DynamicFault,
     bringup_stabilize,
+    cleanup_marker_artifact,
     collect_signals,
     dynamic_evaluate,
     instrument_trigger,
@@ -729,7 +730,11 @@ async def test_collect_signals_reports_filesystem_artifact_and_self_report(tmp_p
             return ExecutionResult(
                 command=command, returncode=0, stdout="FOUND\n", stderr="", timed_out=False
             )
-        if "target_stdout.log" in command:
+        # collect_signals reads the QEMU log (`.fvvw_qemu.log`), which is
+        # what `_launch_qemu_and_wait` actually redirects QEMU's own
+        # stdout/stderr to — see the regression test below for why this
+        # must NOT be `target_stdout.log` (nothing ever writes that file).
+        if command.startswith("cat") and ".fvvw_qemu.log" in command:
             return ExecutionResult(
                 command=command,
                 returncode=0,
@@ -751,3 +756,128 @@ async def test_collect_signals_reports_filesystem_artifact_and_self_report(tmp_p
     assert "target_self_report" in kinds
     fs_signal = next(s for s in signals if s["kind"] == "filesystem_artifact")
     assert fs_signal["marker_present"] is True
+    self_report_signal = next(s for s in signals if s["kind"] == "target_self_report")
+    assert self_report_signal["marker_present"] is True
+
+
+async def test_collect_signals_target_self_report_reads_qemu_log_not_target_stdout_log(
+    tmp_path: Path,
+):
+    """Regression: collect_signals used to `cat
+    <CONTAINER_WORKDIR>/target_stdout.log`, a file NOTHING in this package
+    ever writes — QEMU's own stdout/stderr is redirected to
+    `_QEMU_LOG_PATH` (`.fvvw_qemu.log`) by `_launch_qemu_and_wait`. That
+    made the `target_self_report` signal permanently absent, starving
+    `dynamic_evaluate`'s `marker_signals_present >= required` CONFIRMED
+    threshold. Assert the command actually issued targets the QEMU log."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    await collect_signals(ctx, captured_sink_argument=None)
+
+    self_report_commands = [c for c in executor.exec_calls if c.startswith("cat")]
+    assert self_report_commands, "collect_signals never issued a self-report read"
+    assert any(".fvvw_qemu.log" in c for c in self_report_commands)
+    assert not any("target_stdout.log" in c for c in self_report_commands)
+
+
+async def test_collect_signals_probes_both_prechroot_and_inchroot_marker_paths(tmp_path: Path):
+    """Regression (Bug A): the marker is created by the EMULATED process
+    running under `chroot .` (CONTAINER_WORKDIR as the new root), so an
+    in-chroot absolute path like `/tmp/claim_001_proof` actually lands at
+    `<CONTAINER_WORKDIR>/tmp/claim_001_proof` in the container's own
+    namespace — the namespace `collect_signals`'s `test -e` itself runs in
+    (it is not chrooted). Probing only the bare in-chroot path was a
+    structural false negative on every chrooted run (i.e. every real
+    firmware run, since `_ctx` always sets `rootfs_dir`)."""
+    probed_paths: list[str] = []
+
+    def on_exec(command):
+        if command.startswith("test -e"):
+            path = command.split()[2]
+            probed_paths.append(path)
+            # Only the CONTAINER_WORKDIR-prefixed (in-chroot) path is
+            # actually FOUND — mirrors the real bind-mount layout.
+            found = path.startswith("/work")
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout="FOUND\n" if found else "NOTFOUND\n",
+                stderr="",
+                timed_out=False,
+            )
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    signals = await collect_signals(ctx, captured_sink_argument=None)
+
+    assert len(probed_paths) == 2
+    assert "/tmp/claim_001_proof" in probed_paths
+    assert "/work/tmp/claim_001_proof" in probed_paths
+    fs_signal = next(s for s in signals if s["kind"] == "filesystem_artifact")
+    assert fs_signal["marker_present"] is True
+    assert fs_signal["found_at"] == "/work/tmp/claim_001_proof"
+
+
+async def test_collect_signals_marker_absent_when_neither_path_found(tmp_path: Path):
+    executor = _FakeSessionExecutor()  # default: every command returns empty/NOTFOUND-shaped
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    signals = await collect_signals(ctx, captured_sink_argument=None)
+
+    fs_signal = next(s for s in signals if s["kind"] == "filesystem_artifact")
+    assert fs_signal["marker_present"] is False
+    assert fs_signal["found_at"] is None
+
+
+# ---------------------------------------------------------------------- #
+# cleanup_marker_artifact — Bug B regression (stale artifact across runs)
+# ---------------------------------------------------------------------- #
+
+
+async def test_cleanup_marker_artifact_removes_both_candidate_paths(tmp_path: Path):
+    """Regression (Bug B): nothing ever removed a marker artifact left
+    behind by an earlier run, so a stale `/tmp/claim_001_proof` from a
+    PRIOR run made collect_signals's filesystem_artifact check report
+    FOUND unconditionally on every LATER run — a permanent false positive
+    once the check itself was corrected to probe the right (in-chroot)
+    path. cleanup_marker_artifact must remove the artifact BEFORE the
+    reach/guards/trigger loop starts."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    await cleanup_marker_artifact(ctx)
+
+    rm_commands = [c for c in executor.exec_calls if c.startswith("rm -f")]
+    assert len(rm_commands) == 2
+    assert any(c == "rm -f /tmp/claim_001_proof" for c in rm_commands)
+    assert any(c == "rm -f /work/tmp/claim_001_proof" for c in rm_commands)
+
+
+async def test_cleanup_marker_artifact_is_best_effort_never_raises(tmp_path: Path):
+    def on_exec(command):
+        if command.startswith("rm -f"):
+            raise RuntimeError("docker exec failed")
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = SessionHandle(container_name="c1")
+
+    await cleanup_marker_artifact(ctx)  # must not raise
+
+
+async def test_cleanup_marker_artifact_no_op_without_handle(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.handle = None
+
+    await cleanup_marker_artifact(ctx)  # must not raise
+
+    assert executor.exec_calls == []

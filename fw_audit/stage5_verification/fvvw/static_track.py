@@ -35,6 +35,7 @@ from fw_audit.stage5_verification.agent import transcript as tx
 from fw_audit.stage5_verification.agent.graph import build_verifier_graph
 from fw_audit.stage5_verification.agent.prompts import render_finding_brief
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
+from fw_audit.stage5_verification.cmdlog import CommandLog, JsonlRecordingList
 
 
 def render_static_brief(candidate: VerificationCandidate, plan: StaticPlan) -> str:
@@ -83,6 +84,41 @@ def _attempt_evidence(attempt: JoernScriptAttempt) -> dict:
     }
 
 
+def _cpg_build_log_fields(record: CpgBuildRecord) -> dict:
+    """`JsonlRecordingList`'s `to_fields` for `cpg_build_holder` — the
+    `joern-parse` command `CpgBuildRecord.command` already carries
+    verbatim (`tools.joern_tool.build_cpg_async`), so this is a pure
+    reshaping, no new data."""
+    return {
+        "command": record.command,
+        "ok": record.ok,
+        "stderr": record.stderr,
+        "notes": {"duration_seconds": record.duration_seconds},
+    }
+
+
+def _joern_script_log_fields(attempt: JoernScriptAttempt) -> dict:
+    """`JsonlRecordingList`'s `to_fields` for `attempts` — logs the exact
+    Scala/CPGQL script text as `payload` (previously recoverable only from
+    the persisted `VerificationReport`/`FVVWReport` JSON after the whole
+    run finished) plus the full stdout/stderr, so a still-running or
+    crashed candidate stays diagnosable mid-flight from the JSONL alone."""
+    return {
+        "command": f"joern --script query_{attempt.attempt_index:03d}.sc",
+        "payload": attempt.script,
+        "exit_code": attempt.returncode,
+        "ok": attempt.ok,
+        "stdout": attempt.stdout,
+        "stderr": attempt.stderr,
+        "notes": {
+            "attempt_index": attempt.attempt_index,
+            "result_marker": attempt.result_marker,
+            "evaluator_verdict": attempt.evaluator_verdict,
+            "evaluator_confidence": attempt.evaluator_confidence,
+        },
+    }
+
+
 async def run_static_track(
     candidate: VerificationCandidate,
     plan: StaticPlan,
@@ -93,6 +129,7 @@ async def run_static_track(
     executor: Executor,
     settings: Settings,
     system_prompt: str | None = None,
+    command_log: CommandLog | None = None,
 ) -> TrackResult:
     """Run the EXISTING static verifier graph (`build_verifier_graph`,
     completely unmodified) against a strategy-enriched brief, and map its
@@ -109,11 +146,29 @@ async def run_static_track(
     resolved by its caller (`fvvw.graph`'s static-track subgraph node),
     which needs `TargetMeta`/`StrategyPlan` from `mem` that
     `verify_candidate` has no concept of.
+
+    `command_log`, when given, wraps `cpg_build_holder`/`attempts` in
+    `JsonlRecordingList` — `build_verifier_graph`'s nodes are the ONLY
+    thing that ever mutates those two lists (`.clear()`/`.append()`/
+    `attempts[-1] = ...`), so this gives full per-command static-track
+    logging with ZERO edits to `agent/graph.py` (see `cmdlog`'s module
+    docstring). `None` (the default) behaves exactly as before — a plain
+    list, no logging — so every existing caller is unaffected.
     """
     brief = render_static_brief(candidate, plan)
 
-    cpg_build_holder: list[CpgBuildRecord] = []
-    attempts: list[JoernScriptAttempt] = []
+    cpg_build_holder: list[CpgBuildRecord]
+    attempts: list[JoernScriptAttempt]
+    if command_log is not None:
+        cpg_build_holder = JsonlRecordingList(
+            command_log, node="build_cpg", kind="joern_parse", to_fields=_cpg_build_log_fields
+        )
+        attempts = JsonlRecordingList(
+            command_log, node="run_script", kind="joern_script", to_fields=_joern_script_log_fields
+        )
+    else:
+        cpg_build_holder = []
+        attempts = []
     graph = build_verifier_graph(
         llm=generator_llm,
         evaluator_llm=evaluator_llm,
@@ -146,6 +201,10 @@ async def run_static_track(
         if cpg_build_holder
         else _cpg_build_evidence(CpgBuildRecord()),
         "attempts": [_attempt_evidence(a) for a in attempts],
+        # Previously discarded entirely in the fork-join path — the
+        # `--joern-only` path keeps this via `VerificationReport.transcript`
+        # (agent.verifier.verify_candidate), so the fork-join now matches.
+        "transcript": [entry.model_dump() for entry in final_state.get("transcript", [])],
         "summary": final_state.get("verdict_summary", ""),
         "confidence": final_state.get("verdict_confidence", ""),
         "evidence_text": final_state.get("verdict_evidence", ""),

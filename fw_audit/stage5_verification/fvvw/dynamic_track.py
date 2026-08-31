@@ -18,6 +18,7 @@ benign-marker-only invariant enforcement.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import uuid
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from fw_audit.executors.base import SessionHandle
 from fw_audit.executors.sandbox_executor import SandboxExecutor
 from fw_audit.observability import aspan
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
+from fw_audit.stage5_verification.cmdlog import aphase
 from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     CONTAINER_WORKDIR,
     build_gdb_batch_command,
@@ -256,7 +258,7 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
         "stage5.bringup_stabilize",
         run_type="tool",
         inputs={"global_id": ctx.candidate.global_id, "repair_count": ctx.repair_count},
-    ) as run:
+    ) as run, aphase("bringup_stabilize"):
         network_name: str | None = None
         if _target_needs_network(ctx.plan) and ctx.settings.stage5_allow_network_grant:
             network_name = f"fvvw-{uuid.uuid4().hex[:12]}"
@@ -474,7 +476,7 @@ async def reach_target(
 
     async with aspan(
         "stage5.reach_target", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
-    ) as run:
+    ) as run, aphase("reach_target"):
         # QEMU is single-use per gdb batch (it runs to completion and exits
         # on GDB disconnect), so relaunch a fresh one for this batch.
         await _launch_qemu_and_wait(ctx)
@@ -546,7 +548,7 @@ async def satisfy_guards(
 
     async with aspan(
         "stage5.satisfy_guards", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
-    ) as run:
+    ) as run, aphase("satisfy_guards"):
         # Fresh QEMU for this batch (single-use per gdb disconnect).
         await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
@@ -643,7 +645,7 @@ async def instrument_trigger(
         "stage5.instrument_trigger",
         run_type="tool",
         inputs={"global_id": ctx.candidate.global_id},
-    ) as run:
+    ) as run, aphase("instrument_trigger"):
         # Fresh QEMU for this batch (single-use per gdb disconnect).
         await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
@@ -704,25 +706,58 @@ async def collect_signals(
 
     async with aspan(
         "stage5.collect_signals", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
-    ) as run:
+    ) as run, aphase("collect_signals"):
         artifact_path = _marker_artifact_path(ctx.plan.payload_marker)
         if artifact_path:
-            check = await ctx.session_executor.exec_in_session(
-                ctx.handle,
-                f"test -e {artifact_path} && echo FOUND || echo NOTFOUND",
-                timeout=ctx.settings.stage5_gdb_timeout_seconds,
-            )
+            # The marker is created by the EMULATED process running under
+            # `chroot .` (CONTAINER_WORKDIR as the new root — see
+            # bringup_stabilize's "." comment), so an in-chroot absolute
+            # path like `/tmp/claim_001_proof` actually lands at
+            # `<CONTAINER_WORKDIR>/tmp/claim_001_proof` in the CONTAINER's
+            # own namespace, which is where THIS check (not chrooted
+            # itself) runs `test -e` from. Probing only the bare
+            # `artifact_path` here was a false negative on every chrooted
+            # run (i.e. every real firmware run) — probe both candidates
+            # and record which one hit.
+            chrooting = ctx.candidate.rootfs_dir is not None
+            candidates = [artifact_path]
+            if chrooting:
+                candidates.append(f"{CONTAINER_WORKDIR}{artifact_path}")
+            found_at: str | None = None
+            for candidate_path in candidates:
+                check = await ctx.session_executor.exec_in_session(
+                    ctx.handle,
+                    f"test -e {candidate_path} && echo FOUND || echo NOTFOUND",
+                    timeout=ctx.settings.stage5_gdb_timeout_seconds,
+                )
+                # `"FOUND" in check.stdout` is a bug the both-path probe
+                # exposed: "FOUND" is a SUBSTRING of "NOTFOUND", so that
+                # check was always true regardless of which branch the
+                # shell took. `.strip() == "FOUND"` is exact.
+                if check.stdout.strip() == "FOUND":
+                    found_at = candidate_path
+                    break
             signals.append(
                 {
                     "kind": "filesystem_artifact",
                     "value": artifact_path,
-                    "marker_present": "FOUND" in check.stdout,
+                    "marker_present": found_at is not None,
+                    "probed": candidates,
+                    "found_at": found_at,
                 }
             )
 
+        # QEMU's own stdout/stderr is captured at `_QEMU_LOG_PATH` by
+        # `_launch_qemu_and_wait`'s redirect — this used to read a
+        # different, never-written filename (`target_stdout.log`), which
+        # made this signal permanently absent. `_QEMU_LOG_PATH` is
+        # truncated on every relaunch (`>`, not `>>`) and `collect_signals`
+        # always runs immediately after `instrument_trigger`'s relaunch, so
+        # this holds exactly the target's output from the marker-injecting
+        # run.
         self_report = await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cat {CONTAINER_WORKDIR}/target_stdout.log 2>/dev/null || true",
+            f"cat {_QEMU_LOG_PATH} 2>/dev/null || true",
             timeout=ctx.settings.stage5_gdb_timeout_seconds,
         )
         marker_id = _extract_marker_identifier(ctx.plan.payload_marker)
@@ -756,6 +791,41 @@ def _extract_marker_identifier(marker: str) -> str:
 
 def _marker_artifact_path(marker: str) -> str:
     return _extract_marker_identifier(marker)
+
+
+async def cleanup_marker_artifact(ctx: BringupContext) -> None:
+    """Remove any pre-existing benign-marker artifact BEFORE the
+    reach/guards/trigger loop starts. Without this, a marker file left
+    behind by an earlier run against the same rootfs (nothing ever removed
+    it) makes `collect_signals`'s `filesystem_artifact` check report FOUND
+    unconditionally on every later run, regardless of whether THAT run's
+    sink was ever reached — a permanent false positive once the check
+    itself was fixed to probe the right (in-chroot) path. Called once,
+    right after bring-up succeeds, from `fvvw.graph.run_dynamic_track_only`
+    — never inside the per-iteration loop, since the marker is expected to
+    (re)appear as evidence within that loop.
+
+    Best-effort: probes and removes both the pre-chroot and in-chroot
+    candidate paths (same two paths `collect_signals` checks), and never
+    raises — a failed cleanup should not abort the run; at worst a stale
+    artifact survives and the run proceeds exactly as it did before this
+    function existed."""
+    if ctx.handle is None:
+        return
+    artifact_path = _marker_artifact_path(ctx.plan.payload_marker)
+    if not artifact_path:
+        return
+    chrooting = ctx.candidate.rootfs_dir is not None
+    candidates = [artifact_path]
+    if chrooting:
+        candidates.append(f"{CONTAINER_WORKDIR}{artifact_path}")
+    for candidate_path in candidates:
+        with contextlib.suppress(Exception):
+            await ctx.session_executor.exec_in_session(
+                ctx.handle,
+                f"rm -f {candidate_path}",
+                timeout=ctx.settings.stage5_gdb_timeout_seconds,
+            )
 
 
 def _looks_like_setup_fault(stderr: str) -> bool:
@@ -874,6 +944,7 @@ __all__ = [
     "BringupExhausted",
     "DynamicFault",
     "bringup_stabilize",
+    "cleanup_marker_artifact",
     "collect_signals",
     "dynamic_evaluate",
     "instrument_trigger",

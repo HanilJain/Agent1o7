@@ -40,6 +40,13 @@ KEY_CHUNK_ID = "chunk_id"
 KEY_GLOBAL_ID = "global_id"
 KEY_ATTEMPT = "attempt"
 KEY_MODEL = "model"
+KEY_THREAD_ID = "thread_id"
+"""LangSmith's reserved metadata key for grouping runs into one Threads-view
+conversation (https://docs.smith.langchain.com's `thread_id` convention) —
+every run sharing a `thread_id` in its metadata is rendered as one thread
+regardless of how many separate root traces started it. Distinct from
+`KEY_RUN_ID` (this repo's OWN per-invocation correlation id, unrelated to
+LangSmith's thread grouping)."""
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,29 @@ class TraceContext:
     chunk_id: str | None = None
     global_id: str | None = None
     model: str | None = None
+    thread_id: str | None = None
+    """LangSmith Threads-view grouping key. Left unset by default —
+    `to_metadata()` then falls back to `global_id` (see `effective_thread_id`
+    below) rather than requiring every caller to set it explicitly. Set it
+    explicitly only when the desired grouping is coarser than one finding,
+    e.g. `trace_context(thread_id=candidate.bin_id)` to group every finding
+    verified against the same binary into one thread."""
+
+    @property
+    def effective_thread_id(self) -> str | None:
+        """`thread_id` if explicitly set, else `global_id`, else `None`.
+        This is what makes every span opened while verifying one Stage 3
+        finding — the strategy agent, the static track's generate/run/
+        evaluate loop, the dynamic track's bring-up/reach/guards/trigger,
+        the crosscheck, the report writer — land in the SAME LangSmith
+        Thread automatically, with no per-call-site change needed: they
+        already all run inside `trace_context(global_id=candidate.global_id,
+        ...)` (`fvvw/driver.py`'s `_process_one_fvvw`,
+        `stage5_verification/driver.py`'s `_process_one`), so `to_metadata()`
+        picking this up is enough. A caller verifying multiple findings for
+        the same binary and wanting THOSE grouped together instead sets
+        `thread_id` explicitly (e.g. to `bin_id`) to override this fallback."""
+        return self.thread_id or self.global_id
 
     def to_metadata(self) -> dict[str, str]:
         """Render as a flat string-keyed dict suitable for a LangSmith
@@ -68,6 +98,7 @@ class TraceContext:
             (KEY_CHUNK_ID, self.chunk_id),
             (KEY_GLOBAL_ID, self.global_id),
             (KEY_MODEL, self.model),
+            (KEY_THREAD_ID, self.effective_thread_id),
         )
         return {key: value for key, value in pairs if value is not None}
 

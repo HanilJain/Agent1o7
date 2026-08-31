@@ -114,6 +114,7 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
     `stage5_verification.driver._process_one`'s trace_context/span nesting
     exactly (entered PER-TASK, never once around the whole pool — see that
     function's own comment for why)."""
+    started_at = datetime.now(UTC)
     with trace_context(
         stage="5",
         global_id=candidate.global_id,
@@ -148,7 +149,14 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
                 }
             )
 
-    started_at = datetime.now(UTC)
+    command_log_paths = {
+        track: str(path)
+        for track, path in (
+            ("static", deps.static_command_log.path),
+            ("dynamic", deps.dynamic_command_log.path),
+        )
+        if path is not None
+    }
     report = FVVWReport(
         global_id=candidate.global_id,
         bin_id=candidate.bin_id,
@@ -159,6 +167,10 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
         reachability_confidence=outcome["reachability_confidence"],
         residual_unknowns=outcome["residual_unknowns"],
         report_markdown=report_markdown,
+        guard_logs=outcome["guard_logs"],
+        dynamic_gdb_transcript=outcome["dynamic_gdb_transcript"],
+        crosscheck_evidence=outcome["crosscheck_evidence"],
+        command_log_paths=command_log_paths,
         started_at=started_at,
         finished_at=datetime.now(UTC),
     )

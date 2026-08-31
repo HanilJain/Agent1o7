@@ -59,7 +59,8 @@ cross-cutting concerns (Executor abstraction, LLM routing, Settings).
 
 | File | Purpose |
 |---|---|
-| `layout.py` | Pure path algebra for `stage5/` — **now also carries the separate `fvvw/` subtree's paths** (additive; the original static-track paths are untouched). |
+| `layout.py` | Pure path algebra for `stage5/` — **now also carries the separate `fvvw/` subtree's paths**, including `fvvw/logs/` (additive; the original static-track paths are untouched). |
+| `cmdlog.py` | `CommandLog` — per-track, append-only JSONL of every command either track executes plus its full result, written to `stage5/fvvw/logs/<gid>.<static\|dynamic>.jsonl`. `LoggingSessionExecutor` wraps the dynamic track's session executor BY COMPOSITION (never edits `SandboxExecutor`) so every `exec_in_session` call is captured centrally. `JsonlRecordingList` intercepts `agent.graph.build_verifier_graph`'s `cpg_build_holder`/`attempts` list parameters so the static track gets full logging with ZERO edits to `agent/graph.py`. `phase()`/`aphase()` (sync/async) tag records with the active node name via a `ContextVar`, isolated per `asyncio` task the same way `observability.context.trace_context` is. Always on by default (`Settings.stage5_command_log`) — unlike LangSmith spans, NOT gated by `langsmith_tracing`; the whole point is a diagnosable run with no `--trace`. |
 | `candidate_index.py` | Resolves `stage3/findings/*.json` into `VerificationCandidate`s. Resolves `source_path` (the Joern C, for the static track) via `stage2_summary.json` — **and now also resolves `binary_path`/`rootfs_dir`/`elf`/`functions`** (the real ELF + Stage 2's already-computed facts, for `characterize_target`/the dynamic track) via `resolve_binary_target()`. |
 | `errors.py` | `Stage5InputError`, `SandboxUnavailableError`, `VerifierModelUnavailableError`. |
 | `tools/joern_tool.py` | `build_cpg_async`/`run_joern_script_async` + `joern_executor()`. Owns the exact Joern CLI command strings. |
@@ -134,7 +135,11 @@ rootfs_path` plus `.elf`/`.functions`).
 **Fork-join (default), a SEPARATE subtree — never collides with the
 above:** `fvvw/reports/<gid>.json` (`common.verification.FVVWReport`) →
 `fvvw/reports/<gid>.md` (disclosure Markdown) →
-`fvvw/dynamic_workspace/<gid>/` → `fvvw_summary.json`.
+`fvvw/dynamic_workspace/<gid>/` → `fvvw_summary.json`. Plus
+`fvvw/logs/<gid>.static.jsonl` / `fvvw/logs/<gid>.dynamic.jsonl` — every
+command either track ran and its full result (`cmdlog.CommandLog`); a
+sibling of `dynamic_workspace/`, so it survives `--keep-workspace=False`'s
+cleanup even though the workspace itself doesn't.
 
 ## Debugging
 
@@ -185,6 +190,27 @@ above:** `fvvw/reports/<gid>.json` (`common.verification.FVVWReport`) →
   tests/test_fvvw_*.py tests/test_sandbox_executor.py
   tests/test_sandbox_session_executor.py` — no Docker/LLM/QEMU/GDB required
   (`FakeExecutor` + duck-typed fake chat models + a fake session executor).
+- A dynamic-track run stuck INCONCLUSIVE with no obvious cause → read
+  `fvvw/logs/<gid>.dynamic.jsonl` (one JSON object per command: `node`,
+  `kind`, `command`, `payload` for GDB recipe/Joern script text, full
+  `stdout`/`stderr`, `notes`). `kind:"exec_in_session"` records cover
+  every QEMU/GDB command including the ones the LangSmith span never
+  captured (`pkill`, the backgrounded launch, the readiness probe).
+  `jq 'select(.kind=="exec_in_session")' fvvw/logs/<gid>.dynamic.jsonl`
+  is the fastest way to replay a run's exact GDB batches.
+- **Fixed bugs worth knowing about if you're re-deriving from an older
+  trace or report:** `collect_signals` used to read a file
+  (`target_stdout.log`) nothing ever wrote — it now reads the QEMU log
+  `_launch_qemu_and_wait` actually redirects to; the filesystem-artifact
+  check used to probe only the pre-chroot marker path, which is
+  unreachable from inside the chroot the emulated process actually runs
+  under — it now probes both; a stale marker artifact from an earlier run
+  is now removed (`cleanup_marker_artifact`) before each dynamic-track run
+  starts, not left to produce a false `FOUND` forever; a `DynamicFault`
+  raised by `bringup_stabilize` itself (not just by
+  reach/guards/trigger) used to escape `run_dynamic_track_only` uncaught —
+  it's now retried like every other dynamic-track fault. All four were
+  plausible root causes of "always inconclusive" on real firmware.
 
 ## Adding a feature here
 
@@ -200,3 +226,9 @@ above:** `fvvw/reports/<gid>.json` (`common.verification.FVVWReport`) →
   the fix to `ctx.applied_fixes` so a retry within the same run reuses it.
 - A new arch for the dynamic track is one `QEMU_ARCH_TABLE` entry in
   `tools/qemu_gdb_tool.py`, not a new `if`/`elif` branch anywhere.
+- A new dynamic-track command that should be logged needs no explicit
+  `cmdlog` call at the site that issues it — `LoggingSessionExecutor`
+  (wrapping `deps.dynamic_session_executor`) captures every
+  `exec_in_session()` call automatically. Wrap the new code in
+  `cmdlog.aphase("<node_name>")` (or `phase()` for a sync block) so the
+  resulting records carry the right `node` tag.

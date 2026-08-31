@@ -592,6 +592,14 @@ class Settings(BaseSettings):
     files are staged on the host before being bind-mounted — defaults to
     `stage5/workspace/<gid>/dynamic/` under the run's own `db_subfolder`
     (see `stage5_verification.layout`) when unset."""
+    stage5_command_log: bool = Field(default=True, validation_alias="FWA_STAGE5_COMMAND_LOG")
+    """Master switch for `stage5_verification.cmdlog.CommandLog` — every
+    command either fork-join track executes, plus its full result, appended
+    to `stage5/fvvw/logs/<gid>.<track>.jsonl`. Unlike LangSmith tracing,
+    this stays on by default and is NOT governed by `langsmith_tracing`: the
+    whole point is a diagnosable run with no `--trace`/LangSmith account.
+    Set `False` only to suppress the extra disk writes (e.g. a constrained
+    CI runner); it never affects a verdict either way."""
 
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names

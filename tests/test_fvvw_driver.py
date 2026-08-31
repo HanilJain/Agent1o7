@@ -36,6 +36,7 @@ from fw_audit.common.verification import (
 )
 from fw_audit.config.settings import Settings
 from fw_audit.stage5_verification import layout
+from fw_audit.stage5_verification.cmdlog import CommandLog
 from fw_audit.stage5_verification.errors import SandboxUnavailableError, Stage5InputError
 from fw_audit.stage5_verification.fvvw import driver as fvvw_driver
 
@@ -110,6 +111,8 @@ class _FakeDeps:
         self.dynamic_workspace_dir = tmp_path / "dynamic_ws"
         self.static_workspace_dir.mkdir(parents=True, exist_ok=True)
         self.dynamic_workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.static_command_log = CommandLog.disabled()
+        self.dynamic_command_log = CommandLog.disabled()
 
 
 def _fake_outcome(tmp_path: Path, *, agreement=Agreement.CONCORDANT_CONFIRM) -> dict:
@@ -192,6 +195,17 @@ async def test_run_fvvw_queue_end_to_end_persists_json_and_markdown(tmp_path, mo
         assert md_path.is_file()
         assert "Disclosure report" in md_path.read_text(encoding="utf-8")
 
+        # Previously-computed-then-dropped fields must now be persisted.
+        report_data = json.loads(json_path.read_text(encoding="utf-8"))
+        assert "guard_logs" in report_data
+        assert "dynamic_gdb_transcript" in report_data
+        assert "crosscheck_evidence" in report_data
+        # started_at must be captured BEFORE the work runs, not backfilled
+        # after — a regression here would make started_at ~= finished_at.
+        started_at = datetime.fromisoformat(report_data["started_at"])
+        finished_at = datetime.fromisoformat(report_data["finished_at"])
+        assert started_at <= finished_at
+
     summary_path = layout.fvvw_summary_path(stage5_dir_)
     assert summary_path.is_file()
     written = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -199,6 +213,40 @@ async def test_run_fvvw_queue_end_to_end_persists_json_and_markdown(tmp_path, mo
 
     # Must NOT touch the static-only path's own summary file.
     assert not layout.stage5_summary_path(stage5_dir_).is_file()
+
+
+async def test_run_fvvw_queue_persists_command_log_paths_when_enabled(tmp_path, monkeypatch):
+    db_subfolder = tmp_path / "db" / "fw"
+    _write_findings(db_subfolder, "bin", ["c1"])
+    _write_stage2_summary(db_subfolder, "bin")
+
+    async def fake_run_fvvw(candidate, *, db_subfolder, settings):
+        outcome = _fake_outcome(tmp_path)
+        deps = outcome["deps"]
+        deps.static_command_log = CommandLog(tmp_path / "c1.static.jsonl", track="static")
+        deps.dynamic_command_log = CommandLog(tmp_path / "c1.dynamic.jsonl", track="dynamic")
+        deps.static_command_log.record(node="build_cpg", kind="joern_parse", command="joern-parse")
+        deps.dynamic_command_log.record(node="reach_target", kind="gdb_batch", command="gdb ...")
+        return outcome
+
+    async def fake_write_report(**kwargs):
+        return "# Disclosure report\n\nfake"
+
+    monkeypatch.setattr(fvvw_driver, "run_fvvw", fake_run_fvvw)
+    monkeypatch.setattr(fvvw_driver, "write_report", fake_write_report)
+
+    summary = await fvvw_driver.run_fvvw_queue(
+        db_subfolder=db_subfolder, settings=Settings(_env_file=None)
+    )
+    assert summary.total_verified == 1
+
+    stage5_dir_ = layout.stage5_dir(db_subfolder)
+    fvvw_dir_ = layout.fvvw_dir(stage5_dir_)
+    reports_dir_ = layout.fvvw_reports_dir(fvvw_dir_)
+    json_path = reports_dir_ / layout.fvvw_report_json_filename("bin#0000::c1")
+    report_data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert report_data["command_log_paths"]["static"] == str(tmp_path / "c1.static.jsonl")
+    assert report_data["command_log_paths"]["dynamic"] == str(tmp_path / "c1.dynamic.jsonl")
 
 
 async def test_run_fvvw_queue_only_filters_to_selected_global_ids(tmp_path, monkeypatch):

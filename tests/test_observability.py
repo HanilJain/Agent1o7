@@ -280,3 +280,51 @@ def test_trace_context_to_metadata_omits_unset_fields():
 def test_trace_context_to_tags():
     ctx = TraceContext(stage="5", run_id="r1")
     assert ctx.to_tags() == ["stage:5", "run:r1"]
+
+
+# --------------------------------------------------------------------- #
+# thread_id — LangSmith Threads-view grouping
+# --------------------------------------------------------------------- #
+
+
+def test_effective_thread_id_falls_back_to_global_id():
+    ctx = TraceContext(global_id="chunk1::finding1")
+    assert ctx.effective_thread_id == "chunk1::finding1"
+
+
+def test_effective_thread_id_prefers_explicit_thread_id():
+    ctx = TraceContext(global_id="chunk1::finding1", thread_id="bin-level-thread")
+    assert ctx.effective_thread_id == "bin-level-thread"
+
+
+def test_effective_thread_id_none_when_nothing_set():
+    ctx = TraceContext()
+    assert ctx.effective_thread_id is None
+
+
+def test_to_metadata_includes_thread_id_from_global_id():
+    ctx = TraceContext(stage="5", global_id="chunk1::finding1")
+    metadata = ctx.to_metadata()
+    assert metadata["thread_id"] == "chunk1::finding1"
+    assert metadata["global_id"] == "chunk1::finding1"
+
+
+def test_to_metadata_omits_thread_id_when_nothing_to_derive_it_from():
+    ctx = TraceContext(stage="5")
+    assert "thread_id" not in ctx.to_metadata()
+
+
+def test_every_span_in_one_candidates_verification_shares_a_thread_id():
+    """The behavior this feature is actually for: every span opened while
+    verifying ONE Stage 3 finding — strategy, static track, dynamic track,
+    report — must carry the same thread_id with zero call-site changes,
+    because they all already run inside one `trace_context(global_id=...)`
+    block (fvvw/driver.py's _process_one_fvvw)."""
+    with trace_context(stage="5", run_id="run-1", global_id="chunk1::finding1"):
+        strategy_meta = current_context().to_metadata()
+        with trace_context(bin_id="sbin_mailosd"):
+            static_track_meta = current_context().to_metadata()
+            dynamic_track_meta = current_context().to_metadata()
+    assert strategy_meta["thread_id"] == "chunk1::finding1"
+    assert static_track_meta["thread_id"] == "chunk1::finding1"
+    assert dynamic_track_meta["thread_id"] == "chunk1::finding1"

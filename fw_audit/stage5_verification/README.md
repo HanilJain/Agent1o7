@@ -102,7 +102,10 @@ the real ELF/rootfs/arch facts).
 - **Fork-join** (default), a SEPARATE subtree: `fvvw/reports/<gid>.json`
   (`common.verification.FVVWReport` — both tracks' results, the two-axis
   verdict, residual unknowns), `fvvw/reports/<gid>.md` (the LLM-composed
-  disclosure document), `fvvw_summary.json`.
+  disclosure document), `fvvw_summary.json`, and
+  `fvvw/logs/<gid>.static.jsonl` / `fvvw/logs/<gid>.dynamic.jsonl` — every
+  command either track ran plus its full result, for when a candidate
+  needs debugging beyond what the report quotes.
 
 Neither path writes into an earlier stage's tree, and the two output
 subtrees never collide even against the same `db_subfolder`.
