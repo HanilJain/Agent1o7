@@ -19,7 +19,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from fw_audit.common.findings import Finding
-from fw_audit.common.verification import Agreement, TrackResult
+from fw_audit.common.verification import Agreement, HumanReviewRecord, TrackResult
 from fw_audit.config.settings import Settings
 from fw_audit.observability import run_config
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
@@ -53,9 +53,13 @@ supplied residual_unknowns list; never omit or soften one.
 
 Hard rules: never state a confidence level not supported by the supplied \
 data. Never claim reachability was confirmed if any guard was FORCED \
-rather than naturally satisfied — say so explicitly. Output ONLY the \
-Markdown document, no commentary before or after it, no markdown code \
-fence wrapping the whole document.
+rather than naturally satisfied — say so explicitly. If a "Human review" \
+section is supplied below, you MUST state PLAINLY, in the executive \
+summary AND in the relevant track's own section, that a human operator — \
+not the automated pipeline — set that track's verdict, and quote the \
+operator's rationale. Never present a human-set verdict as machine-derived. \
+Output ONLY the Markdown document, no commentary before or after it, no \
+markdown code fence wrapping the whole document.
 """
 
 
@@ -74,6 +78,7 @@ def render_report_brief(
     reachability_confidence: str,
     residual_unknowns: list[str],
     dynamic_gdb_transcript: str = "",
+    human_review: HumanReviewRecord | None = None,
 ) -> str:
     """Render the complete STM into the plain-text brief `write_report`
     reasons over. Raw tool output (the static track's Joern
@@ -129,6 +134,18 @@ def render_report_brief(
         "verbatim or lightly rephrased — never drop one):",
         *[f"  - {u}" for u in residual_unknowns],
     ]
+    if human_review is not None:
+        lines += [
+            "",
+            "## Human review (HITL)",
+            f"track: {human_review.track}",
+            f"action: {human_review.action}",
+            f"rationale: {human_review.rationale or '(none given)'}",
+            f"rounds: {human_review.rounds}",
+            "State plainly in the executive summary AND in this track's own section "
+            "that a HUMAN OPERATOR set this track's verdict, quoting the rationale above "
+            "— never present it as machine-derived.",
+        ]
     return "\n".join(lines)
 
 
@@ -146,6 +163,7 @@ async def write_report(
     llm: BaseChatModel,
     settings: Settings,
     system_prompt: str | None = None,
+    human_review: HumanReviewRecord | None = None,
 ) -> str:
     """Run the `write_report` LLM node — one call, plain text in/text out
     (no structured output needed; the output IS the artifact, not
@@ -169,6 +187,7 @@ async def write_report(
         reachability_confidence=reachability_confidence,
         residual_unknowns=residual_unknowns,
         dynamic_gdb_transcript=dynamic_gdb_transcript,
+        human_review=human_review,
     )
     system = system_prompt if system_prompt is not None else REPORT_SYSTEM_PROMPT
     messages = [

@@ -52,6 +52,16 @@ cross-cutting concerns (Executor abstraction, LLM routing, Settings).
 - `joint_evaluate` (`fvvw/joint.py`) is the ONLY function permitted to read
   both `static_result` and `dynamic_result` — see `fvvw/state.py`'s key
   tuples for the mechanical isolation this enforces.
+- **HITL never runs inside a track's own concurrent task.** The prompt is
+  hoisted to `fvvw.graph.run_fvvw`, strictly AFTER the fork-join's barrier
+  and BEFORE `joint_evaluate` — a blocking prompt inside a track would
+  interleave stdout with a sibling candidate's own task in the worker pool.
+  `--hitl=prompt` FORCES `stage5_workers=1` in `runner.py` for exactly this
+  reason; don't relax that.
+- **An operator-injected raw GDB recipe (HITL's "inject" action) gets its
+  OWN gate**, `dynamic_track.validate_injected_recipe()` — never
+  `validate_benign_marker` (which only understands a bare marker string).
+  Never weaken it to accommodate a "more capable" recipe.
 
 ## Files
 
@@ -94,6 +104,8 @@ tool-calling — both are plain text in/text out, for local-model reliability.
 | `fvvw/driver.py` | `run_fvvw_queue()` — a SEPARATE worker-pool queue (not an extension of `driver.py`) persisting `FVVWReport` JSON + disclosure Markdown to `stage5/fvvw/reports/`. |
 | `fvvw/debug.py` | `debug_strategy` (strategy only), `debug_dynamic` (dynamic track ONLY — the per-track debug path), `debug_fvvw` (full fork-join, dry run). |
 | `tools/verification_sandbox.py` | `verification_executor()`/`verification_session_executor()` — resolve an `Executor`/session-capable `SandboxExecutor` pointed at `stage5_verification_image` (a SEPARATE image from Joern's). |
+| `cmdlog.py` | `CommandLog` — per-track, append-only JSONL of every command either track executes plus its full result, written to `stage5/fvvw/logs/<gid>.<static\|dynamic>.jsonl`. `LoggingSessionExecutor` wraps the dynamic session executor by COMPOSITION; `JsonlRecordingList` intercepts the static track's `cpg_build_holder`/`attempts` lists with zero edits to `agent/graph.py`. Always on by default (`Settings.stage5_command_log`), unlike LangSmith — the point is a diagnosable run with no `--trace`. |
+| `fvvw/hitl.py` | Human-in-the-loop: `HitlAction`/`HitlDecision`/`HitlRequest`, `Prompter` (an injectable callable — `terminal_prompter` for real use, a scripted fake in tests), `is_budget_exhausted()` (the trigger — reads the `evidence["budget_exhausted"]` fact tagged by the producing track), `force_verdict_result()`, `build_human_review_record()`. Hooked into `fvvw.graph.run_fvvw` AFTER the fork-join barrier, never inside a track. |
 
 ## Invoke
 
@@ -114,6 +126,11 @@ fw-verify debug verify --db-subfolder data/db/<stem> --gid "<gid>" \
 fw-verify debug strategy --db-subfolder data/db/<stem> --gid "<gid>"              # strategy_agent only
 fw-verify debug dynamic --db-subfolder data/db/<stem> --gid "<gid>"               # QEMU+GDB track only
 fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report.json  # full fork-join, dry run
+
+# Human-in-the-loop — pauses AFTER the barrier when a track exhausts its
+# own budget without a decisive verdict; forces stage5_workers=1
+fw-verify run --db-subfolder data/db/<stem> --hitl=prompt \
+    --max-iterations 10 --dynamic-max-iterations 8 --no-command-log
 ```
 
 `--model` sets `FWA_STAGE5_VERIFIER_MODEL`, which every Stage 5 LLM role
@@ -139,7 +156,11 @@ above:** `fvvw/reports/<gid>.json` (`common.verification.FVVWReport`) →
 `fvvw/logs/<gid>.static.jsonl` / `fvvw/logs/<gid>.dynamic.jsonl` — every
 command either track ran and its full result (`cmdlog.CommandLog`); a
 sibling of `dynamic_workspace/`, so it survives `--keep-workspace=False`'s
-cleanup even though the workspace itself doesn't.
+cleanup even though the workspace itself doesn't. `FVVWReport.
+command_log_paths` points at both files directly. `FVVWReport.human_review`
+(`common.verification.HumanReviewRecord`) is set only when `--hitl=prompt`
+led to an operator intervention on this candidate — `None` for every
+ordinary, unattended run.
 
 ## Debugging
 
@@ -190,6 +211,10 @@ cleanup even though the workspace itself doesn't.
   tests/test_fvvw_*.py tests/test_sandbox_executor.py
   tests/test_sandbox_session_executor.py` — no Docker/LLM/QEMU/GDB required
   (`FakeExecutor` + duck-typed fake chat models + a fake session executor).
+  `tests/test_fvvw_hitl.py` exercises all four HITL actions via a scripted
+  `Prompter` (no real stdin); `test_fvvw_graph.py`'s `test_run_fvvw_hitl_*`
+  tests exercise the full hook end-to-end (mode off, both tracks decisive,
+  force_verdict, skip, and the `stage5_hitl_max_rounds` bound).
 - A dynamic-track run stuck INCONCLUSIVE with no obvious cause → read
   `fvvw/logs/<gid>.dynamic.jsonl` (one JSON object per command: `node`,
   `kind`, `command`, `payload` for GDB recipe/Joern script text, full
@@ -197,7 +222,24 @@ cleanup even though the workspace itself doesn't.
   every QEMU/GDB command including the ones the LangSmith span never
   captured (`pkill`, the backgrounded launch, the readiness probe).
   `jq 'select(.kind=="exec_in_session")' fvvw/logs/<gid>.dynamic.jsonl`
-  is the fastest way to replay a run's exact GDB batches.
+  is the fastest way to replay a run's exact GDB batches. Instead of (or
+  before) re-running with more iterations, `--hitl=prompt` pauses exactly
+  at this point and offers retry/override_plan/inject/force_verdict — the
+  same JSONL is what the prompt itself shows as "recent commands".
+- GDB recipes and the QEMU stdout/stderr log live under
+  `tools.qemu_gdb_tool.CONTAINER_SCRATCH` (`/tmp/fvvw` inside the
+  session container), never under `CONTAINER_WORKDIR` — that path is a
+  bind mount of the extracted firmware rootfs itself, so writing recipes
+  there would pollute the firmware being analyzed. Nothing needs to be
+  copied out: the recipe text and full stdout/stderr are captured verbatim
+  in the host-side JSONL instead.
+- `BenignMarkerViolation` from HITL's "inject" action (a raw GDB recipe,
+  not a bare marker) → the recipe matched `dynamic_track.
+  validate_injected_recipe`'s deny-list — either one of `_DENY_PATTERNS`
+  (the same list `validate_benign_marker` uses) or a GDB escape hatch
+  (`shell`, `!`, `pipe`, `python`, `define`, `source`, `dump`, ...). Never
+  worked around by loosening the validator; the operator's recipe should
+  stick to `break`/`continue`/`printf`/`set $reg = ...`.
 - **Fixed bugs worth knowing about if you're re-deriving from an older
   trace or report:** `collect_signals` used to read a file
   (`target_stdout.log`) nothing ever wrote — it now reads the QEMU log
@@ -232,3 +274,13 @@ cleanup even though the workspace itself doesn't.
   `exec_in_session()` call automatically. Wrap the new code in
   `cmdlog.aphase("<node_name>")` (or `phase()` for a sync block) so the
   resulting records carry the right `node` tag.
+- A new HITL action goes in `fvvw/hitl.py`'s `HitlAction` enum plus a new
+  branch in `fvvw/graph.py`'s `_run_hitl_for_track` (fork-join path) and
+  `driver.py`'s `_run_hitl_joern_only` (`--joern-only` path) — both read
+  the SAME `HitlDecision`, so a new action needs a branch in both unless
+  it's genuinely fork-join-only. Never let an action bypass
+  `validate_benign_marker`/`validate_injected_recipe` for the dynamic
+  track's own safety invariant.
+- New recipe/scratch files the dynamic track writes go under
+  `tools.qemu_gdb_tool.CONTAINER_SCRATCH`, never under `CONTAINER_WORKDIR`
+  (the bind-mounted firmware rootfs) — see that constant's own docstring.

@@ -35,7 +35,7 @@ from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
 
-from fw_audit.common.verification import TrackResult, VerificationVerdict
+from fw_audit.common.verification import HumanReviewRecord, TrackResult, VerificationVerdict
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings
 from fw_audit.executors.base import Executor
@@ -60,8 +60,21 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     reach_target,
     satisfy_guards,
 )
+from fw_audit.stage5_verification.fvvw.hitl import (
+    HitlAction,
+    HitlRequest,
+    Prompter,
+    build_human_review_record,
+    force_verdict_result,
+    is_budget_exhausted,
+    prompt_for_track,
+    terminal_prompter,
+)
 from fw_audit.stage5_verification.fvvw.joint import joint_evaluate
-from fw_audit.stage5_verification.fvvw.static_track import run_static_track
+from fw_audit.stage5_verification.fvvw.static_track import (
+    run_injected_static_script,
+    run_static_track,
+)
 from fw_audit.stage5_verification.fvvw.strategy import strategy_agent
 from fw_audit.stage5_verification.tools.characterize_tool import characterize_target
 from fw_audit.stage5_verification.tools.crosscheck_tool import static_crosscheck
@@ -203,6 +216,8 @@ async def run_dynamic_track_only(
     target,
     *,
     deps: FVVWDeps,
+    settings_override: Settings | None = None,
+    raw_recipe_override: str | None = None,
 ) -> tuple[TrackResult, list[dict], bool | None, str]:
     """The dynamic track's full sequence, run as one function rather than
     discrete LangGraph nodes (see this module's docstring for why) —
@@ -210,11 +225,19 @@ async def run_dynamic_track_only(
     bring-up repair loop and the hypothesis A/B switch exactly as
     `fvvw.dynamic_track` implements them.
 
+    `settings_override`, when given, is used instead of `deps.settings` for
+    this run only — HITL's "retry with more iterations" action
+    (`fvvw.hitl`) passes a `Settings.model_copy` with a raised
+    `stage5_dynamic_max_iterations` without touching `deps` itself.
+    `raw_recipe_override`, when given, is threaded onto the `BringupContext`
+    so `instrument_trigger` runs it verbatim instead of the plan-derived
+    recipe — HITL's "inject" action.
+
     Returns `(TrackResult, guard_logs, dynamic_reached_sink,
     gdb_transcript)` — the extra values `joint_evaluate`/`fvvw.report` need
     beyond the bare `TrackResult`.
     """
-    settings = deps.settings
+    settings = settings_override or deps.settings
     emulation = plan_emulation(target, plan)["emulation_plan"]
     if emulation["mode"] == "unsupported":
         return (
@@ -235,6 +258,7 @@ async def run_dynamic_track_only(
         emulation_plan=emulation,
         settings=settings,
         session_executor=deps.dynamic_session_executor,
+        raw_recipe_override=raw_recipe_override,
     )
 
     transcript = ""
@@ -325,7 +349,12 @@ async def run_dynamic_track_only(
             TrackResult(
                 verdict=VerificationVerdict.ERROR,
                 proved_hypothesis="none",
-                evidence={"reason": f"not_run: {exc}"},
+                # budget_exhausted tagged here too (not just INCONCLUSIVE in
+                # dynamic_evaluate._terminal) — a BringupExhausted ERROR is
+                # ALSO a budget-exhaustion outcome per the HITL trigger
+                # condition (fvvw.hitl): "a track exhausted its own budget
+                # and returned a non-decisive verdict".
+                evidence={"reason": f"not_run: {exc}", "budget_exhausted": True},
             ),
             guard_logs,
             None,
@@ -336,11 +365,158 @@ async def run_dynamic_track_only(
             await deps.dynamic_session_executor.stop(ctx.handle)
 
 
+async def _run_hitl_for_track(
+    *,
+    candidate: VerificationCandidate,
+    track: str,
+    result: TrackResult,
+    plan,
+    target,
+    deps: FVVWDeps,
+    settings: Settings,
+    prompter: Prompter,
+    dynamic_reached_sink: bool | None,
+    guard_logs: list[dict],
+    gdb_transcript: str,
+) -> tuple[TrackResult, bool | None, list[dict], str, HumanReviewRecord | None]:
+    """Run the HITL prompt loop for ONE track (`"static"` or `"dynamic"`),
+    bounded by `Settings.stage5_hitl_max_rounds`. Returns the (possibly
+    updated) `TrackResult` plus the dynamic-track extras that can also
+    change on a retry/inject round (`dynamic_reached_sink`, `guard_logs`,
+    `gdb_transcript` — unchanged/passed through for the static track), and a
+    `HumanReviewRecord` if the operator's LAST action was anything but
+    `skip` (a `skip` leaves the track's own result untouched and produces no
+    review record — there was nothing to attribute to a human).
+
+    Each round re-reads the track's own `CommandLog` for the "recent
+    commands" context shown at the prompt — cheap (JSONL read-back,
+    `CommandLog.read_all()`) and always reflects the LATEST round's activity
+    without this function needing to track command history itself.
+    """
+    command_log = deps.static_command_log if track == "static" else deps.dynamic_command_log
+    last_decision = None
+    round_number = 0
+
+    while is_budget_exhausted(result) and round_number < settings.stage5_hitl_max_rounds:
+        round_number += 1
+        recent_commands = command_log.read_all()[-10:]
+        req = HitlRequest(
+            global_id=candidate.global_id,
+            track=track,
+            result=result,
+            plan=plan,
+            target=target,
+            recent_commands=recent_commands,
+            round_number=round_number,
+        )
+        decision = await prompt_for_track(req, prompter=prompter)
+        last_decision = decision
+
+        if decision.action == HitlAction.SKIP:
+            break
+
+        if decision.action == HitlAction.FORCE_VERDICT:
+            forced = decision.forced_verdict or VerificationVerdict.INCONCLUSIVE
+            result = force_verdict_result(
+                previous=result, verdict=forced, rationale=decision.rationale
+            )
+            break
+
+        if track == "static":
+            static_plan = (
+                plan.model_copy(update=decision.plan_overrides)
+                if decision.action == HitlAction.OVERRIDE_PLAN
+                else plan
+            )
+            if decision.action == HitlAction.RETRY:
+                extra = decision.extra_iterations or settings.stage5_hitl_extra_iterations
+                retry_settings = settings.model_copy(
+                    update={
+                        "stage5_max_agent_iterations": settings.stage5_max_agent_iterations
+                        + extra
+                    }
+                )
+                result = await run_static_track(
+                    candidate,
+                    static_plan,
+                    generator_llm=deps.static_generator_llm,
+                    evaluator_llm=deps.static_evaluator_llm,
+                    workspace_dir=deps.static_workspace_dir,
+                    executor=deps.static_executor,
+                    settings=retry_settings,
+                    system_prompt=deps.system_prompt,
+                    command_log=command_log,
+                )
+            elif decision.action == HitlAction.OVERRIDE_PLAN:
+                plan = static_plan
+                result = await run_static_track(
+                    candidate,
+                    static_plan,
+                    generator_llm=deps.static_generator_llm,
+                    evaluator_llm=deps.static_evaluator_llm,
+                    workspace_dir=deps.static_workspace_dir,
+                    executor=deps.static_executor,
+                    settings=settings,
+                    system_prompt=deps.system_prompt,
+                    command_log=command_log,
+                )
+            elif decision.action == HitlAction.INJECT:
+                result = await run_injected_static_script(
+                    candidate,
+                    decision.injected_payload,
+                    workspace_dir=deps.static_workspace_dir,
+                    executor=deps.static_executor,
+                    settings=settings,
+                    command_log=command_log,
+                )
+        else:  # dynamic
+            dynamic_plan = (
+                plan.model_copy(update=decision.plan_overrides)
+                if decision.action == HitlAction.OVERRIDE_PLAN
+                else plan
+            )
+            retry_settings = settings
+            if decision.action == HitlAction.RETRY:
+                extra = decision.extra_iterations or settings.stage5_hitl_extra_iterations
+                retry_settings = settings.model_copy(
+                    update={
+                        "stage5_dynamic_max_iterations": settings.stage5_dynamic_max_iterations
+                        + extra
+                    }
+                )
+            if decision.action == HitlAction.OVERRIDE_PLAN:
+                plan = dynamic_plan
+            raw_override = (
+                decision.injected_payload if decision.action == HitlAction.INJECT else None
+            )
+            (
+                result,
+                guard_logs,
+                dynamic_reached_sink,
+                gdb_transcript,
+            ) = await run_dynamic_track_only(
+                candidate,
+                dynamic_plan,
+                target,
+                deps=deps,
+                settings_override=retry_settings,
+                raw_recipe_override=raw_override,
+            )
+
+    review = None
+    if last_decision is not None and last_decision.action != HitlAction.SKIP:
+        review = build_human_review_record(
+            track=track, decision=last_decision, rounds=max(round_number, 1)
+        )
+    return result, dynamic_reached_sink, guard_logs, gdb_transcript, review
+
+
 async def run_fvvw(
     candidate: VerificationCandidate,
     *,
     db_subfolder: Path,
     settings: Settings,
+    hitl_prompter: Prompter = terminal_prompter,
 ) -> dict:
     """Run the complete fork-join workflow for one candidate: strategy ->
     fork(static, dynamic) -> join -> joint_evaluate -> (report composed
@@ -351,8 +527,19 @@ async def run_fvvw(
     Returns a plain dict with `target`, `plan`, `static_result`,
     `dynamic_result`, `agreement`, `mechanism_confidence`,
     `reachability_confidence`, `residual_unknowns`, `guard_logs`,
-    `dynamic_gdb_transcript`, `crosscheck_evidence` — everything
-    `fvvw.report.write_report` and the persisted `FVVWReport` need.
+    `dynamic_gdb_transcript`, `crosscheck_evidence`, `human_review` —
+    everything `fvvw.report.write_report` and the persisted `FVVWReport`
+    need.
+
+    When `Settings.stage5_hitl_mode == "prompt"`, a track whose terminal
+    result is tagged `budget_exhausted` (see `fvvw.hitl`'s trigger
+    condition) is offered to the operator via `hitl_prompter`
+    (`fvvw.hitl.terminal_prompter` by default — a scripted fake in tests)
+    AFTER the barrier below and BEFORE `joint_evaluate`, never inside
+    either track's own concurrent task — see `fvvw.hitl`'s module docstring
+    for why. `hitl_prompter` is a parameter (not read from `Settings`
+    itself) purely so tests can inject a scripted `Prompter` with no real
+    stdin.
     """
     if candidate.source_path is None:
         raise Stage5InputError(
@@ -391,6 +578,7 @@ async def run_fvvw(
             plan.static_plan,
             executor=deps.crosscheck_executor,
             settings=settings,
+            command_log=deps.static_command_log,
         )
     )
     dynamic_task = asyncio.ensure_future(
@@ -401,6 +589,61 @@ async def run_fvvw(
     static_result = await static_task
     crosscheck_result = await crosscheck_task
     dynamic_result, guard_logs, dynamic_reached_sink, gdb_transcript = await dynamic_task
+
+    # ---- HITL: offer intervention on any track that exhausted its budget,
+    # AFTER the barrier (both tracks' results are in hand) and BEFORE
+    # joint_evaluate — see fvvw.hitl's module docstring for why this can't
+    # live inside either track's own concurrent task. ---------------------
+    human_review: HumanReviewRecord | None = None
+    if settings.stage5_hitl_mode == "prompt":
+        if is_budget_exhausted(static_result):
+            (
+                static_result,
+                _,
+                _,
+                _,
+                static_review,
+            ) = await _run_hitl_for_track(
+                candidate=candidate,
+                track="static",
+                result=static_result,
+                plan=plan.static_plan,
+                target=target,
+                deps=deps,
+                settings=settings,
+                prompter=hitl_prompter,
+                dynamic_reached_sink=dynamic_reached_sink,
+                guard_logs=guard_logs,
+                gdb_transcript=gdb_transcript,
+            )
+            human_review = static_review or human_review
+        if is_budget_exhausted(dynamic_result):
+            (
+                dynamic_result,
+                dynamic_reached_sink,
+                guard_logs,
+                gdb_transcript,
+                dynamic_review,
+            ) = await _run_hitl_for_track(
+                candidate=candidate,
+                track="dynamic",
+                result=dynamic_result,
+                plan=plan.dynamic_plan,
+                target=target,
+                deps=deps,
+                settings=settings,
+                prompter=hitl_prompter,
+                dynamic_reached_sink=dynamic_reached_sink,
+                guard_logs=guard_logs,
+                gdb_transcript=gdb_transcript,
+            )
+            # A candidate rarely needs BOTH tracks reviewed in one run; if it
+            # does, the dynamic track's review record is what's persisted —
+            # human_review is a single record, not a list, matching
+            # FVVWReport.human_review's shape. Both actions are still fully
+            # visible either way: residual_unknowns (fvvw.joint) carries a
+            # caveat for EVERY human_attributed track, not just the last one.
+            human_review = dynamic_review or human_review
 
     # ---- joint_evaluate ---------------------------------------------------
     verdict = joint_evaluate(
@@ -423,6 +666,7 @@ async def run_fvvw(
         "guard_logs": guard_logs,
         "dynamic_gdb_transcript": gdb_transcript,
         "crosscheck_evidence": crosscheck_result.to_evidence_dict(),
+        "human_review": human_review,
         "deps": deps,
     }
 

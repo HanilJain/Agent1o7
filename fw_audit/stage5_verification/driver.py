@@ -19,8 +19,10 @@ from pathlib import Path
 
 from fw_audit.common.verification import (
     CandidateRunRecord,
+    TrackResult,
     VerificationReport,
     VerificationRunSummary,
+    VerificationVerdict,
 )
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.observability import span, trace_context
@@ -35,6 +37,13 @@ from fw_audit.stage5_verification.errors import (
     SandboxUnavailableError,
     Stage5InputError,
     VerifierModelUnavailableError,
+)
+from fw_audit.stage5_verification.fvvw.hitl import (
+    HitlAction,
+    HitlRequest,
+    Prompter,
+    prompt_for_track,
+    terminal_prompter,
 )
 from fw_audit.stage5_verification.report_writer import render_report
 
@@ -102,6 +111,109 @@ class _RunContext:
     records: dict[str, CandidateRunRecord] = dataclasses.field(default_factory=dict)
 
 
+def _joern_only_budget_exhausted(report: VerificationReport, settings: Settings) -> bool:
+    """The `--joern-only` path's own budget-exhaustion check — mirrors
+    `fvvw.static_track.run_static_track`'s tagging exactly (verdict is
+    ERROR/INCONCLUSIVE AND every iteration was used), but computed here
+    directly against a `VerificationReport` (whose `evidence` field is a
+    plain `str`, not the fork-join's `dict` — there's no `budget_exhausted`
+    field to tag on this schema, so this is re-derived at the point HITL
+    needs it instead)."""
+    return (
+        report.verdict in (VerificationVerdict.ERROR, VerificationVerdict.INCONCLUSIVE)
+        and len(report.attempts) >= settings.stage5_max_agent_iterations
+    )
+
+
+async def _run_hitl_joern_only(
+    report: VerificationReport,
+    *,
+    candidate: VerificationCandidate,
+    db_subfolder: Path,
+    settings: Settings,
+    prompter: Prompter,
+) -> VerificationReport:
+    """HITL for the `--joern-only` static-only path — offers only the
+    static actions (retry/override_plan is not meaningful here since there
+    is no `StrategyPlan`/`StaticPlan` in this code path at all; `inject`
+    reuses `fvvw.static_track.run_injected_static_script` against the same
+    workspace `verify_candidate` already built; `force_verdict` substitutes
+    a verdict directly). Bounded by `stage5_hitl_max_rounds`, same as the
+    fork-join's own loop."""
+    from fw_audit.stage5_verification.fvvw.static_track import run_injected_static_script
+    from fw_audit.stage5_verification.tools.joern_tool import joern_executor
+
+    stage5_dir_ = layout.stage5_dir(db_subfolder)
+    workspace_dir_ = layout.workspace_dir(stage5_dir_, candidate.global_id)
+    round_number = 0
+
+    while (
+        _joern_only_budget_exhausted(report, settings)
+        and round_number < settings.stage5_hitl_max_rounds
+    ):
+        round_number += 1
+        req = HitlRequest(
+            global_id=candidate.global_id,
+            track="static",
+            result=_report_as_track_result(report),
+            plan=None,
+            target=None,
+            recent_commands=[],
+            round_number=round_number,
+        )
+        decision = await prompt_for_track(req, prompter=prompter)
+
+        if decision.action == HitlAction.SKIP:
+            break
+        if decision.action == HitlAction.FORCE_VERDICT:
+            forced = decision.forced_verdict or VerificationVerdict.INCONCLUSIVE
+            report = report.model_copy(
+                update={"verdict": forced, "summary": decision.rationale or report.summary}
+            )
+            break
+        if decision.action == HitlAction.INJECT:
+            executor = joern_executor(settings)
+            result = await run_injected_static_script(
+                candidate,
+                decision.injected_payload,
+                workspace_dir=workspace_dir_,
+                executor=executor,
+                settings=settings,
+            )
+            report = report.model_copy(update={"verdict": result.verdict})
+        elif decision.action == HitlAction.RETRY:
+            extra = decision.extra_iterations or settings.stage5_hitl_extra_iterations
+            retry_settings = settings.model_copy(
+                update={"stage5_max_agent_iterations": settings.stage5_max_agent_iterations + extra}
+            )
+            report = await verify_candidate(
+                candidate, db_subfolder=db_subfolder, settings=retry_settings
+            )
+        # override_plan is not offered on --joern-only (see docstring), so
+        # any other action is treated as skip.
+
+    return report
+
+
+def _report_as_track_result(report: VerificationReport) -> TrackResult:
+    """Adapt a `VerificationReport` into the bare shape `HitlRequest.result`
+    needs (`verdict`/`proved_hypothesis`/`iters_used` are all this path's
+    prompter reads) — a real `TrackResult`, since `fvvw.hitl`'s helpers
+    already expect one."""
+    if report.verdict == VerificationVerdict.CONFIRMED:
+        proved = "A"
+    elif report.verdict == VerificationVerdict.REFUTED:
+        proved = "B"
+    else:
+        proved = "none"
+    return TrackResult(
+        verdict=report.verdict,
+        proved_hypothesis=proved,
+        evidence={},
+        iters_used=len(report.attempts),
+    )
+
+
 async def _process_one(candidate: VerificationCandidate, *, ctx: _RunContext) -> None:
     """Verify one candidate, persisting the JSON report and Markdown
     explanation, then updating the run-level bookkeeping record."""
@@ -122,6 +234,16 @@ async def _process_one(candidate: VerificationCandidate, *, ctx: _RunContext) ->
         report: VerificationReport = await verify_candidate(
             candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings
         )
+        if ctx.settings.stage5_hitl_mode == "prompt" and _joern_only_budget_exhausted(
+            report, ctx.settings
+        ):
+            report = await _run_hitl_joern_only(
+                report,
+                candidate=candidate,
+                db_subfolder=ctx.db_subfolder,
+                settings=ctx.settings,
+                prompter=terminal_prompter,
+            )
         if run is not None:
             run.end(outputs={"verdict": report.verdict.value})
 

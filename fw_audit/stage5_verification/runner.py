@@ -143,6 +143,38 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the strategy plan, the dynamic QEMU+GDB track, and the joint two-axis verdict "
         "entirely. Without this flag, `run` drives the full FVVW v3 fork-join by default.",
     )
+    run.add_argument(
+        "--hitl",
+        choices=["off", "prompt"],
+        default=None,
+        metavar="{off,prompt}",
+        help="'prompt' pauses after a track exhausts its own budget without a decisive "
+        "verdict and offers the operator retry/override_plan/inject/force_verdict/skip. "
+        "FORCES stage5_workers=1 (a blocking terminal prompt cannot safely interleave "
+        "with a concurrent candidate's own stdout) — a notice is printed when this "
+        "happens. Default 'off' (unattended, today's behavior, unchanged).",
+    )
+    run.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override the static track's stage5_max_agent_iterations for this run.",
+    )
+    run.add_argument(
+        "--dynamic-max-iterations",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override the dynamic track's stage5_dynamic_max_iterations for this run.",
+    )
+    run.add_argument(
+        "--no-command-log",
+        action="store_true",
+        help="Disable stage5/fvvw/logs/<gid>.<track>.jsonl command logging for this run "
+        "(Settings.stage5_command_log=False) — the LangSmith span record (if --trace is "
+        "also passed) is unaffected either way.",
+    )
 
     dbg = sub.add_parser("debug", help="Inspect/verify one component in isolation.")
     dbg_sub = dbg.add_subparsers(dest="debug_command", required=True)
@@ -237,6 +269,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
         updates["stage5_verifier_model"] = args.model
     if args.keep_workspace:
         updates["stage5_keep_workspace"] = True
+    if getattr(args, "max_iterations", None) is not None:
+        updates["stage5_max_agent_iterations"] = args.max_iterations
+    if getattr(args, "dynamic_max_iterations", None) is not None:
+        updates["stage5_dynamic_max_iterations"] = args.dynamic_max_iterations
+    if getattr(args, "no_command_log", False):
+        updates["stage5_command_log"] = False
+    if getattr(args, "hitl", None) is not None:
+        updates["stage5_hitl_mode"] = args.hitl
+        if args.hitl == "prompt" and settings.stage5_workers != 1:
+            print(
+                "note: --hitl=prompt forces stage5_workers=1 — a blocking terminal "
+                "prompt cannot safely interleave with a concurrent candidate's stdout.",
+                file=sys.stderr,
+            )
+            updates["stage5_workers"] = 1
     if updates:
         settings = settings.model_copy(update=updates)
 

@@ -601,6 +601,32 @@ class Settings(BaseSettings):
     Set `False` only to suppress the extra disk writes (e.g. a constrained
     CI runner); it never affects a verdict either way."""
 
+    # ---- Stage 5 FVVW v3: human-in-the-loop on inconclusive tracks --------
+    stage5_hitl_mode: str = Field(default="off", validation_alias="FWA_STAGE5_HITL_MODE")
+    """`"off"` (default — today's fully unattended behavior, unchanged) or
+    `"prompt"` — when a track exhausts its own iteration/repair budget
+    without reaching a decisive verdict (INCONCLUSIVE, or the ERROR a
+    budget exhaustion produces), `fvvw.graph.run_fvvw` pauses AFTER the
+    fork-join barrier and offers the operator one of `fvvw.hitl.HitlAction`'s
+    four interventions before `joint_evaluate` runs. See `fw-verify run
+    --hitl=prompt`."""
+    stage5_hitl_max_rounds: int = Field(
+        default=3, ge=1, validation_alias="FWA_STAGE5_HITL_MAX_ROUNDS"
+    )
+    """Bounds the retry/override/inject prompt loop for ONE candidate — an
+    unattended terminal (stdin closed/EOF, or an operator who keeps choosing
+    retry) cannot spin the same candidate forever; after this many rounds
+    the candidate proceeds to `joint_evaluate` with whatever the last round
+    produced."""
+    stage5_hitl_extra_iterations: int = Field(
+        default=4, ge=1, validation_alias="FWA_STAGE5_HITL_EXTRA_ITERATIONS"
+    )
+    """Default extra-iterations count for HITL's "retry with more
+    iterations" action when the operator doesn't specify a different number
+    — added to whichever budget (`stage5_max_agent_iterations` for the
+    static track, `stage5_dynamic_max_iterations` for the dynamic track)
+    the exhausted track was using."""
+
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names
     # (binwalk/unsquashfs/etc.) are no longer configurable here — those run

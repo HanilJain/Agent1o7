@@ -310,3 +310,57 @@ def test_joint_evaluate_forced_guard_with_concordant_confirm_still_caps_reachabi
     assert verdict.mechanism_confidence == MechanismConfidence.CONFIRMED_STRONG
     assert verdict.reachability_confidence == ReachabilityConfidence.FORCED_UNKNOWN
     assert any("FORCED" in u for u in verdict.residual_unknowns)
+
+
+# ---------------------------------------------------------------------- #
+# human_attributed caveat — HITL's force_verdict action (Stage 5 HITL plan
+# Part 3) never presents a hand-set verdict as machine-derived.
+# ---------------------------------------------------------------------- #
+
+
+def test_residual_unknowns_flags_human_attributed_dynamic_verdict():
+    unknowns = collect_residual_unknowns(
+        static_result=_result(VerificationVerdict.CONFIRMED),
+        dynamic_result=_result(
+            VerificationVerdict.CONFIRMED,
+            evidence={"human_attributed": True, "rationale": "manually confirmed via ida"},
+        ),
+    )
+    assert any(
+        "dynamic track" in u and "HUMAN OPERATOR" in u and "manually confirmed via ida" in u
+        for u in unknowns
+    )
+
+
+def test_residual_unknowns_flags_human_attributed_static_verdict():
+    unknowns = collect_residual_unknowns(
+        static_result=_result(
+            VerificationVerdict.REFUTED,
+            evidence={"human_attributed": True, "rationale": "sanitizer confirmed by hand"},
+        ),
+        dynamic_result=_result(VerificationVerdict.REFUTED),
+    )
+    assert any(
+        "static track" in u and "HUMAN OPERATOR" in u and "sanitizer confirmed by hand" in u
+        for u in unknowns
+    )
+
+
+def test_residual_unknowns_no_human_attributed_caveat_for_ordinary_run():
+    unknowns = collect_residual_unknowns(
+        static_result=_result(VerificationVerdict.CONFIRMED),
+        dynamic_result=_result(VerificationVerdict.CONFIRMED),
+    )
+    assert not any("HUMAN OPERATOR" in u for u in unknowns)
+
+
+def test_joint_evaluate_end_to_end_surfaces_human_attributed_caveat():
+    verdict = joint_evaluate(
+        static_result=_result(VerificationVerdict.CONFIRMED),
+        dynamic_result=_result(
+            VerificationVerdict.CONFIRMED,
+            evidence={"human_attributed": True, "rationale": "r"},
+        ),
+        dynamic_reached_sink=True,
+    )
+    assert any("HUMAN OPERATOR" in u for u in verdict.residual_unknowns)

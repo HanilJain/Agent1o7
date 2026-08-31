@@ -170,6 +170,20 @@ def collect_residual_unknowns(
             f"({static_result.verdict.value}) — see its own evidence for the attempt history."
         )
 
+    # A forced human verdict (HITL's `force_verdict` action — see
+    # fvvw.hitl.force_verdict_result) is flagged as an explicit caveat on
+    # WHICHEVER track carries it, never silently presented as a
+    # machine-derived result. Checked on both tracks independently — either
+    # or both may carry it.
+    for label, result in (("static", static_result), ("dynamic", dynamic_result)):
+        if (result.evidence or {}).get("human_attributed"):
+            rationale = (result.evidence or {}).get("rationale", "")
+            unknowns.append(
+                f"{label} track's verdict ({result.verdict.value}) was SET BY A HUMAN "
+                f"OPERATOR (HITL force_verdict), not derived from the pipeline's own "
+                f"evidence — rationale: {rationale or '(none given)'}"
+            )
+
     return unknowns
 
 

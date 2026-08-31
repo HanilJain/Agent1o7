@@ -21,6 +21,20 @@ from dataclasses import dataclass
 
 CONTAINER_WORKDIR = "/work"
 
+CONTAINER_SCRATCH = "/tmp/fvvw"
+"""Where GDB recipes and the QEMU stdout/stderr log are written — deliberately
+OUTSIDE `CONTAINER_WORKDIR`, which is a bind mount of `candidate.rootfs_dir`
+(the extracted firmware filesystem itself, see `dynamic_track._workspace_dir_for`).
+Writing recipes/logs under `CONTAINER_WORKDIR` would pollute the extracted
+firmware with `recipe_*.gdb`/`.fvvw_qemu.log` files that are never cleaned up
+and would still be present on a later re-run. Both the shell redirect (`>
+{CONTAINER_SCRATCH}/...`) and the `gdb-multiarch` invocation are evaluated by
+the OUTER container shell, never inside the `chroot` `bringup_stabilize`
+issues for the emulated process itself, so this absolute container-local path
+resolves correctly regardless of whether the target is chrooted. No copy-out
+step is needed: the recipe text and every stdout/stderr this produces are
+captured verbatim in the host-side `cmdlog.CommandLog` JSONL instead."""
+
 
 @dataclass(frozen=True)
 class QemuArchSpec:
@@ -314,6 +328,7 @@ def render_trigger_breakpoint_commands(
 
 
 __all__ = [
+    "CONTAINER_SCRATCH",
     "CONTAINER_WORKDIR",
     "QEMU_ARCH_TABLE",
     "QemuArchSpec",

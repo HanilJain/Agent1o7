@@ -138,6 +138,7 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
             reachability_confidence=outcome["reachability_confidence"].value,
             residual_unknowns=outcome["residual_unknowns"],
             dynamic_gdb_transcript=outcome["dynamic_gdb_transcript"],
+            human_review=outcome.get("human_review"),
             llm=deps.report_llm,
             settings=ctx.settings,
         )
@@ -171,6 +172,7 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
         dynamic_gdb_transcript=outcome["dynamic_gdb_transcript"],
         crosscheck_evidence=outcome["crosscheck_evidence"],
         command_log_paths=command_log_paths,
+        human_review=outcome.get("human_review"),
         started_at=started_at,
         finished_at=datetime.now(UTC),
     )

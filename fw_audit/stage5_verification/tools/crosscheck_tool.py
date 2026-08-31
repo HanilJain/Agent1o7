@@ -30,6 +30,7 @@ from fw_audit.config.settings import Settings, get_settings
 from fw_audit.executors.base import Executor
 from fw_audit.observability import aspan
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
+from fw_audit.stage5_verification.cmdlog import CommandLog
 from fw_audit.stage5_verification.tools.verification_sandbox import verification_executor
 
 CROSSCHECK_CONTAINER_WORKDIR = "/work"
@@ -122,6 +123,7 @@ async def static_crosscheck(
     *,
     executor: Executor | None = None,
     settings: Settings | None = None,
+    command_log: CommandLog | None = None,
 ) -> CrosscheckResult:
     """Disassemble `candidate.binary_path` and confirm/refute
     `plan.expected_intermediate_calls`/`plan.sanitizer_patterns` against it.
@@ -133,6 +135,11 @@ async def static_crosscheck(
     `candidate.binary_path` is unresolved or the sandbox is unreachable —
     the static track's Joern half is unaffected either way, this is purely
     corroborative.
+
+    `command_log`, when given, records the `objdump` command + its full
+    result to `stage5/fvvw/logs/<gid>.static.jsonl` — previously visible
+    only in the LangSmith span (a no-op without `--trace`). `None` (the
+    default) behaves exactly as before.
     """
     settings = settings or get_settings()
     executor = executor or verification_executor(settings)
@@ -149,13 +156,14 @@ async def static_crosscheck(
     workspace_dir = candidate.binary_path.parent
     binary_name = candidate.binary_path.name
 
+    command = objdump_disassemble_command(binary_name)
     async with aspan(
         "stage5.static_crosscheck",
         run_type="tool",
         inputs={"global_id": candidate.global_id, "bin_id": candidate.bin_id},
     ) as run:
         result = await executor.run(
-            objdump_disassemble_command(binary_name),
+            command,
             files=workspace_dir,
             timeout=settings.stage5_qemu_timeout_seconds,
         )
@@ -170,6 +178,15 @@ async def static_crosscheck(
             pattern: _search_disassembly(disassembly, pattern)
             for pattern in plan.sanitizer_patterns
         }
+
+        if command_log is not None:
+            command_log.record(
+                node="static_crosscheck",
+                kind="objdump",
+                command=command,
+                result=result,
+                notes={"calls_confirmed": calls_confirmed, "sanitizers_found": sanitizers_found},
+            )
 
         if run is not None:
             run.end(

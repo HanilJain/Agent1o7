@@ -33,6 +33,7 @@ from fw_audit.observability import aspan
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.cmdlog import aphase
 from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
+    CONTAINER_SCRATCH,
     CONTAINER_WORKDIR,
     build_gdb_batch_command,
     build_qemu_user_launch_command,
@@ -47,8 +48,11 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
 # DynamicFault message if the gdbstub readiness probe times out, so a
 # silent "never opened the port" failure carries QEMU's own diagnostic
 # (bad chroot, missing interpreter/libs, unsupported syscall, ...) instead
-# of forcing a manual `docker exec` to find out why.
-_QEMU_LOG_PATH = f"{CONTAINER_WORKDIR}/.fvvw_qemu.log"
+# of forcing a manual `docker exec` to find out why. Lives under
+# CONTAINER_SCRATCH (never CONTAINER_WORKDIR, which is a bind mount of the
+# extracted firmware rootfs) so this never pollutes the firmware being
+# analyzed — see qemu_gdb_tool.CONTAINER_SCRATCH's own docstring.
+_QEMU_LOG_PATH = f"{CONTAINER_SCRATCH}/.fvvw_qemu.log"
 
 # --------------------------------------------------------------------- #
 # Benign-marker-only invariant (FVVW §0/§12) — a hard, validated invariant
@@ -136,6 +140,66 @@ def validate_benign_marker(marker: str) -> None:
         )
 
 
+# GDB's own escape hatches — anything here would execute a HOST-side command
+# (a shell, an interpreter, arbitrary file read) outside the benign-marker
+# discipline `validate_benign_marker` enforces for the marker text itself.
+# An operator-injected raw recipe (HITL's "inject" action) bypasses
+# `plan.payload_marker` entirely, so `validate_benign_marker` never sees it —
+# this is that recipe's OWN gate, checked line-by-line before the recipe is
+# ever written into a session container.
+_GDB_ESCAPE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"^\s*shell\b",
+        r"^\s*!",
+        r"^\s*pipe\b",
+        r"^\s*\|",
+        r"^\s*python\b",
+        r"^\s*python-interactive\b",
+        r"^\s*pi\b",
+        r"^\s*eval\b",
+        r"^\s*define\b",
+        r"^\s*source\b",
+        r"^\s*dump\b",  # dump memory/binary to an arbitrary host file
+        r"^\s*generate-core-file\b",
+    )
+)
+
+
+def validate_injected_recipe(recipe: str) -> None:
+    """Raises `BenignMarkerViolation` if an operator-supplied raw GDB recipe
+    (HITL's "inject" action — see `fvvw.hitl`) contains any of GDB's own
+    escape hatches, which would let the recipe execute host-side commands
+    outside the benign-marker-only discipline. Reuses `BenignMarkerViolation`
+    (rather than a new exception type) since this is the SAME hard-stop
+    invariant applied to a different input shape — a caller that hits this
+    must treat the dynamic track as `not_run` for this round, never retry
+    with an auto-"sanitized" recipe. Checked line-by-line so a legitimate
+    `break`/`continue`/`printf`/`set $reg = ...` line elsewhere in the
+    recipe doesn't cause a false positive from a substring match against the
+    whole text."""
+    if not recipe or not recipe.strip():
+        raise BenignMarkerViolation("injected recipe is empty — refusing to run nothing.")
+    for lineno, line in enumerate(recipe.splitlines(), start=1):
+        for pattern in _GDB_ESCAPE_PATTERNS:
+            if pattern.search(line):
+                raise BenignMarkerViolation(
+                    f"injected recipe line {lineno} matched a denied GDB escape hatch "
+                    f"{pattern.pattern!r}: {line!r}"
+                )
+    # The deny-list `validate_benign_marker` already applies to a payload
+    # marker also catches obviously dangerous shell content that might be
+    # embedded in a `printf`/`call` line (e.g. a reverse shell one-liner),
+    # so run it too — never bypassed just because this is a "recipe" rather
+    # than a bare marker string.
+    for pattern in _DENY_PATTERNS:
+        if pattern.search(recipe):
+            raise BenignMarkerViolation(
+                f"injected recipe matched a denied (non-benign) pattern "
+                f"{pattern.pattern!r}."
+            )
+
+
 # --------------------------------------------------------------------- #
 # plan_emulation
 # --------------------------------------------------------------------- #
@@ -205,6 +269,14 @@ class BringupContext:
     launch_cmd: str = ""
     applied_fixes: list[str] | None = None
     repair_count: int = 0
+    raw_recipe_override: str | None = None
+    """Set by HITL's "inject" action (`fvvw.hitl`) to run an operator-supplied
+    GDB recipe VERBATIM in `instrument_trigger` instead of the one
+    `render_gdb_recipe`/`render_trigger_breakpoint_commands` would build —
+    validated by `validate_injected_recipe` (never `validate_benign_marker`,
+    which only understands a bare marker string) before use. `None` (the
+    default) means every dynamic-track node behaves exactly as it did before
+    this field existed."""
 
     def __post_init__(self) -> None:
         if self.applied_fixes is None:
@@ -364,7 +436,8 @@ async def _launch_qemu_and_wait(ctx: BringupContext) -> None:
 
     await ctx.session_executor.exec_in_session(
         ctx.handle,
-        f"cd {CONTAINER_WORKDIR} && ({ctx.launch_cmd} > {_QEMU_LOG_PATH} 2>&1 &) ",
+        f"cd {CONTAINER_WORKDIR} && mkdir -p {CONTAINER_SCRATCH} && "
+        f"({ctx.launch_cmd} > {_QEMU_LOG_PATH} 2>&1 &) ",
         timeout=ctx.settings.stage5_qemu_timeout_seconds,
     )
 
@@ -468,7 +541,7 @@ async def reach_target(
     recipe = render_gdb_recipe(
         architecture=arch, gdb_port=1234, entry_addr=entry_addr, breakpoint_commands=[]
     )
-    recipe_path = "recipe_reach.gdb"
+    recipe_path = f"{CONTAINER_SCRATCH}/recipe_reach.gdb"
     target_relpath = _target_relpath_in_workspace(ctx.candidate)
 
     if ctx.handle is None:
@@ -482,7 +555,7 @@ async def reach_target(
         await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cat > {CONTAINER_WORKDIR}/{recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
+            f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
             timeout=ctx.settings.stage5_gdb_timeout_seconds,
         )
         result = await ctx.session_executor.exec_in_session(
@@ -543,7 +616,7 @@ async def satisfy_guards(
         entry_addr=ctx.plan.entry_addr or ctx.target.func_offset,
         breakpoint_commands=breakpoint_commands,
     )
-    recipe_path = "recipe_guards.gdb"
+    recipe_path = f"{CONTAINER_SCRATCH}/recipe_guards.gdb"
     target_relpath = _target_relpath_in_workspace(ctx.candidate)
 
     async with aspan(
@@ -553,7 +626,7 @@ async def satisfy_guards(
         await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cat > {CONTAINER_WORKDIR}/{recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
+            f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
             timeout=ctx.settings.stage5_gdb_timeout_seconds,
         )
         result = await ctx.session_executor.exec_in_session(
@@ -602,8 +675,20 @@ async def instrument_trigger(
     fired (sink not reached), distinct from "reached but the marker text
     isn't present" (neutralized), which `dynamic_evaluate` treats very
     differently (retry/repair signal vs. real evidence toward B).
+
+    When `ctx.raw_recipe_override` is set (HITL's "inject" action — see
+    `fvvw.hitl`), that recipe text is used VERBATIM instead of the one this
+    function would otherwise build, validated by `validate_injected_recipe`
+    (never `validate_benign_marker`, since a raw recipe is not a bare marker
+    string) before anything else happens. `_parse_trigger_capture`'s marker
+    is still `"TRIGGER:sink_arg"` for the override case too, so an operator
+    writing a raw recipe should reuse that same `printf` marker if they want
+    `captured_sink_argument` populated from it.
     """
-    validate_benign_marker(ctx.plan.payload_marker)
+    if ctx.raw_recipe_override is not None:
+        validate_injected_recipe(ctx.raw_recipe_override)
+    else:
+        validate_benign_marker(ctx.plan.payload_marker)
 
     arch, _ = ctx.emulation_plan.get("arch_spec_key", ("unknown", ""))
     if ctx.handle is None:
@@ -614,6 +699,41 @@ async def instrument_trigger(
     register = arch_spec.arg_registers[0] if arch_spec else "$r0"
 
     marker = "TRIGGER:sink_arg"
+    if ctx.raw_recipe_override is not None:
+        recipe = ctx.raw_recipe_override
+        recipe_path = f"{CONTAINER_SCRATCH}/recipe_trigger.gdb"
+        target_relpath = _target_relpath_in_workspace(ctx.candidate)
+        async with aspan(
+            "stage5.instrument_trigger",
+            run_type="tool",
+            inputs={"global_id": ctx.candidate.global_id, "injected": True},
+        ) as run, aphase("instrument_trigger"):
+            await _launch_qemu_and_wait(ctx)
+            await ctx.session_executor.exec_in_session(
+                ctx.handle,
+                f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n"
+                f"{recipe}FVVWEOF",
+                timeout=ctx.settings.stage5_gdb_timeout_seconds,
+            )
+            result = await ctx.session_executor.exec_in_session(
+                ctx.handle,
+                f"cd {CONTAINER_WORKDIR} && "
+                + build_gdb_batch_command(recipe_path, target_relpath),
+                timeout=ctx.settings.stage5_gdb_timeout_seconds,
+            )
+            captured = _parse_trigger_capture(result.stdout, marker)
+            if run is not None:
+                run.end(outputs={"ok": result.ok, "captured": captured, "injected": True})
+
+        if not result.ok and _looks_like_setup_fault(result.stdout + result.stderr):
+            raise DynamicFault(
+                f"{ctx.candidate.global_id}: instrument_trigger (injected recipe) "
+                f"GDB/QEMU setup fault: {result.stderr}"
+            )
+
+        transcript = gdb_transcript_so_far + result.stdout + result.stderr
+        return transcript, captured
+
     # This is a FRESH QEMU run (see _launch_qemu_and_wait) — the guards
     # forced in `satisfy_guards`'s separate run do not carry over, so this
     # recipe must re-force them itself BEFORE the sink breakpoint, or the
@@ -638,7 +758,7 @@ async def instrument_trigger(
         entry_addr=ctx.plan.entry_addr or ctx.target.func_offset,
         breakpoint_commands=breakpoint_commands,
     )
-    recipe_path = "recipe_trigger.gdb"
+    recipe_path = f"{CONTAINER_SCRATCH}/recipe_trigger.gdb"
     target_relpath = _target_relpath_in_workspace(ctx.candidate)
 
     async with aspan(
@@ -650,7 +770,7 @@ async def instrument_trigger(
         await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cat > {CONTAINER_WORKDIR}/{recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
+            f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
             timeout=ctx.settings.stage5_gdb_timeout_seconds,
         )
         result = await ctx.session_executor.exec_in_session(
@@ -927,12 +1047,20 @@ def dynamic_evaluate(
 def _terminal(
     verdict: VerificationVerdict, proved_hypothesis: str, iteration: int, *, reason: str
 ) -> dict:
+    evidence: dict = {"reason": reason} if reason else {}
+    if verdict == VerificationVerdict.INCONCLUSIVE:
+        # HITL's trigger condition (fvvw.graph.run_fvvw, see fvvw.hitl) is a
+        # FACT tagged here, not an inference made later from the verdict
+        # alone — a candidate could in principle reach INCONCLUSIVE some
+        # other way in the future, so this stays an explicit marker rather
+        # than "verdict == INCONCLUSIVE" being re-derived at the call site.
+        evidence["budget_exhausted"] = True
     return {
         "route": "done",
         "result": TrackResult(
             verdict=verdict,
             proved_hypothesis=proved_hypothesis,
-            evidence={"reason": reason} if reason else {},
+            evidence=evidence,
             iters_used=iteration,
         ),
     }
@@ -952,4 +1080,5 @@ __all__ = [
     "reach_target",
     "satisfy_guards",
     "validate_benign_marker",
+    "validate_injected_recipe",
 ]

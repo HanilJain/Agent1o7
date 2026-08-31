@@ -23,6 +23,7 @@ from langchain_core.language_models import BaseChatModel
 
 from fw_audit.common.verification import (
     CpgBuildRecord,
+    EvaluationVerdict,
     JoernScriptAttempt,
     StaticPlan,
     TrackResult,
@@ -32,10 +33,15 @@ from fw_audit.config.settings import Settings
 from fw_audit.executors.base import Executor
 from fw_audit.observability import run_config
 from fw_audit.stage5_verification.agent import transcript as tx
-from fw_audit.stage5_verification.agent.graph import build_verifier_graph
+from fw_audit.stage5_verification.agent.graph import (
+    build_verifier_graph,
+    extract_result_marker,
+    final_status,
+)
 from fw_audit.stage5_verification.agent.prompts import render_finding_brief
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.cmdlog import CommandLog, JsonlRecordingList
+from fw_audit.stage5_verification.tools.joern_tool import run_joern_script_async
 
 
 def render_static_brief(candidate: VerificationCandidate, plan: StaticPlan) -> str:
@@ -192,7 +198,16 @@ async def run_static_track(
         run_name="stage5.fvvw.static_track",
         metadata={"global_id": candidate.global_id, "bin_id": candidate.bin_id},
         settings=settings,
-    )
+    ) or {}
+    # LangGraph's default recursion_limit (25) caps this graph's
+    # generate_script -> run_script -> evaluate loop (3 steps/iteration,
+    # plus build_cpg + conclude) at max_iterations <= ~7 before the run
+    # aborts mid-loop with a GraphRecursionError. HITL's "retry with more
+    # iterations" action (fvvw.hitl) can push settings.stage5_max_agent_
+    # iterations well above that, so this must be set explicitly rather than
+    # left at the library default — see the FVVW HITL plan's "Recursion-limit
+    # trap" note.
+    config["recursion_limit"] = 3 * settings.stage5_max_agent_iterations + 8
     final_state = await graph.ainvoke(initial_state, config=config)
 
     verdict = final_state.get("verdict", VerificationVerdict.ERROR)
@@ -210,6 +225,17 @@ async def run_static_track(
         "evidence_text": final_state.get("verdict_evidence", ""),
         "recommended_next_steps": final_state.get("verdict_next_steps", []),
     }
+    if verdict in (VerificationVerdict.ERROR, VerificationVerdict.INCONCLUSIVE) and final_state.get(
+        "iteration", 0
+    ) >= settings.stage5_max_agent_iterations:
+        # HITL's trigger condition (fvvw.hitl) — the static track's own
+        # budget-exhaustion path (agent.graph's evaluate node downgrades a
+        # FAIL_RETRY to FAIL_STOP at stage5_max_agent_iterations, which
+        # conclude maps to ERROR) is tagged here the same way the dynamic
+        # track tags its own exhaustion, so run_fvvw's post-barrier hook can
+        # check `evidence.get("budget_exhausted")` uniformly across both
+        # tracks without special-casing which one it's looking at.
+        evidence["budget_exhausted"] = True
 
     # The static track has no A/B hypothesis-switch of its own (that logic
     # applies primarily to the dynamic track) — CONFIRMED implies A,
@@ -231,4 +257,74 @@ async def run_static_track(
     )
 
 
-__all__ = ["render_static_brief", "run_static_track"]
+async def run_injected_static_script(
+    candidate: VerificationCandidate,
+    script: str,
+    *,
+    workspace_dir: Path,
+    executor: Executor,
+    settings: Settings,
+    command_log: CommandLog | None = None,
+) -> TrackResult:
+    """HITL's "inject" action for the static track — run an OPERATOR-supplied
+    Joern script verbatim against the already-built CPG in `workspace_dir`,
+    with NO LLM generate/evaluate loop and NO edit to `agent/graph.py`. The
+    verdict is derived the exact same mechanical way `agent.graph.
+    conclude_node` derives it: parse the script's own `RESULT:` marker line
+    (`extract_result_marker`) and treat a present marker as an implicit PASS
+    (`final_status(EvaluationVerdict.PASS, marker)`) — a missing marker
+    (script produced no RESULT: line, or errored) is INCONCLUSIVE rather
+    than ERROR, since a raw script run isn't itself evidence the pipeline
+    malfunctioned, only that the operator's script didn't conclude cleanly.
+
+    Requires `workspace_dir` to already contain `cpg.bin` — i.e. the static
+    track must have run at least once for this candidate first (this is a
+    RE-run/inject action, not a way to bootstrap a CPG from nothing).
+    """
+    # A high, fixed index (rather than 0) so this never overwrites an
+    # earlier real attempt's query_NNN.sc left in the same workspace_dir by
+    # the generate/run/evaluate loop that ran before HITL kicked in.
+    attempt = await run_joern_script_async(
+        script,
+        attempt_index=999,
+        workspace_dir=workspace_dir,
+        executor=executor,
+        settings=settings,
+    )
+    if command_log is not None:
+        command_log.record(
+            node="run_script",
+            kind="joern_script_injected",
+            command="joern --script query_999.sc",
+            payload=script,
+            exit_code=attempt.returncode,
+            ok=attempt.ok,
+            stdout=attempt.stdout,
+            stderr=attempt.stderr,
+            notes={"injected": True},
+        )
+
+    marker = extract_result_marker(attempt.stdout, attempt.stderr)
+    evaluation_verdict = EvaluationVerdict.PASS if attempt.ok else EvaluationVerdict.FAIL_STOP
+    verdict = final_status(evaluation_verdict, marker)
+
+    if verdict == VerificationVerdict.CONFIRMED:
+        proved_hypothesis = "A"
+    elif verdict == VerificationVerdict.REFUTED:
+        proved_hypothesis = "B"
+    else:
+        proved_hypothesis = "none"
+
+    return TrackResult(
+        verdict=verdict,
+        proved_hypothesis=proved_hypothesis,
+        evidence={
+            "attempts": [_attempt_evidence(attempt)],
+            "injected": True,
+            "result_marker": marker,
+        },
+        iters_used=0,
+    )
+
+
+__all__ = ["render_static_brief", "run_injected_static_script", "run_static_track"]

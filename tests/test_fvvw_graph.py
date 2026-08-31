@@ -496,3 +496,393 @@ async def test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself(
     result = await run_fvvw(candidate, db_subfolder=db_subfolder, settings=settings)
     assert result["dynamic_result"] is not None
     assert flaky_session._stage_attempts >= 2  # failed once, then retried successfully
+
+
+# ---------------------------------------------------------------------- #
+# HITL — Stage 5 HITL plan Part 3, wired into run_fvvw between the barrier
+# and joint_evaluate.
+# ---------------------------------------------------------------------- #
+
+
+class _NeverReachesSessionExecutor(_FakeSessionExecutor):
+    """Every GDB batch reports NO breakpoint hit — dynamic_evaluate can
+    never confirm/refute, so it exhausts stage5_dynamic_max_iterations and
+    terminates INCONCLUSIVE with evidence["budget_exhausted"]=True (see
+    fvvw.dynamic_track._terminal). This is what lets these tests trigger
+    the HITL hook deterministically without depending on iteration timing."""
+
+    async def exec_in_session(self, handle, command, *, timeout=None):
+        self.exec_calls.append(command)
+        if command.startswith("test -e"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout="NOTFOUND\n", stderr="", timed_out=False
+            )
+        return ExecutionResult(command=command, returncode=0, stdout="", stderr="", timed_out=False)
+
+
+async def test_run_fvvw_hitl_off_never_calls_prompter(monkeypatch, fake_executor, tmp_path: Path):
+    """stage5_hitl_mode='off' (the default) — the prompter must never be
+    invoked, even though the dynamic track exhausts its budget."""
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            (files / "cpg.bin").write_bytes(b"cpg")
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout="disasm\n", stderr="", timed_out=False
+            )
+        return ExecutionResult(
+            command=command,
+            returncode=0,
+            stdout="RESULT: FLOW_FOUND (1 path(s))",
+            stderr="",
+            timed_out=False,
+        )
+
+    joern_exec = fake_executor(on_run)
+    crosscheck_exec = fake_executor(on_run)
+    never_reaches = _NeverReachesSessionExecutor()
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.joern_executor", lambda settings: joern_exec
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_executor",
+        lambda settings: crosscheck_exec,
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_session_executor",
+        lambda settings: never_reaches,
+    )
+
+    prompter_calls = []
+
+    def prompter(req):
+        prompter_calls.append(req)
+        from fw_audit.stage5_verification.fvvw.hitl import HitlAction, HitlDecision
+
+        return HitlDecision(action=HitlAction.SKIP)
+
+    settings = Settings(
+        _env_file=None, FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=1, FWA_STAGE5_HITL_MODE="off"
+    )
+    result = await run_fvvw(
+        candidate, db_subfolder=db_subfolder, settings=settings, hitl_prompter=prompter
+    )
+
+    assert result["dynamic_result"].verdict == VerificationVerdict.INCONCLUSIVE
+    assert result["dynamic_result"].evidence.get("budget_exhausted") is True
+    assert prompter_calls == [], "prompter must never be called when stage5_hitl_mode='off'"
+    assert result["human_review"] is None
+
+
+async def test_run_fvvw_hitl_not_invoked_when_both_tracks_decisive(
+    monkeypatch, fake_executor, tmp_path: Path
+):
+    """Even with stage5_hitl_mode='prompt', a candidate whose both tracks
+    reach a decisive verdict never triggers the prompter."""
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+    _patch_executors(
+        monkeypatch, fake_executor, script_outputs=["RESULT: FLOW_FOUND (1 path(s))"]
+    )
+
+    prompter_calls = []
+
+    def prompter(req):
+        prompter_calls.append(req)
+        from fw_audit.stage5_verification.fvvw.hitl import HitlAction, HitlDecision
+
+        return HitlDecision(action=HitlAction.SKIP)
+
+    settings = Settings(
+        _env_file=None, FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=2, FWA_STAGE5_HITL_MODE="prompt"
+    )
+    result = await run_fvvw(
+        candidate, db_subfolder=db_subfolder, settings=settings, hitl_prompter=prompter
+    )
+
+    assert result["static_result"].verdict == VerificationVerdict.CONFIRMED
+    assert result["dynamic_result"].verdict == VerificationVerdict.CONFIRMED
+    assert prompter_calls == []
+    assert result["human_review"] is None
+
+
+async def test_run_fvvw_hitl_force_verdict_sets_human_review_and_caveat(
+    monkeypatch, fake_executor, tmp_path: Path
+):
+    """The dynamic track exhausts its budget; the scripted prompter chooses
+    force_verdict — the returned outcome must carry a human_review record
+    and joint_evaluate's residual_unknowns must flag the attribution."""
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            (files / "cpg.bin").write_bytes(b"cpg")
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout="disasm\n", stderr="", timed_out=False
+            )
+        return ExecutionResult(
+            command=command,
+            returncode=0,
+            stdout="RESULT: FLOW_FOUND (1 path(s))",
+            stderr="",
+            timed_out=False,
+        )
+
+    joern_exec = fake_executor(on_run)
+    crosscheck_exec = fake_executor(on_run)
+    never_reaches = _NeverReachesSessionExecutor()
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.joern_executor", lambda settings: joern_exec
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_executor",
+        lambda settings: crosscheck_exec,
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_session_executor",
+        lambda settings: never_reaches,
+    )
+
+    prompter_calls = []
+
+    def prompter(req):
+        from fw_audit.stage5_verification.fvvw.hitl import HitlAction, HitlDecision
+
+        prompter_calls.append(req)
+        assert req.track == "dynamic"
+        return HitlDecision(
+            action=HitlAction.FORCE_VERDICT,
+            forced_verdict=VerificationVerdict.CONFIRMED,
+            rationale="confirmed by manual GDB session",
+        )
+
+    settings = Settings(
+        _env_file=None, FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=1, FWA_STAGE5_HITL_MODE="prompt"
+    )
+    result = await run_fvvw(
+        candidate, db_subfolder=db_subfolder, settings=settings, hitl_prompter=prompter
+    )
+
+    assert len(prompter_calls) == 1
+    assert result["dynamic_result"].verdict == VerificationVerdict.CONFIRMED
+    assert result["dynamic_result"].evidence["human_attributed"] is True
+    assert result["human_review"] is not None
+    assert result["human_review"].track == "dynamic"
+    assert result["human_review"].action == "force_verdict"
+    assert result["human_review"].rationale == "confirmed by manual GDB session"
+    assert any("HUMAN OPERATOR" in u for u in result["residual_unknowns"])
+
+
+async def test_run_fvvw_hitl_skip_leaves_result_untouched_and_no_review(
+    monkeypatch, fake_executor, tmp_path: Path
+):
+    """Choosing 'skip' at the prompt accepts the track's current
+    non-decisive result as-is — no human_review record is produced, since
+    nothing was actually attributed to a human."""
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            (files / "cpg.bin").write_bytes(b"cpg")
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout="disasm\n", stderr="", timed_out=False
+            )
+        return ExecutionResult(
+            command=command,
+            returncode=0,
+            stdout="RESULT: FLOW_FOUND (1 path(s))",
+            stderr="",
+            timed_out=False,
+        )
+
+    joern_exec = fake_executor(on_run)
+    crosscheck_exec = fake_executor(on_run)
+    never_reaches = _NeverReachesSessionExecutor()
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.joern_executor", lambda settings: joern_exec
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_executor",
+        lambda settings: crosscheck_exec,
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_session_executor",
+        lambda settings: never_reaches,
+    )
+
+    def prompter(req):
+        from fw_audit.stage5_verification.fvvw.hitl import HitlAction, HitlDecision
+
+        return HitlDecision(action=HitlAction.SKIP)
+
+    settings = Settings(
+        _env_file=None, FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=1, FWA_STAGE5_HITL_MODE="prompt"
+    )
+    result = await run_fvvw(
+        candidate, db_subfolder=db_subfolder, settings=settings, hitl_prompter=prompter
+    )
+
+    assert result["dynamic_result"].verdict == VerificationVerdict.INCONCLUSIVE
+    assert result["human_review"] is None
+
+
+async def test_run_fvvw_hitl_bounded_by_max_rounds(monkeypatch, fake_executor, tmp_path: Path):
+    """A prompter that always retries must not spin forever — bounded by
+    stage5_hitl_max_rounds. The dynamic session never reaches a breakpoint
+    regardless of how many iterations are granted, so every retry round
+    stays budget_exhausted and the loop must terminate after exactly
+    stage5_hitl_max_rounds rounds."""
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            (files / "cpg.bin").write_bytes(b"cpg")
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout="disasm\n", stderr="", timed_out=False
+            )
+        return ExecutionResult(
+            command=command,
+            returncode=0,
+            stdout="RESULT: FLOW_FOUND (1 path(s))",
+            stderr="",
+            timed_out=False,
+        )
+
+    joern_exec = fake_executor(on_run)
+    crosscheck_exec = fake_executor(on_run)
+    never_reaches = _NeverReachesSessionExecutor()
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.joern_executor", lambda settings: joern_exec
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_executor",
+        lambda settings: crosscheck_exec,
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_session_executor",
+        lambda settings: never_reaches,
+    )
+
+    prompter_calls = []
+
+    def prompter(req):
+        from fw_audit.stage5_verification.fvvw.hitl import HitlAction, HitlDecision
+
+        prompter_calls.append(req)
+        return HitlDecision(action=HitlAction.RETRY, extra_iterations=1)
+
+    settings = Settings(
+        _env_file=None,
+        FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=1,
+        FWA_STAGE5_HITL_MODE="prompt",
+        FWA_STAGE5_HITL_MAX_ROUNDS=2,
+    )
+    result = await run_fvvw(
+        candidate, db_subfolder=db_subfolder, settings=settings, hitl_prompter=prompter
+    )
+
+    assert len(prompter_calls) == 2, "prompter must be called exactly stage5_hitl_max_rounds times"
+    assert result["dynamic_result"].verdict == VerificationVerdict.INCONCLUSIVE
+    # A retry that never resolved is still recorded (any non-SKIP action
+    # produces a human_review record — retry included, since an operator DID
+    # intervene even though the outcome stayed non-decisive), with the
+    # correct round count bounded by stage5_hitl_max_rounds.
+    assert result["human_review"] is not None
+    assert result["human_review"].action == "retry"
+    assert result["human_review"].rounds == 2

@@ -42,6 +42,7 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     reach_target,
     satisfy_guards,
     validate_benign_marker,
+    validate_injected_recipe,
 )
 
 # ---------------------------------------------------------------------- #
@@ -107,6 +108,72 @@ def test_marker_not_matching_allowlist_shape_rejected():
     scoped path is rejected — the allow-list is deliberately narrow."""
     with pytest.raises(BenignMarkerViolation):
         validate_benign_marker("; some_custom_binary --do-something ;")
+
+
+# ---------------------------------------------------------------------- #
+# validate_injected_recipe — HITL's "inject" gate on a raw GDB recipe
+# ---------------------------------------------------------------------- #
+
+
+def test_valid_injected_recipe_passes():
+    validate_injected_recipe(
+        "break *0x1000\ncontinue\nprintf \"TRIGGER:sink_arg:%s\\n\", (char*)$r0\n"
+    )  # must not raise
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "shell rm -rf /",
+        "! ls",
+        "pipe echo hi | cat",
+        "python import os; os.system('rm -rf /')",
+        "python-interactive",
+        "pi 1+1",
+        "eval printf \"x\"",
+        "define mycmd\nend",
+        "source /tmp/evil.gdb",
+        "dump memory /tmp/leak.bin 0x1000 0x2000",
+        "generate-core-file /tmp/core",
+    ],
+)
+def test_injected_recipe_gdb_escape_hatches_rejected(recipe: str):
+    with pytest.raises(BenignMarkerViolation):
+        validate_injected_recipe(recipe)
+
+
+def test_injected_recipe_escape_hatch_mid_recipe_rejected():
+    """The gate is checked LINE BY LINE, not just against the first line —
+    an operator-authored recipe could plant an escape hatch anywhere."""
+    recipe = "break *0x1000\ncontinue\nshell rm -rf /\n"
+    with pytest.raises(BenignMarkerViolation):
+        validate_injected_recipe(recipe)
+
+
+def test_injected_recipe_deny_list_also_applies():
+    """The SAME deny-list validate_benign_marker uses also applies to a
+    raw recipe — never bypassed just because it's a whole recipe rather
+    than a bare marker string."""
+    with pytest.raises(BenignMarkerViolation):
+        validate_injected_recipe("printf \"x\"\nshell_unrelated\n; reboot ;\n")
+
+
+def test_empty_injected_recipe_rejected():
+    with pytest.raises(BenignMarkerViolation):
+        validate_injected_recipe("")
+    with pytest.raises(BenignMarkerViolation):
+        validate_injected_recipe("   \n  ")
+
+
+def test_ordinary_gdb_commands_not_falsely_flagged():
+    """A legitimate line containing 'source' or 'define' only as a
+    SUBSTRING elsewhere (not as the command itself) must not false-positive
+    — but a genuine `source`/`define` command at line start is still
+    caught (see the parametrized rejection test above)."""
+    # 'resourceful_check' contains 'source' as a substring but the pattern
+    # anchors on a LEADING command token, so this must pass.
+    recipe = 'printf "resourceful_check done\\n"\ncontinue\n'
+    validate_injected_recipe(recipe)  # must not raise
 
 
 # ---------------------------------------------------------------------- #
@@ -686,7 +753,12 @@ async def test_instrument_trigger_forces_guards_before_sink_in_same_run(tmp_path
     written_recipes: list[str] = []
 
     def on_exec(command):
-        if "recipe_trigger.gdb" in command and command.startswith("cat >"):
+        # The recipe write is now `mkdir -p {CONTAINER_SCRATCH} && cat > ...`
+        # (CONTAINER_SCRATCH, not CONTAINER_WORKDIR — see qemu_gdb_tool's
+        # CONTAINER_SCRATCH docstring for why: CONTAINER_WORKDIR is a bind
+        # mount of the extracted firmware rootfs, and recipes must never be
+        # written into it), so this no longer starts with "cat >" itself.
+        if "recipe_trigger.gdb" in command and "cat >" in command:
             written_recipes.append(command)
         return None
 

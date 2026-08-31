@@ -502,6 +502,36 @@ class ReachabilityConfidence(str, Enum):
     REFUTED = "refuted"
 
 
+class HumanReviewRecord(BaseModel):
+    """`mem.joint.human_review` / `FVVWReport.human_review` — set only when
+    an operator intervened via HITL (`stage5_verification.fvvw.hitl`) on a
+    track that exhausted its budget without a decisive verdict. `None` (the
+    default on `FVVWReport`) means no human intervention happened for this
+    candidate — the ordinary, unattended path. Recording this durably (not
+    just noting it in `residual_unknowns`) is what lets a reader of the
+    persisted report distinguish a machine-derived verdict from a
+    human-attributed one at a glance, without re-deriving it from prose."""
+
+    track: str = Field(description="'static' or 'dynamic' — which track the operator acted on.")
+    action: str = Field(
+        description="The HitlAction taken: 'retry', 'override_plan', 'inject', or "
+        "'force_verdict'."
+    )
+    rationale: str = Field(
+        default="", description="The operator's stated reasoning, verbatim."
+    )
+    overrides: dict = Field(
+        default_factory=dict,
+        description="Plan-field overrides applied ('override_plan') or the injected payload "
+        "text ('inject') — empty for 'retry'/'force_verdict'.",
+    )
+    rounds: int = Field(
+        default=1, description="How many HITL prompt rounds this candidate went through "
+        "before reaching a final disposition (bounded by stage5_hitl_max_rounds)."
+    )
+    timestamp: datetime
+
+
 class FVVWReport(BaseModel):
     """The fork-join run's on-disk artifact: `stage5/fvvw/<gid>.json`.
     Assembled by `fvvw.graph`'s driver from the terminal STM after
@@ -551,6 +581,11 @@ class FVVWReport(BaseModel):
     report JSON doesn't have to re-derive `fvvw/logs/<gid>.<track>.jsonl`
     from `global_id` by hand. Empty when `Settings.stage5_command_log` was
     `False` for this run."""
+    human_review: HumanReviewRecord | None = None
+    """Set only when an operator intervened via HITL (`Settings.
+    stage5_hitl_mode="prompt"`) on a track that exhausted its budget without
+    a decisive verdict — see `HumanReviewRecord`'s own docstring. `None`
+    (the default) for every ordinary, unattended run."""
     started_at: datetime
     finished_at: datetime | None = None
     trace_url: str | None = None

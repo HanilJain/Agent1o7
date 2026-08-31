@@ -62,6 +62,90 @@ def test_run_subcommand_joern_only_flag_sets_true():
 
 
 # ---------------------------------------------------------------------- #
+# --hitl / --max-iterations / --dynamic-max-iterations / --no-command-log
+# (Stage 5 HITL plan Part 4)
+# ---------------------------------------------------------------------- #
+
+
+def test_run_subcommand_hitl_defaults_to_none():
+    args = _parse_args(["run", "--db-subfolder", "x"])
+    assert args.hitl is None
+
+
+def test_run_subcommand_hitl_prompt_flag_parses():
+    args = _parse_args(["run", "--db-subfolder", "x", "--hitl", "prompt"])
+    assert args.hitl == "prompt"
+
+
+def test_run_subcommand_hitl_off_flag_parses():
+    args = _parse_args(["run", "--db-subfolder", "x", "--hitl", "off"])
+    assert args.hitl == "off"
+
+
+def test_run_subcommand_hitl_rejects_unknown_value():
+    with pytest.raises(SystemExit):
+        _parse_args(["run", "--db-subfolder", "x", "--hitl", "bogus"])
+
+
+def test_run_subcommand_max_iterations_defaults_to_none():
+    args = _parse_args(["run", "--db-subfolder", "x"])
+    assert args.max_iterations is None
+
+
+def test_run_subcommand_max_iterations_flag_parses():
+    args = _parse_args(["run", "--db-subfolder", "x", "--max-iterations", "10"])
+    assert args.max_iterations == 10
+
+
+def test_run_subcommand_dynamic_max_iterations_flag_parses():
+    args = _parse_args(["run", "--db-subfolder", "x", "--dynamic-max-iterations", "8"])
+    assert args.dynamic_max_iterations == 8
+
+
+def test_run_subcommand_no_command_log_defaults_to_false():
+    args = _parse_args(["run", "--db-subfolder", "x"])
+    assert args.no_command_log is False
+
+
+def test_run_subcommand_no_command_log_flag_sets_true():
+    args = _parse_args(["run", "--db-subfolder", "x", "--no-command-log"])
+    assert args.no_command_log is True
+
+
+def test_cmd_run_hitl_prompt_forces_single_worker(monkeypatch, tmp_path, capsys):
+    """--hitl=prompt must force stage5_workers=1 and print a notice —
+    a blocking terminal prompt cannot safely interleave with a concurrent
+    candidate's own stdout."""
+    from datetime import UTC, datetime
+
+    from fw_audit.common.verification import VerificationRunSummary
+    from fw_audit.stage5_verification import runner as runner_mod
+
+    captured_settings = {}
+
+    async def fake_run_fvvw_queue(*, db_subfolder, settings, only_global_ids, run_id, **kw):
+        captured_settings["settings"] = settings
+        return VerificationRunSummary(
+            status="completed",
+            db_subfolder=str(db_subfolder),
+            started_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(runner_mod, "run_fvvw_queue", fake_run_fvvw_queue)
+
+    args = runner_mod._parse_args(
+        ["run", "--db-subfolder", str(tmp_path), "--hitl", "prompt"]
+    )
+    rc = runner_mod._cmd_run(args)
+
+    assert rc == 0
+    assert captured_settings["settings"].stage5_hitl_mode == "prompt"
+    assert captured_settings["settings"].stage5_workers == 1
+    stderr = capsys.readouterr().err
+    assert "stage5_workers=1" in stderr
+
+
+# ---------------------------------------------------------------------- #
 # New per-track debug subcommands (Stage 5 FVVW v3 Phase 6)
 # ---------------------------------------------------------------------- #
 

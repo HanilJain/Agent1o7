@@ -134,7 +134,11 @@ async def verify_candidate(
         run_name="stage5.verify_candidate",
         metadata={"global_id": candidate.global_id, "bin_id": candidate.bin_id},
         settings=settings,
-    )
+    ) or {}
+    # See fvvw.static_track.run_static_track's identical comment — HITL's
+    # "retry with more iterations" action can raise stage5_max_agent_iterations
+    # well past LangGraph's default recursion_limit (25).
+    config["recursion_limit"] = 3 * settings.stage5_max_agent_iterations + 8
     try:
         if on_step is None:
             final_state = await graph.ainvoke(initial_state, config=config)

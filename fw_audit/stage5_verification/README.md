@@ -64,6 +64,18 @@ fork-join's static-track building block.
 - **`fvvw/driver.py`**: `run_fvvw_queue()` — a bounded worker pool over
   candidates, persisting `FVVWReport` JSON + Markdown for each, entirely
   separate from the original `driver.py`'s own queue.
+- **`cmdlog.py`**: `CommandLog` — per-track, append-only JSONL of every
+  command either track executes plus its full result, always on by default
+  (unlike LangSmith, not gated by `--trace`) so a failed run stays
+  diagnosable from disk alone.
+- **`fvvw/hitl.py`**: human-in-the-loop — when a track exhausts its own
+  iteration/repair budget without a decisive verdict, `run_fvvw` (with
+  `--hitl=prompt`) pauses after the fork-join barrier and offers the
+  operator one of four interventions: retry with more iterations, override
+  plan values, inject a raw payload/script, or force the verdict by hand
+  with a rationale. A forced verdict is durably marked
+  `evidence["human_attributed"]=True` and surfaces as an explicit caveat in
+  the disclosure report — never presented as machine-derived.
 
 ## Files
 
@@ -84,6 +96,11 @@ fw-verify debug build-cpg --db-subfolder data/db/<stem> --bin-id <bin_id>   # Jo
 fw-verify debug verify --db-subfolder data/db/<stem> --gid "<gid>"          # Joern track only
 fw-verify debug dynamic --db-subfolder data/db/<stem> --gid "<gid>"        # QEMU+GDB track only
 fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report.json  # both, dry run
+
+# Human-in-the-loop: pauses when a track exhausts its budget without a
+# decisive verdict, forces stage5_workers=1
+fw-verify run --db-subfolder data/db/<stem> --hitl=prompt \
+    --max-iterations 10 --dynamic-max-iterations 8
 ```
 
 ## Input
