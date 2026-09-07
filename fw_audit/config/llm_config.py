@@ -51,10 +51,16 @@ class ModelProvider(str, Enum):
     """OpenCode Go (https://opencode.ai/docs/go/) — a hosted subscription
     exposing an OpenAI-compatible endpoint
     (`https://opencode.ai/zen/go/v1/chat/completions` by default) plus its
-    own API key. Model ids follow OpenCode's `"opencode-go/<model-id>"`
-    convention (e.g. `"opencode-go/kimi-k3"`) and are passed through
-    verbatim as the `model` field of the chat-completions request — see
-    `Settings.opencode_api_key`/`opencode_base_url`."""
+    own API key. Model ids are BARE (e.g. `"kimi-k3"`, `"deepseek-v4-pro"`,
+    `"qwen3.8-flash"`) — confirmed against a real `GET .../v1/models`
+    response; despite OpenCode's own docs describing model identity
+    elsewhere as `"opencode-go/<model-id>"`, sending that prefixed form to
+    THIS endpoint gets a 401 `ModelError: Model opencode-go/<id> is not
+    supported`. Ids are passed through verbatim as the `model` field of the
+    chat-completions request — see `Settings.opencode_api_key`/
+    `opencode_base_url`. Run the `/v1/models` curl in this repo's
+    `.env.example` OpenCode Go section to get your account's exact,
+    current list rather than trusting any hardcoded example here."""
 
     @property
     def langchain_id(self) -> str:

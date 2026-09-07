@@ -236,21 +236,23 @@ def test_model_provider_langchain_id_maps_opencode_go_to_openai():
     assert ModelProvider.OPENCODE_GO.langchain_id == "openai"
 
 
-def test_parse_model_override_opencode_go_keeps_model_id_slash():
-    # OpenCode addresses a model as "opencode-go/<model-id>" — the "/" must
-    # survive untouched since only the FIRST ":" is split on.
-    spec = _parse_model_override("opencode_go:opencode-go/kimi-k3")
+def test_parse_model_override_opencode_go_uses_bare_model_id():
+    # Confirmed against a real account's GET /v1/models response: OpenCode
+    # Go's own endpoint expects BARE model ids ("kimi-k3"), not the
+    # "opencode-go/<model-id>" form OpenCode's general docs use elsewhere —
+    # that prefixed form 401s ("Model opencode-go/<id> is not supported").
+    spec = _parse_model_override("opencode_go:kimi-k3")
     assert spec.provider == ModelProvider.OPENCODE_GO
-    assert spec.model == "opencode-go/kimi-k3"
+    assert spec.model == "kimi-k3"
 
 
 def test_resolve_spec_stage1_identifier_model_override(monkeypatch):
-    monkeypatch.setenv("FWA_STAGE1_IDENTIFIER_MODEL", "opencode_go:opencode-go/kimi-k3")
+    monkeypatch.setenv("FWA_STAGE1_IDENTIFIER_MODEL", "opencode_go:kimi-k3")
     _clear_settings_cache()
     try:
         spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER)
         assert spec.provider == ModelProvider.OPENCODE_GO
-        assert spec.model == "opencode-go/kimi-k3"
+        assert spec.model == "kimi-k3"
 
         # Other roles are unaffected by this role-specific override.
         analyst_spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST)
@@ -283,8 +285,8 @@ def test_get_llm_opencode_go_builds_chat_openai_via_init_chat_model():
     # init_chat_model("openai", ...) path, getting native tool-calling/
     # with_structured_output support for free.
     pytest.importorskip("langchain_openai")
-    spec = ModelSpec(provider=ModelProvider.OPENCODE_GO, model="opencode-go/kimi-k3")
+    spec = ModelSpec(provider=ModelProvider.OPENCODE_GO, model="kimi-k3")
     llm = get_llm(spec, settings=Settings(opencode_api_key="test-key"))
     assert type(llm).__name__ == "ChatOpenAI"
-    assert llm.model_name == "opencode-go/kimi-k3"
+    assert llm.model_name == "kimi-k3"
     assert llm.openai_api_base == "https://opencode.ai/zen/go/v1"
