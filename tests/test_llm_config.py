@@ -274,10 +274,24 @@ def test_credential_kwargs_opencode_go_returns_key_and_base_url():
     kwargs = _credential_kwargs(
         ModelProvider.OPENCODE_GO, Settings(opencode_api_key="test-key")
     )
-    assert kwargs == {
-        "api_key": "test-key",
-        "base_url": "https://opencode.ai/zen/go/v1",
-    }
+    assert kwargs["api_key"] == "test-key"
+    assert kwargs["base_url"] == "https://opencode.ai/zen/go/v1"
+    # OpenCode Go 400s ("MissingSessionID") without this header on every
+    # request — see the long comment in _credential_kwargs.
+    assert "x-opencode-session" in kwargs["default_headers"]
+    assert kwargs["default_headers"]["x-opencode-session"]
+
+
+def test_credential_kwargs_opencode_go_generates_a_fresh_session_id_each_call():
+    from fw_audit.config.llm_config import _credential_kwargs
+
+    settings = Settings(opencode_api_key="test-key")
+    first = _credential_kwargs(ModelProvider.OPENCODE_GO, settings)
+    second = _credential_kwargs(ModelProvider.OPENCODE_GO, settings)
+    assert (
+        first["default_headers"]["x-opencode-session"]
+        != second["default_headers"]["x-opencode-session"]
+    )
 
 
 def test_get_llm_opencode_go_builds_chat_openai_via_init_chat_model():
@@ -290,3 +304,4 @@ def test_get_llm_opencode_go_builds_chat_openai_via_init_chat_model():
     assert type(llm).__name__ == "ChatOpenAI"
     assert llm.model_name == "kimi-k3"
     assert llm.openai_api_base == "https://opencode.ai/zen/go/v1"
+    assert "x-opencode-session" in llm.default_headers

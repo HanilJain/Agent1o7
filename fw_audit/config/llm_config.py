@@ -28,6 +28,7 @@ full native tool-calling/`with_structured_output` support for free.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -437,6 +438,19 @@ def _credential_kwargs(provider: ModelProvider, settings: Settings) -> dict[str,
         return {
             "api_key": settings.opencode_api_key,
             "base_url": settings.opencode_base_url,
+            # OpenCode Go REJECTS a request with no `x-opencode-session`
+            # header — 400 MissingSessionID: "Request is missing
+            # x-opencode-session and cannot be routed efficiently" (see
+            # https://opencode.ai/docs/go/#where-can-i-use-it). Docs ask
+            # for a "stable session ID... for each conversation" — this
+            # module builds one `ChatOpenAI` instance per role-resolution
+            # call (once per firmware for Stage 1, once per chunk for
+            # Stage 3, once per candidate for Stage 5, ...), so a fresh id
+            # generated here is stable for that whole instance's lifetime
+            # (every retry/repair attempt against it reuses the same
+            # client, hence the same header) without this module having to
+            # thread a session id through every call site by hand.
+            "default_headers": {"x-opencode-session": str(uuid.uuid4())},
         }
     raise ValueError(f"Unsupported model provider: {provider}")  # pragma: no cover - defensive
 
