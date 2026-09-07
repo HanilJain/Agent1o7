@@ -12,8 +12,17 @@ use and to supply the credentials/base-url `init_chat_model` doesn't know
 where to find (those live in `Settings`, never `os.environ` directly).
 
 Supported providers: Ollama (local), Anthropic (Claude), Google (Gemini),
-OpenAI — and anything OpenAI-API-compatible (vLLM, LM Studio) via the
-"openai" provider pointed at `Settings.openai_base_url`.
+OpenAI — and anything OpenAI-API-compatible (vLLM, LM Studio, OpenCode Go)
+via the "openai" `model_provider` id pointed at a different `base_url`.
+OpenCode Go (https://opencode.ai/docs/go/) is one such service: a hosted
+$10/month subscription exposing a curated set of coding models behind an
+OpenAI-compatible `/v1/chat/completions` endpoint, authenticated with its
+own API key (from `opencode.ai/auth`) — `ModelProvider.OPENCODE_GO` is a
+distinct enum member (so its credential doesn't collide with a real
+`OPENAI_API_KEY`/`Settings.openai_base_url` pair also in use), but still
+resolves through `init_chat_model`'s ordinary "openai" path like any other
+OpenAI-compatible backend — no custom chat-model class needed, so it gets
+full native tool-calling/`with_structured_output` support for free.
 """
 
 from __future__ import annotations
@@ -38,19 +47,33 @@ class ModelProvider(str, Enum):
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
     OPENAI = "openai"
+    OPENCODE_GO = "opencode_go"
+    """OpenCode Go (https://opencode.ai/docs/go/) — a hosted subscription
+    exposing an OpenAI-compatible endpoint
+    (`https://opencode.ai/zen/go/v1/chat/completions` by default) plus its
+    own API key. Model ids follow OpenCode's `"opencode-go/<model-id>"`
+    convention (e.g. `"opencode-go/kimi-k3"`) and are passed through
+    verbatim as the `model` field of the chat-completions request — see
+    `Settings.opencode_api_key`/`opencode_base_url`."""
 
     @property
     def langchain_id(self) -> str:
         """The `model_provider` string `init_chat_model` expects.
 
-        Only GOOGLE differs from its own value: LangChain splits "Google"
-        into `google_genai` (AI Studio / Gemini API — what
+        GOOGLE and OPENCODE_GO both differ from their own `.value`: LangChain
+        splits "Google" into `google_genai` (AI Studio / Gemini API — what
         `GEMINI_API_KEY`/`GOOGLE_API_KEY` authenticate against) and
-        `google_vertexai` (GCP-project-based auth, unused here). Every other
-        member's `.value` already matches `init_chat_model`'s provider id.
-        """
+        `google_vertexai` (GCP-project-based auth, unused here); OPENCODE_GO
+        is a distinct `ModelProvider` member (for its own separate API key)
+        but is, mechanically, an OpenAI-compatible endpoint — so it resolves
+        to `init_chat_model`'s `"openai"` id, exactly like the vLLM/LM
+        Studio case already routed through `Settings.openai_base_url`. Every
+        other member's `.value` already matches `init_chat_model`'s
+        provider id."""
         if self is ModelProvider.GOOGLE:
             return "google_genai"
+        if self is ModelProvider.OPENCODE_GO:
+            return "openai"
         return self.value
 
 
@@ -238,6 +261,7 @@ GEMINI_HIGH_REASONING = ModelSpec(provider=ModelProvider.GOOGLE, model="gemini-2
 # `--model`) alone still points BOTH roles at one model. Add an entry here,
 # not another `if` branch, when a new role gets its own override field.
 _ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, tuple[str, ...]] = {
+    AgentRole.STAGE1_BINARY_IDENTIFIER: ("stage1_identifier_model",),
     AgentRole.STAGE3_VULN_ANALYST: ("stage3_analyst_model",),
     AgentRole.STAGE4_QUERY_PLANNER: ("stage4_query_planner_model",),
     AgentRole.STAGE4_TAINT_ANALYST: ("stage4_taint_analyst_model",),
@@ -394,6 +418,20 @@ def _credential_kwargs(provider: ModelProvider, settings: Settings) -> dict[str,
         if settings.openai_base_url:
             kwargs["base_url"] = settings.openai_base_url
         return kwargs
+    if provider is ModelProvider.OPENCODE_GO:
+        # Own dedicated credential (not OPENAI_API_KEY) so an OpenCode Go
+        # subscription and a real OpenAI account can be configured at the
+        # same time without one clobbering the other's base_url/key.
+        if not settings.opencode_api_key:
+            raise ValueError(
+                "FWA_OPENCODE_API_KEY is not set. Sign in at "
+                "https://opencode.ai/auth, subscribe to Go, and copy your "
+                "API key before requesting an opencode_go-backed model."
+            )
+        return {
+            "api_key": settings.opencode_api_key,
+            "base_url": settings.opencode_base_url,
+        }
     raise ValueError(f"Unsupported model provider: {provider}")  # pragma: no cover - defensive
 
 
@@ -402,6 +440,10 @@ _PROVIDER_INSTALL_HINTS: dict[ModelProvider, str] = {
     ModelProvider.ANTHROPIC: "anthropic",
     ModelProvider.GOOGLE: "google",
     ModelProvider.OPENAI: "openai",
+    # OPENCODE_GO resolves through init_chat_model's "openai" id (see
+    # ModelProvider.langchain_id) — the same langchain-openai package
+    # covers it, no separate integration package exists.
+    ModelProvider.OPENCODE_GO: "openai",
 }
 
 
@@ -491,8 +533,6 @@ def _build_from_spec(
     per-call identity has to be attached at construction time, not chained
     on afterward.
     """
-    from langchain.chat_models import init_chat_model
-
     identity_kwargs: dict[str, Any] = {}
     if role is not None:
         identity_kwargs["tags"] = [f"role:{role.value}"]
@@ -501,6 +541,8 @@ def _build_from_spec(
             "provider": spec.provider.value,
             "model": spec.model,
         }
+
+    from langchain.chat_models import init_chat_model
 
     try:
         return init_chat_model(

@@ -31,6 +31,12 @@ google = ["langchain-google-genai>=2.0.0"]
 # OpenAI-compatible endpoints: OpenAI itself, and any locally-hosted server that
 # speaks the OpenAI API (vLLM, LM Studio) via `Settings.openai_base_url`.
 openai = ["langchain-openai>=1.0.0"]
+# Alias for OpenCode Go (https://opencode.ai/docs/go/) — a hosted
+# subscription behind an OpenAI-compatible endpoint (see
+# Settings.opencode_api_key/opencode_base_url), so ModelProvider.OPENCODE_GO
+# needs the exact same package as "openai" and nothing more. Kept as its own
+# extra name for discoverability, same "alias" precedent as stage2/stage3.
+opencode = ["langchain-openai>=1.0.0"]
 all = [
     "langchain-ollama>=1.0.0",
     "langchain-anthropic>=1.0.0",

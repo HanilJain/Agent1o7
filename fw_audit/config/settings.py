@@ -50,6 +50,22 @@ class Settings(BaseSettings):
     """Override the OpenAI API endpoint. Unset = real OpenAI. Point this at a
     local OpenAI-compatible server (vLLM, LM Studio, ...) to run the "openai"
     provider fully offline without a new ModelProvider member."""
+    opencode_api_key: str | None = Field(
+        default=None, validation_alias="FWA_OPENCODE_API_KEY"
+    )
+    """API key for an OpenCode Go subscription (https://opencode.ai/docs/go/)
+    — sign in at `opencode.ai/auth`, subscribe to Go, and copy the key.
+    Required for `ModelProvider.OPENCODE_GO`; `FWA_`-prefixed (not the bare
+    `OPENCODE_API_KEY` convention other providers' keys use) since this is
+    this project's own setting name, not an SDK-defined one."""
+    opencode_base_url: str = Field(
+        default="https://opencode.ai/zen/go/v1", validation_alias="FWA_OPENCODE_BASE_URL"
+    )
+    """OpenCode Go's OpenAI-compatible endpoint. `ModelProvider.OPENCODE_GO`
+    resolves through `init_chat_model`'s ordinary "openai" provider id
+    pointed at this base_url + `opencode_api_key` — see
+    `config/llm_config.py`'s module docstring. Override only if OpenCode
+    publishes a different Go endpoint."""
     ollama_base_url: str = Field(
         default="http://localhost:11434", validation_alias="OLLAMA_BASE_URL"
     )
@@ -75,6 +91,14 @@ class Settings(BaseSettings):
     has no more specific per-role override set. `provider` must be one of
     `ModelProvider`'s values; `model` may itself contain `:` (Ollama tags),
     so only the FIRST `:` is split on."""
+    stage1_identifier_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE1_IDENTIFIER_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE1_BINARY_IDENTIFIER`, same
+    `"<provider>:<model>"` syntax as `llm_model` — e.g.
+    `"opencode:anthropic/claude-sonnet-4-20250514"` to route just Stage 1's
+    Identifier Agent through an OpenCode server. Takes precedence over
+    `llm_model` for that role only."""
     stage3_analyst_model: str | None = Field(
         default=None, validation_alias="FWA_STAGE3_ANALYST_MODEL"
     )
