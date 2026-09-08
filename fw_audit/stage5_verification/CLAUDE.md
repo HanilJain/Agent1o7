@@ -181,8 +181,10 @@ ordinary, unattended run.
   `Dockerfile.joern`'s fetch stage; needs the same pre-fetched
   `docker/.joern-cli.zip`.
 - `Stage5InputError` on `run`/`debug verify`/`debug fvvw` → `stage3/findings/`
-  or `stage2/stage2_summary.json` missing; run `fw-analyze --analyze` /
-  `fw-extract` first. `debug_fvvw`/`run_fvvw` additionally raise this if a
+  or `stage2/stage2_summary.json` missing; run `fw-analyze --queue` then
+  `fw-analyze --analyze --chunks-file <stage3/chunk_index.json>` / `fw-extract`
+  first (see `fw_audit/stage3_analysis/CLAUDE.md` — `--analyze` never chunks
+  on its own). `debug_fvvw`/`run_fvvw` additionally raise this if a
   candidate's `source_path` never resolved (needed by the static track even
   in the fork-join).
 - `characterize_target`'s "target mismatch" `Stage5InputError` → the

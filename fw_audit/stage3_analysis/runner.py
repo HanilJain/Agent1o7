@@ -39,16 +39,26 @@ placeholder consumer — proves the queue/backpressure/retry/shutdown
 mechanism works, does no actual vulnerability analysis. Use `--analyze`
 instead to run Component 2's real LLM consumer.
 
-`--analyze` (Component 2) implies `--queue`'s plumbing but swaps the no-op
-consumer for `agent.orchestrator.run_analysis()`'s real one: each chunk is
-sent to the analyst LLM (`AgentRole.STAGE3_VULN_ANALYST` — Anthropic Claude
-Sonnet by default), validated against `common.findings.AnalysisReport`, and
-persisted to `<db_subfolder>/stage3/findings/<chunk_id>.json`, with a run
-summary at `<db_subfolder>/stage3/analysis_summary.json`. `--model
-provider:model` overrides which model is used for this run only (e.g.
-`--model ollama:qwen2.5-coder:1.5b` for an offline smoke test). `main()`
-stays synchronous except for the queue/analysis bridge, a single
-`asyncio.run(...)` call.
+`--analyze` (Component 2) NEVER chunks — it requires `--chunks-file PATH`,
+a JSON file naming exactly which already-persisted `stage3/chunks/*.c`
+chunks to analyze (see `chunk_index.load_chunk_selection`'s docstring for
+the accepted shapes). Produce that file by running `--debug-chunks` or
+`--queue` first (either writes `stage3/chunk_index.json`), copying it, and
+deleting the rows you don't want:
+
+    fw-analyze path/to/stage1_summary.json --debug-chunks
+    cp .../stage3/chunk_index.json selected.json   # edit: delete rows
+    fw-analyze path/to/stage1_summary.json --analyze --chunks-file selected.json
+
+`--analyze` without `--chunks-file` is a usage error (exit 2). Each
+selected chunk is sent to the analyst LLM (`AgentRole.STAGE3_VULN_ANALYST`
+— Anthropic Claude Sonnet by default), validated against
+`common.findings.AnalysisReport`, and persisted to `<db_subfolder>/stage3/
+findings/<chunk_id>.json`, with a run summary at `<db_subfolder>/stage3/
+analysis_summary.json`. `--model provider:model` overrides which model is
+used for this run only (e.g. `--model ollama:qwen2.5-coder:1.5b` for an
+offline smoke test). `main()` stays synchronous except for the
+queue/analysis bridge, a single `asyncio.run(...)` call.
 """
 
 from __future__ import annotations
@@ -63,6 +73,7 @@ from fw_audit.config.settings import get_settings
 from fw_audit.observability import configure_tracing, flush_traces
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.agent.orchestrator import AnalystModelUnavailableError, run_analysis
+from fw_audit.stage3_analysis.chunk_index import load_chunk_selection, resolve_chunk_handles
 from fw_audit.stage3_analysis.chunk_queue import run_queue
 from fw_audit.stage3_analysis.errors import Stage3InputError
 from fw_audit.stage3_analysis.ingest import ingest
@@ -156,6 +167,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--chunks-file",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Required with --analyze: a JSON file naming which already-persisted "
+            "stage3/chunks/*.c chunks to analyze — no chunking happens. Accepts a bare "
+            "JSON array of chunk ids, or an object with a 'chunks' array (so an unedited "
+            "stage3/chunk_index.json or stage3_summary.json works verbatim). Produce "
+            "chunk_index.json first with --debug-chunks or --queue, copy it, delete the "
+            "rows you don't want, and pass the copy here."
+        ),
+    )
+    parser.add_argument(
         "--run-id", type=str, default=None, help="Run identifier for logging (default: random)."
     )
     parser.add_argument(
@@ -224,6 +249,36 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    if args.analyze and args.chunks_file is None:
+        print(
+            "error: --analyze requires --chunks-file PATH (a JSON file naming which "
+            "already-persisted chunks to analyze — --analyze never chunks). Produce one "
+            "with --debug-chunks or --queue (writes stage3/chunk_index.json), copy it, "
+            "delete the rows you don't want, and pass the copy: --analyze --chunks-file "
+            "selected.json",
+            file=sys.stderr,
+        )
+        return 2
+    if args.chunks_file is not None and not args.analyze:
+        print(
+            "warning: --chunks-file has no effect without --analyze", file=sys.stderr
+        )
+    if args.analyze and args.debug_chunks:
+        print(
+            "warning: --debug-chunks still chunks (independently of --analyze, which "
+            "never does) and will rewrite stage3/chunk_index.json before --analyze reads "
+            "your --chunks-file selection from it",
+            file=sys.stderr,
+        )
+
+    chunk_selection = None
+    if args.chunks_file is not None:
+        try:
+            chunk_selection = load_chunk_selection(Path(args.chunks_file))
+        except Stage3InputError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
     settings = get_settings()
     if args.debug:
         settings = settings.model_copy(update={"stage3_debug_dump": True})
@@ -255,11 +310,33 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Debug source dump: {layout.debug_dir(stage3_dir)}/<bin_id>.c")
     if args.debug_chunks and report.targets:
         print(f"Chunk debug dump: {layout.chunks_dir(stage3_dir)}/<chunk_id>.c")
+        print(f"Chunk index: {layout.chunk_index_path(stage3_dir)}")
 
+    chunk_handles = None
     if args.analyze:
+        assert chunk_selection is not None  # guaranteed by the exit-2 check above
+        try:
+            chunk_handles, resolve_warnings = resolve_chunk_handles(
+                chunk_selection, report=report
+            )
+        except Stage3InputError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for w in resolve_warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        print(
+            f"\nSelected chunks: {len(chunk_handles)} (chunking skipped; "
+            f"from {args.chunks_file})"
+        )
+
         try:
             analysis_summary, queue_summary = asyncio.run(
-                run_analysis(report, settings=settings, run_id=args.run_id)
+                run_analysis(
+                    report,
+                    settings=settings,
+                    run_id=args.run_id,
+                    chunk_handles=chunk_handles,
+                )
             )
         except AnalystModelUnavailableError as exc:
             print(f"error: analyst model unavailable: {exc}", file=sys.stderr)
@@ -283,9 +360,10 @@ def main(argv: list[str] | None = None) -> int:
             f"{summary.total_failed} failed"
         )
         print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
+        print(f"Chunk index: {layout.chunk_index_path(stage3_dir)}")
 
     flush_traces()
-    return 1 if not report.targets else 0
+    return 1 if (not report.targets and chunk_handles is None) else 0
 
 
 if __name__ == "__main__":

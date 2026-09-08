@@ -41,8 +41,12 @@ fw-analyze data/db/<stem>/stage1_summary.json                    # Step 1 only
 fw-analyze data/db/<stem>/stage1_summary.json --debug             # dump raw+cleaned source
 fw-analyze data/db/<stem>/stage1_summary.json --debug-chunks --chunk-lines 500
 fw-analyze data/db/<stem>/stage1_summary.json --queue              # Step 4, plumbing check
-fw-analyze data/db/<stem>/stage1_summary.json --analyze             # Component 2, real LLM
-fw-analyze data/db/<stem>/stage1_summary.json --analyze --model ollama:qwen2.5-coder:1.5b
+
+# --analyze NEVER chunks — it requires --chunks-file, a JSON file naming
+# which already-persisted chunks to analyze. Produce one from chunk_index.json
+# (written by --debug-chunks/--queue above), trim it, then:
+fw-analyze data/db/<stem>/stage1_summary.json --analyze --chunks-file selected.json
+fw-analyze data/db/<stem>/stage1_summary.json --analyze --chunks-file selected.json --model ollama:qwen2.5-coder:1.5b
 ```
 
 ## Input
@@ -52,9 +56,12 @@ fw-analyze data/db/<stem>/stage1_summary.json --analyze --model ollama:qwen2.5-c
 ## Output
 
 `data/db/<stem>/stage3/`: `ingestion_report.json` always; `debug/`,
-`chunks/`, `stage3_summary.json`, `findings/<chunk_id>.json`, and
-`analysis_summary.json` depending on which flags are passed. Never writes
-into `stage2/` or the mirror tree.
+`chunks/` + `chunk_index.json`, `stage3_summary.json`,
+`findings/<chunk_id>.json`, and `analysis_summary.json` depending on which
+flags are passed. `chunk_index.json` is an editable manifest of every
+chunk on disk — trim a copy of it and pass it to `--analyze --chunks-file`
+to select a subset without re-chunking. Never writes into `stage2/` or the
+mirror tree.
 
 ## Debugging
 

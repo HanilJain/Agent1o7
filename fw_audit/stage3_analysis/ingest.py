@@ -53,10 +53,14 @@ Independently, when `settings.stage3_chunk_debug_dump` is true (the CLI's
 `--debug-chunks` flag), `ingest()` chunks every `Target`'s cleaned source
 (loaded via `stage3_analysis.cleaned_io`, NOT re-parsed) via
 `chunk.strategy.chunk_source` and writes one file per `Chunk` under
-`stage3/chunks/<chunk_id>.c`. This is a SEPARATE flag from
-`stage3_debug_dump` above — either may be set alone or together — since
-dumping chunk payloads and dumping raw/cleaned source answer different
-questions. Same missing-cleaned-artifact degradation as the cleaned dump.
+`stage3/chunks/<chunk_id>.c`, plus the editable manifest
+`stage3/chunk_index.json` (`chunk_index.write_chunk_index`) — the same
+manifest `chunk_queue.produce_chunks()` writes under `--queue`/`--analyze`'s
+chunking mode, with identical deterministic content for the same inputs.
+This is a SEPARATE flag from `stage3_debug_dump` above — either may be set
+alone or together — since dumping chunk payloads and dumping raw/cleaned
+source answer different questions. Same missing-cleaned-artifact
+degradation as the cleaned dump.
 """
 
 from __future__ import annotations
@@ -70,6 +74,7 @@ from fw_audit.config.settings import Settings, get_settings
 from fw_audit.stage2_extraction.stage1_io import load_stage1_summary
 from fw_audit.stage3_analysis import discover, layout
 from fw_audit.stage3_analysis.chunk.strategy import chunk_source
+from fw_audit.stage3_analysis.chunk_index import write_chunk_index
 from fw_audit.stage3_analysis.cleaned_io import load_cleaned_source, resolve_cleaned_paths
 from fw_audit.stage3_analysis.models import IngestionReport, SkippedTarget, Target
 from fw_audit.stage3_analysis.stage2_io import (
@@ -312,7 +317,11 @@ def _write_chunk_debug_sources(report: IngestionReport, settings: Settings) -> N
     `cleaned_io.load_cleaned_source`, not re-parsed) via `chunk.strategy.
     chunk_source`, then write one file per `Chunk` to
     `stage3/chunks/<chunk_id>.c` (via `layout.chunks_dir()`/
-    `layout.chunk_filename()`).
+    `layout.chunk_filename()`), plus the editable `stage3/chunk_index.json`
+    manifest (`chunk_index.write_chunk_index`) from each `Chunk.
+    to_json_dict()` — metadata only, mirroring `chunk_queue.produce_chunks`'s
+    own accumulation for the same reason: never hold a `Chunk`'s full text
+    longer than the single write it takes.
 
     Independent of `settings.stage3_debug_dump` — see `Settings.
     stage3_chunk_debug_dump`'s docstring for why these are two separate
@@ -340,6 +349,7 @@ def _write_chunk_debug_sources(report: IngestionReport, settings: Settings) -> N
     except OSError:
         return
 
+    index_entries: list[dict] = []
     for target in report.targets:
         if target.cleaned_source_path is None or target.cleaned_index_path is None:
             logger.warning(
@@ -367,6 +377,9 @@ def _write_chunk_debug_sources(report: IngestionReport, settings: Settings) -> N
                 dest.write_text(chunk.to_text(), encoding="utf-8")
             except OSError:
                 continue
+            index_entries.append(chunk.to_json_dict())
+
+    write_chunk_index(layout.stage3_dir(report.db_subfolder), index_entries)
 
 
 __all__ = ["ingest"]

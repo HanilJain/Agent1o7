@@ -708,6 +708,36 @@ def test_ingest_chunk_debug_dump_writes_one_file_per_chunk(tmp_path):
     assert "int sub(int x)" in (chunks_dir / "sbin_wpasupp__0001.c").read_text(encoding="utf-8")
 
 
+def test_ingest_chunk_debug_dump_writes_chunk_index(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    import json
+
+    source = _padded_function("add") + "\n" + _padded_function("sub")
+    stage1_path = _setup_run(
+        tmp_path,
+        identified_paths=["sbin/wpasupp"],
+        binaries=[
+            _binary_dict(
+                "sbin/wpasupp",
+                functions=[_ghidra_function_dict("add"), _ghidra_function_dict("sub")],
+            )
+        ],
+        tree_files={"sbin/wpasupp.c": source},
+        cleaned_texts={"sbin_wpasupp": source},
+    )
+    chunk_settings = Settings(
+        _env_file=None, stage3_chunk_debug_dump=True, stage3_chunk_lines=50
+    )
+    ingest(stage1_summary_path=stage1_path, settings=chunk_settings)
+
+    index_path = tmp_path / "db" / "fw" / "stage3" / "chunk_index.json"
+    assert index_path.is_file()
+    written = json.loads(index_path.read_text(encoding="utf-8"))
+    chunk_ids = sorted(c["chunk_id"] for c in written["chunks"])
+    assert chunk_ids == ["sbin_wpasupp#0000", "sbin_wpasupp#0001"]
+    assert "functions" not in written["chunks"][0]
+
+
 def test_ingest_chunk_debug_dump_writes_files_for_matched_targets_only(tmp_path):
     pytest.importorskip("tree_sitter_c")
     stage1_path = _setup_run(

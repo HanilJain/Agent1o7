@@ -252,7 +252,8 @@ async def run_queue(
     if not (stage3_dir / "findings").is_dir():
         raise Stage4InputError(
             f"No Stage 3 findings directory at {stage3_dir / 'findings'} — run "
-            "`fw-analyze ... --analyze` first."
+            "`fw-analyze ... --queue` then `fw-analyze ... --analyze --chunks-file "
+            "<stage3/chunk_index.json>` first."
         )
 
     candidates = discover_sink_candidates(stage3_dir, decisions=decisions)

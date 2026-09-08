@@ -80,7 +80,13 @@ def test_parse_args_defaults():
     assert args.queue is False
     assert args.analyze is False
     assert args.model is None
+    assert args.chunks_file is None
     assert args.run_id is None
+
+
+def test_parse_args_chunks_file():
+    args = _parse_args(["s.json", "--analyze", "--chunks-file", "selected.json"])
+    assert args.chunks_file == "selected.json"
 
 
 def test_parse_args_only_is_repeatable():
@@ -470,6 +476,7 @@ def test_main_exit_code_1_on_zero_targets(tmp_path: Path, capsys):
 
 
 def test_main_analyze_runs_agent_consumer_and_prints_findings(tmp_path: Path, capsys, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
     from fw_audit.common.findings import AnalysisReport
 
     async def fake_analyze_chunk(text, *, chunk_id, rootfs_path, settings, function_names=()):
@@ -482,7 +489,15 @@ def test_main_analyze_runs_agent_consumer_and_prints_findings(tmp_path: Path, ca
     summary_path = _setup_single_target_run(
         tmp_path, source_text="int main(void) { return 0; }\n"
     )
-    code = main([str(summary_path), "--analyze"])
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+
+    # Phase 1: chunk only, no LLM — produces stage3/chunk_index.json.
+    assert main([str(summary_path), "--queue"]) == 0
+
+    # Phase 2: analyze exactly what got chunked.
+    code = main(
+        [str(summary_path), "--analyze", "--chunks-file", str(stage3_dir / "chunk_index.json")]
+    )
 
     assert code == 0
     captured = capsys.readouterr()
@@ -490,11 +505,12 @@ def test_main_analyze_runs_agent_consumer_and_prints_findings(tmp_path: Path, ca
     assert "Findings:" in captured.out
     assert "Analysis summary:" in captured.out
 
-    analysis_summary_path = tmp_path / "db" / "fw" / "stage3" / "analysis_summary.json"
+    analysis_summary_path = stage3_dir / "analysis_summary.json"
     assert analysis_summary_path.is_file()
 
 
 def test_main_analyze_model_override_is_applied(tmp_path: Path, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
     from fw_audit.common.findings import AnalysisReport
 
     captured_model = {}
@@ -510,8 +526,18 @@ def test_main_analyze_model_override_is_applied(tmp_path: Path, monkeypatch):
     summary_path = _setup_single_target_run(
         tmp_path, source_text="int main(void) { return 0; }\n"
     )
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert main([str(summary_path), "--queue"]) == 0
+
     code = main(
-        [str(summary_path), "--analyze", "--model", "ollama:qwen2.5-coder:1.5b"]
+        [
+            str(summary_path),
+            "--analyze",
+            "--chunks-file",
+            str(stage3_dir / "chunk_index.json"),
+            "--model",
+            "ollama:qwen2.5-coder:1.5b",
+        ]
     )
 
     assert code == 0
@@ -519,6 +545,8 @@ def test_main_analyze_model_override_is_applied(tmp_path: Path, monkeypatch):
 
 
 def test_main_analyze_missing_credential_exits_2(tmp_path: Path, capsys, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
+
     def _raise(role, settings=None):
         raise ValueError("ANTHROPIC_API_KEY is not set.")
 
@@ -529,8 +557,137 @@ def test_main_analyze_missing_credential_exits_2(tmp_path: Path, capsys, monkeyp
     summary_path = _setup_single_target_run(
         tmp_path, source_text="int main(void) { return 0; }\n"
     )
-    code = main([str(summary_path), "--analyze"])
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert main([str(summary_path), "--queue"]) == 0
+
+    code = main(
+        [str(summary_path), "--analyze", "--chunks-file", str(stage3_dir / "chunk_index.json")]
+    )
 
     assert code == 2
     captured = capsys.readouterr()
     assert "analyst model unavailable" in captured.err
+
+
+def test_main_analyze_without_chunks_file_exits_2(tmp_path: Path, capsys):
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    code = main([str(summary_path), "--analyze"])
+
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "--chunks-file" in captured.err
+
+
+def test_main_chunks_file_without_analyze_warns_but_runs(tmp_path: Path, capsys):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert main([str(summary_path), "--queue"]) == 0
+
+    code = main(
+        [str(summary_path), "--chunks-file", str(stage3_dir / "chunk_index.json")]
+    )
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "--chunks-file has no effect without --analyze" in captured.err
+
+
+def test_main_queue_writes_chunk_index_and_prints_path(tmp_path: Path, capsys):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    code = main([str(summary_path), "--queue"])
+
+    assert code == 0
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    index_path = stage3_dir / "chunk_index.json"
+    assert index_path.is_file()
+    captured = capsys.readouterr()
+    assert str(index_path) in captured.out
+
+
+def test_main_analyze_with_chunks_file_analyzes_only_selected(tmp_path: Path, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
+    from fw_audit.common.findings import AnalysisReport
+
+    async def fake_analyze_chunk(text, *, chunk_id, rootfs_path, settings, function_names=()):
+        return AnalysisReport(chunk_id=chunk_id, findings=[], checked_categories=[])
+
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk", fake_analyze_chunk
+    )
+
+    padded_a = "int func_a(void) {\n" + "    int x = 1;\n" * 60 + "    return x;\n}\n"
+    padded_b = "int func_b(void) {\n" + "    int y = 2;\n" * 60 + "    return y;\n}\n"
+    summary_path = _setup_single_target_run(tmp_path, source_text=padded_a + "\n" + padded_b)
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+
+    assert main([str(summary_path), "--queue", "--chunk-lines", "50"]) == 0
+    index = json.loads((stage3_dir / "chunk_index.json").read_text(encoding="utf-8"))
+    all_ids = [c["chunk_id"] for c in index["chunks"]]
+    assert len(all_ids) >= 2
+
+    selected_path = tmp_path / "selected.json"
+    selected_path.write_text(json.dumps([all_ids[0]]), encoding="utf-8")
+
+    code = main(
+        [str(summary_path), "--analyze", "--chunks-file", str(selected_path)]
+    )
+
+    assert code == 0
+    findings = list((stage3_dir / "findings").glob("*.json"))
+    assert len(findings) == 1
+
+
+def test_main_analyze_with_chunks_file_does_not_rechunk(tmp_path: Path, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
+    from fw_audit.common.findings import AnalysisReport
+
+    async def fake_analyze_chunk(text, *, chunk_id, rootfs_path, settings, function_names=()):
+        return AnalysisReport(chunk_id=chunk_id, findings=[], checked_categories=[])
+
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk", fake_analyze_chunk
+    )
+
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert main([str(summary_path), "--queue"]) == 0
+
+    # Delete the cleaned artifact the chunking path would need — proves
+    # --analyze --chunks-file never reads it.
+    cleaned_dir = tmp_path / "db" / "fw" / "stage2" / "binaries" / "bin_busybox" / "cleaned"
+    for f in cleaned_dir.glob("*"):
+        f.unlink()
+
+    code = main(
+        [str(summary_path), "--analyze", "--chunks-file", str(stage3_dir / "chunk_index.json")]
+    )
+
+    assert code == 0
+
+
+def test_main_analyze_missing_chunk_ids_exits_2_listing_all(tmp_path: Path):
+    pytest.importorskip("tree_sitter_c")
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    assert main([str(summary_path), "--queue"]) == 0
+
+    selected_path = tmp_path / "selected.json"
+    selected_path.write_text(
+        json.dumps(["bin_busybox__9999", "bin_busybox__9998"]), encoding="utf-8"
+    )
+
+    code = main(
+        [str(summary_path), "--analyze", "--chunks-file", str(selected_path)]
+    )
+    assert code == 2

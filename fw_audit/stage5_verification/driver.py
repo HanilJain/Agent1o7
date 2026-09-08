@@ -346,7 +346,8 @@ async def run_queue(
     if not stage3_findings_dir.is_dir():
         raise Stage5InputError(
             f"No Stage 3 findings directory at {stage3_findings_dir} — run "
-            "`fw-analyze ... --analyze` first."
+            "`fw-analyze ... --queue` then `fw-analyze ... --analyze --chunks-file "
+            "<stage3/chunk_index.json>` first."
         )
 
     candidates = discover_candidates(db_subfolder, decisions=decisions)

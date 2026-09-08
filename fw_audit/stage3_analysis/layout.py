@@ -10,6 +10,13 @@ Layout, under `<db_subfolder>/stage3/`::
     stage3_summary.json       (written by chunk_queue.run_queue(), --queue)
     analysis_summary.json     (written by agent.orchestrator.run_analysis(),
                                 --analyze — Component 2's own run summary)
+    chunk_index.json          (written by BOTH chunking paths — ingest.
+                                _write_chunk_debug_sources under --debug-chunks,
+                                chunk_queue.produce_chunks under --queue/
+                                --analyze — an editable manifest of every
+                                chunk currently on disk; trim a copy of it
+                                and hand it to --analyze --chunks-file to
+                                select a subset. See chunk_index_path.)
     debug/<bin_id>.c              (--debug only; Step 1's raw resolved-source
                                     dump — see debug_dir/debug_source_path)
     debug/<bin_id>.cleaned.c       (--debug only; Step 2's function-only
@@ -115,6 +122,18 @@ def finding_filename(chunk_id: str) -> str:
     of `.c` — keeps a finding's filename trivially derivable from its
     chunk's filename."""
     return f"{chunk_id.replace('#', '__')}.json"
+
+
+def chunk_index_path(stage3_dir_: Path) -> Path:
+    """Editable manifest of every chunk currently persisted under
+    `chunks_dir(stage3_dir_)`, written by BOTH chunking paths —
+    `ingest._write_chunk_debug_sources` (`--debug-chunks`) and
+    `chunk_queue.produce_chunks` (`--queue`/`--analyze`'s chunking mode) —
+    with identical deterministic content for the same inputs, same
+    reasoning `chunks_dir`'s own docstring gives for `chunks/*.c`. This is
+    an INPUT to `--chunks-file` (`chunk_index.load_chunk_selection`), never
+    read back automatically by any stage."""
+    return stage3_dir_ / "chunk_index.json"
 
 
 def analysis_summary_path(stage3_dir_: Path) -> Path:

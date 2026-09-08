@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fw_audit.stage3_analysis.layout import (
     chunk_filename,
+    chunk_index_path,
     chunks_dir,
     debug_dir,
     debug_source_path,
@@ -41,6 +42,12 @@ def test_chunks_dir(tmp_path):
     stage3 = tmp_path / "stage3"
 
     assert chunks_dir(stage3) == stage3 / "chunks"
+
+
+def test_chunk_index_path(tmp_path):
+    stage3 = tmp_path / "stage3"
+
+    assert chunk_index_path(stage3) == stage3 / "chunk_index.json"
 
 
 def test_debug_dir(tmp_path):

@@ -14,7 +14,12 @@ import pytest
 
 from fw_audit.common.schemas import ExtractionStatus
 from fw_audit.config.settings import Settings
-from fw_audit.stage3_analysis.chunk_queue import ChunkQueue, produce_chunks, run_queue
+from fw_audit.stage3_analysis.chunk_queue import (
+    ChunkQueue,
+    produce_chunks,
+    produce_preselected,
+    run_queue,
+)
 from fw_audit.stage3_analysis.ingest import ingest
 from fw_audit.stage3_analysis.models import Chunk, ChunkHandle, ExtractedFunction
 from tests.conftest import write_cleaned_artifact
@@ -87,6 +92,33 @@ async def test_put_idempotent_same_chunk_id_overwrites_identical_content(tmp_pat
 
     assert handle1.chunk_path == handle2.chunk_path
     assert handle1.chunk_path.read_text(encoding="utf-8") == chunk.to_text()
+
+
+async def test_put_handle_enqueues_without_writing_a_file(tmp_path):
+    queue = _queue(tmp_path, workers=1)
+    preexisting = tmp_path / "chunks" / "test_bin__0000.c"
+    preexisting.parent.mkdir(parents=True)
+    preexisting.write_text("void f(void) {}", encoding="utf-8")
+    handle = ChunkHandle(
+        chunk_id="test_bin#0000",
+        bin_id="test_bin",
+        rootfs_path="bin/test",
+        source_relpath="bin/test.c",
+        chunk_path=preexisting,
+        start_line=1,
+        end_line=1,
+        approx_tokens=4,
+        oversized=False,
+    )
+    before_mtime = preexisting.stat().st_mtime_ns
+
+    returned = await queue.put_handle(handle)
+
+    assert returned is handle
+    assert queue.produced == [handle]
+    assert preexisting.stat().st_mtime_ns == before_mtime  # never rewritten
+    received = await queue.__anext__()
+    assert received is handle
 
 
 async def test_async_for_yields_put_handles_in_order(tmp_path):
@@ -349,6 +381,115 @@ async def test_run_queue_persists_chunks_regardless_of_debug_flags(tmp_path):
     assert any(chunks_dir.glob("*.c"))
 
 
+async def test_run_queue_chunking_mode_writes_chunk_index(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    source = _padded_function("add") + "\n" + _padded_function("sub")
+    summary_path = _setup_run(tmp_path, source_text=source)
+    report = ingest(stage1_summary_path=summary_path)
+    settings = Settings(_env_file=None, stage3_chunk_lines=50)
+
+    await run_queue(report, settings=settings)
+
+    index_path = tmp_path / "db" / "fw" / "stage3" / "chunk_index.json"
+    assert index_path.is_file()
+    written = json.loads(index_path.read_text(encoding="utf-8"))
+    assert len(written["chunks"]) == 2
+    assert "functions" not in written["chunks"][0]  # metadata only, never full text
+
+
+async def test_run_queue_zero_targets_leaves_existing_chunk_index_intact(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    source = _padded_function("add") + "\n" + _padded_function("sub")
+    summary_path = _setup_run(tmp_path, source_text=source)
+    report = ingest(stage1_summary_path=summary_path)
+    settings = Settings(_env_file=None, stage3_chunk_lines=50)
+    await run_queue(report, settings=settings)
+
+    index_path = tmp_path / "db" / "fw" / "stage3" / "chunk_index.json"
+    before = index_path.read_text(encoding="utf-8")
+
+    # A second report with zero targets (e.g. --only excluded everything)
+    # must not clobber the good index from the first run.
+    from fw_audit.stage3_analysis.models import IngestionReport
+
+    empty_report = IngestionReport(
+        db_subfolder=report.db_subfolder,
+        decompiled_tree_dir=report.decompiled_tree_dir,
+        targets=(),
+    )
+    await run_queue(empty_report, settings=settings)
+
+    assert index_path.read_text(encoding="utf-8") == before
+
+
+async def test_run_queue_with_chunk_handles_never_chunks(tmp_path):
+    pytest.importorskip("tree_sitter_c")
+    source = _padded_function("add") + "\n" + _padded_function("sub")
+    summary_path = _setup_run(tmp_path, source_text=source)
+    report = ingest(stage1_summary_path=summary_path)
+    settings = Settings(_env_file=None, stage3_chunk_lines=50)
+
+    # First produce real chunks to have a persisted .c payload to point at.
+    first_summary = await run_queue(report, settings=settings)
+    handle = first_summary.chunks[0]
+    chunk_path = report.db_subfolder / handle.chunk_path
+
+    # Now delete the cleaned artifact the chunking path would need, and
+    # confirm a chunk_handles= run still succeeds without ever reading it.
+    cleaned_dir = tmp_path / "db" / "fw" / "stage2" / "binaries" / "bin_busybox" / "cleaned"
+    for f in cleaned_dir.glob("*"):
+        f.unlink()
+
+    preselected = ChunkHandle(
+        chunk_id=handle.chunk_id,
+        bin_id=handle.bin_id,
+        rootfs_path=handle.rootfs_path,
+        source_relpath=handle.source_relpath,
+        chunk_path=chunk_path,
+        start_line=handle.start_line,
+        end_line=handle.end_line,
+        approx_tokens=handle.approx_tokens,
+        oversized=handle.oversized,
+    )
+
+    summary = await run_queue(report, settings=settings, chunk_handles=[preselected])
+
+    assert summary.status == "completed"
+    assert summary.total_chunks == 1
+    assert summary.total_acked == 1
+
+
+async def test_run_queue_with_chunk_handles_status_completed_with_zero_targets(tmp_path):
+    from fw_audit.stage3_analysis.models import IngestionReport
+
+    empty_report = IngestionReport(
+        db_subfolder=tmp_path / "db" / "fw",
+        decompiled_tree_dir=tmp_path / "db" / "fw_decompiled",
+        targets=(),
+    )
+    settings = Settings(_env_file=None)
+    chunk_path = tmp_path / "db" / "fw" / "stage3" / "chunks" / "test_bin__0000.c"
+    chunk_path.parent.mkdir(parents=True)
+    chunk_path.write_text("void f(void) {}", encoding="utf-8")
+    handle = ChunkHandle(
+        chunk_id="test_bin#0000",
+        bin_id="test_bin",
+        rootfs_path="bin/test",
+        source_relpath="bin/test.c",
+        chunk_path=chunk_path,
+        start_line=1,
+        end_line=1,
+        approx_tokens=4,
+        oversized=False,
+    )
+
+    summary = await run_queue(empty_report, settings=settings, chunk_handles=[handle])
+
+    assert summary.status == "completed"
+    assert summary.total_chunks == 1
+    assert summary.total_acked == 1
+
+
 async def test_run_queue_zero_targets_produces_empty_summary_no_hang(tmp_path):
     db_subfolder = tmp_path / "db" / "fw"
     stage2_dir = db_subfolder / "stage2"
@@ -466,3 +607,45 @@ async def test_produce_chunks_closes_queue_even_with_no_targets(tmp_path):
         await asyncio.wait_for(queue.__anext__(), timeout=1.0)
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(queue.__anext__(), timeout=1.0)
+
+
+async def test_produce_preselected_closes_queue_even_with_no_handles(tmp_path):
+    queue = _queue(tmp_path, workers=2)
+
+    warnings = await produce_preselected([], queue)
+
+    assert warnings == []
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(queue.__anext__(), timeout=1.0)
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(queue.__anext__(), timeout=1.0)
+
+
+async def test_produce_preselected_enqueues_every_handle(tmp_path):
+    queue = _queue(tmp_path, workers=1)
+    chunk_path = tmp_path / "chunks" / "test_bin__0000.c"
+    chunk_path.parent.mkdir(parents=True)
+    chunk_path.write_text("void f(void) {}", encoding="utf-8")
+    handle = ChunkHandle(
+        chunk_id="test_bin#0000",
+        bin_id="test_bin",
+        rootfs_path="bin/test",
+        source_relpath="bin/test.c",
+        chunk_path=chunk_path,
+        start_line=1,
+        end_line=1,
+        approx_tokens=4,
+        oversized=False,
+    )
+
+    # produce_preselected's own finally always calls queue.close(), which
+    # joins on every put() being task_done()'d — so a bare `await` here
+    # (with nothing consuming) would hang forever. Run it as a background
+    # task, drain+ack the one handle ourselves, then let it finish.
+    producer_task = asyncio.create_task(produce_preselected([handle], queue))
+    received = await asyncio.wait_for(queue.__anext__(), timeout=1.0)
+    assert received is handle
+    queue.ack(received)
+    await asyncio.wait_for(producer_task, timeout=1.0)
+
+    assert queue.produced == [handle]

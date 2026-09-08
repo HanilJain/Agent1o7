@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from fw_audit.observability import trace_context
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.agent.consumer import AnalysisConsumer
 from fw_audit.stage3_analysis.chunk_queue import run_queue
-from fw_audit.stage3_analysis.models import IngestionReport
+from fw_audit.stage3_analysis.models import ChunkHandle, IngestionReport
 
 logger = logging.getLogger("fw_audit.stage3_analysis.agent")
 
@@ -41,10 +42,22 @@ async def run_analysis(
     *,
     settings: Settings,
     run_id: str | None = None,
+    chunk_handles: Sequence[ChunkHandle] | None = None,
 ) -> tuple[AnalysisRunSummary, Stage3Summary]:
     """Run Stage 3 Component 2 end to end: ingest's `IngestionReport` in,
     chunk -> queue -> LLM-analyze every chunk, `AnalysisRunSummary` +
     `Stage3Summary` out (both are also persisted to disk).
+
+    `chunk_handles` is passed straight through to `chunk_queue.run_queue()`
+    (see its docstring): `None` (default, what `tests/
+    test_stage3_analysis_run.py` exercises) keeps chunking every `Target`
+    from Stage 2's cleaned artifact — this function itself has no "never
+    chunk" rule of its own; that's `runner.main`'s `--analyze` CLI
+    contract, enforced by requiring `--chunks-file` there, not here. A
+    caller passing an already-resolved sequence (built by `chunk_index.
+    resolve_chunk_handles` from a `--chunks-file` selection) instead skips
+    chunking entirely — every chunk analyzed is one already persisted to
+    `stage3/chunks/*.c`.
 
     Raises `AnalystModelUnavailableError` if the configured analyst model
     can't be resolved (missing credential, missing provider SDK) — checked
@@ -75,7 +88,11 @@ async def run_analysis(
     # be set once inside a single worker.
     with trace_context(stage="3", run_id=run_id, model=model_label):
         stage3_summary: Stage3Summary = await run_queue(
-            report, settings=settings, consumer=consumer, run_id=run_id
+            report,
+            settings=settings,
+            consumer=consumer,
+            run_id=run_id,
+            chunk_handles=chunk_handles,
         )
 
     analysis_summary = _build_analysis_summary(
@@ -85,6 +102,7 @@ async def run_analysis(
         run_id=run_id,
         model_label=model_label,
         started_at=started_at,
+        preselected=chunk_handles is not None,
     )
     _write_analysis_summary(report.db_subfolder, analysis_summary)
     return analysis_summary, stage3_summary
@@ -98,6 +116,7 @@ def _build_analysis_summary(
     run_id: str,
     model_label: str,
     started_at: datetime,
+    preselected: bool = False,
 ) -> AnalysisRunSummary:
     """Reconcile `AnalysisConsumer.records` (only ever appended to on
     SUCCESS or a deliberate skip — see `consumer.py`) against
@@ -150,7 +169,7 @@ def _build_analysis_summary(
                 findings_by_confidence.get(finding.confidence.value, 0) + 1
             )
 
-    if not report.targets:
+    if not report.targets and not preselected:
         status = "no_targets"
     elif stage3_summary.status == "stage3_input_unavailable":
         status = "stage3_input_unavailable"

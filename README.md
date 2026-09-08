@@ -137,7 +137,12 @@ for the exact command and why.
 ```bash
 fw-ingest path/to/firmware.bin                        # Stage 1
 fw-extract data/db/<firmware-stem>/stage1_summary.json # Stage 2
-fw-analyze data/db/<firmware-stem>/stage1_summary.json --analyze # Stage 3
+
+# Stage 3: --analyze never chunks — it requires --chunks-file naming which
+# already-persisted chunks to analyze (see fw_audit/stage3_analysis/CLAUDE.md).
+fw-analyze data/db/<firmware-stem>/stage1_summary.json --queue
+fw-analyze data/db/<firmware-stem>/stage1_summary.json --analyze --chunks-file data/db/<firmware-stem>/stage3/chunk_index.json
+
 fw-trace build-corpus --db-subfolder data/db/<stem> ...          # Stage 4
 fw-trace run --db-subfolder data/db/<stem>                       # Stage 4
 fw-verify run --db-subfolder data/db/<stem>                      # Stage 5

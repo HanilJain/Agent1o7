@@ -38,6 +38,23 @@ yet built — see `stage3_analysis/__init__.py`): pass a real one (the future
 LLM agent call) once it exists. Omitting it uses `_noop_consumer`, which
 proves the queue/backpressure/ack/nack/close plumbing works end-to-end
 without doing any real analysis.
+
+Two producers: chunk-from-scratch, or pre-selected from disk
+--------------------------------------------------------------------------
+`run_queue()`'s `chunk_handles` parameter selects which PRODUCER feeds the
+queue — still Component 1's own concern, not Component 2's, and not a
+public `producer=` extension point (a producer owes a three-part contract:
+always `close()` in `finally` or every worker hangs forever, return
+`list[str]` warnings, respect `put()` backpressure — exposing that
+generally would let any caller deadlock the pool). `chunk_handles=None`
+(default) keeps today's `produce_chunks()` path: chunk every `Target` from
+Stage 2's cleaned artifact. `chunk_handles=<a list of already-resolved
+ChunkHandle>` (built by `chunk_index.resolve_chunk_handles` from a
+`--chunks-file` selection) instead runs `produce_preselected()`: no
+cleaned-artifact read, no `chunk_source()` call, just `put_handle()` for
+each handle already pointing at a persisted `stage3/chunks/*.c` file. This
+is what makes `fw-analyze --analyze --chunks-file ...` skip chunking
+entirely rather than merely filtering after the fact.
 """
 
 from __future__ import annotations
@@ -46,7 +63,7 @@ import asyncio
 import dataclasses
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -54,6 +71,7 @@ from fw_audit.common.schemas import ChunkRecord, Stage3Summary
 from fw_audit.config.settings import Settings
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.chunk.strategy import chunk_source
+from fw_audit.stage3_analysis.chunk_index import write_chunk_index
 from fw_audit.stage3_analysis.cleaned_io import load_cleaned_source
 from fw_audit.stage3_analysis.models import Chunk, ChunkHandle, IngestionReport
 
@@ -98,17 +116,25 @@ class ChunkQueue:
     async def put(self, chunk: Chunk) -> ChunkHandle:
         """Persist `chunk.to_text()` to `chunks_dir/chunk_filename(chunk_id)`
         (creating the directory on first use), build a `ChunkHandle`
-        pointing at that file, and enqueue it — `await`ing here is what
-        makes backpressure real: once `maxsize` un-acked handles are
-        pending, this blocks until a consumer's `ack()`/`nack()` frees a
-        slot. Idempotent: re-`put()`-ing the same `chunk_id` overwrites the
-        file with identical content (chunking is deterministic for the
-        same input/settings), never duplicates or corrupts it.
+        pointing at that file, and enqueue it via `put_handle()`.
+        Idempotent: re-`put()`-ing the same `chunk_id` overwrites the file
+        with identical content (chunking is deterministic for the same
+        input/settings), never duplicates or corrupts it.
         """
         self._chunks_dir.mkdir(parents=True, exist_ok=True)
         chunk_path = self._chunks_dir / layout.chunk_filename(chunk.chunk_id)
         chunk_path.write_text(chunk.to_text(), encoding="utf-8")
-        handle = ChunkHandle.from_chunk(chunk, chunk_path)
+        return await self.put_handle(ChunkHandle.from_chunk(chunk, chunk_path))
+
+    async def put_handle(self, handle: ChunkHandle) -> ChunkHandle:
+        """Enqueue an already-persisted `ChunkHandle` — no file write. Used
+        by `produce_preselected()` for a `--chunks-file` selection, whose
+        chunk payloads already exist on disk from an earlier chunking run.
+        `await`ing here is what makes backpressure real: once `maxsize`
+        un-acked handles are pending, this blocks until a consumer's
+        `ack()`/`nack()` frees a slot — same as `put()`, which now delegates
+        here after its own file write.
+        """
         self.produced.append(handle)
         await self._queue.put(handle)
         return handle
@@ -219,8 +245,18 @@ async def produce_chunks(
     unlike the former in-memory `extract_functions()` call this replaced),
     `chunk_source()` (using `settings.stage3_chunk_lines`/
     `stage3_max_chunk_lines`), and `queue.put()` every resulting `Chunk`.
+    Also writes `stage3/chunk_index.json` (`chunk_index.write_chunk_index`)
+    from each `Chunk.to_json_dict()` — metadata only, never the `Chunk`
+    itself, so this never reintroduces per-function text into memory across
+    the whole run.
+
     `queue.close()` ALWAYS runs (via `finally`) so spawned consumers never
     hang waiting for a sentinel that never comes, even if this stops early.
+    The index write is nested INSIDE that `finally`, before `close()`: a
+    serialization failure there must not skip the sentinels (or every
+    worker hangs), and writing before `close()` means a chunk index is on
+    disk before `close()`'s `join()` blocks for the whole consumer drain —
+    useful even if the run is interrupted mid-analysis.
 
     A `Target` with no `cleaned_source_path`/`cleaned_index_path` (Stage 2
     skipped cleaning for it) is skipped individually with a warning —
@@ -232,6 +268,7 @@ async def produce_chunks(
     to fold into `Stage3Summary`.
     """
     warnings: list[str] = []
+    index_entries: list[dict] = []
     try:
         if not report.targets:
             return warnings
@@ -262,10 +299,37 @@ async def produce_chunks(
                 max_chunk_lines=settings.stage3_max_chunk_lines,
             )
             for chunk in chunks:
+                index_entries.append(chunk.to_json_dict())
                 await queue.put(chunk)
     finally:
-        await queue.close()
+        try:
+            write_chunk_index(layout.stage3_dir(report.db_subfolder), index_entries)
+        finally:
+            await queue.close()
     return warnings
+
+
+async def produce_preselected(handles: Sequence[ChunkHandle], queue: ChunkQueue) -> list[str]:
+    """The second producer `run_queue()` can select (via `chunk_handles=`):
+    enqueue already-resolved `ChunkHandle`s pointing at chunk payloads a
+    prior chunking run already persisted — no Stage 2 cleaned-artifact
+    read, no `chunk_source()` call, no `stage3/chunk_index.json` write
+    (preselected mode never chunks, so it must never touch the manifest the
+    selection itself was trimmed from).
+
+    Same unconditional finally-close contract as `produce_chunks()`: a
+    failure partway through must still let every worker's sentinel
+    arrive. Returns an empty warnings list — `chunk_index.
+    resolve_chunk_handles` (the caller that built `handles`) is where any
+    per-chunk warnings (e.g. a fallback rootfs_path) were already surfaced,
+    before this ever runs.
+    """
+    try:
+        for handle in handles:
+            await queue.put_handle(handle)
+    finally:
+        await queue.close()
+    return []
 
 
 async def run_queue(
@@ -274,20 +338,36 @@ async def run_queue(
     settings: Settings,
     consumer: Consumer | None = None,
     run_id: str | None = None,
+    chunk_handles: Sequence[ChunkHandle] | None = None,
 ) -> Stage3Summary:
     """Component 1's Step 4 entry point — and Component 2's intended
     extension point (see this module's docstring): pass a real `consumer`
     once Component 2's LLM agent exists; omitting it exercises the
     plumbing with `_noop_consumer` only.
 
-    Spawns `produce_chunks()` and `settings.stage3_queue_workers` `_worker`
-    tasks concurrently via `asyncio.gather` (the producer must run
-    concurrently with consumers, not before them, or `put()`'s backpressure
-    would deadlock waiting for a consumer that's never been scheduled).
-    Writes `stage3_summary.json` itself (via `layout.stage3_summary_path`),
-    mirroring `Stage2Summary`'s precedent of being written by the
-    orchestrator function itself, not only a CLI wrapper — a programmatic
-    caller invoking `run_queue()` directly still gets a summary.
+    `chunk_handles` selects the PRODUCER (see this module's docstring):
+    `None` (default) chunks every `Target` via `produce_chunks()`, same as
+    always. A sequence of already-resolved `ChunkHandle`s (built by
+    `chunk_index.resolve_chunk_handles` from a `--chunks-file` selection)
+    instead runs `produce_preselected()` — no chunking, no cleaned-artifact
+    read, every handle already points at a persisted `stage3/chunks/*.c`
+    file. `_build_summary`'s `no_targets` status is only ever inferred from
+    `report.targets` in the default (chunk-from-scratch) mode — a
+    preselected run has zero `report.targets` requirement, since it never
+    reads Stage 2's cleaned artifacts to begin with.
+
+    Spawns the selected producer and `settings.stage3_queue_workers`
+    `_worker` tasks concurrently via `asyncio.gather` (the producer must
+    run concurrently with consumers, not before them, or `put()`'s
+    backpressure would deadlock waiting for a consumer that's never been
+    scheduled). Writes `stage3_summary.json` itself (via `layout.
+    stage3_summary_path`) in BOTH modes — mirroring `Stage2Summary`'s
+    precedent of being written by the orchestrator function itself, not
+    only a CLI wrapper: a programmatic caller invoking `run_queue()`
+    directly still gets a summary, and nothing else in the repo depends on
+    this file (`stage4_rag.sink_index`'s module docstring says so
+    explicitly), so a preselected run's summary describing just the subset
+    it processed is never mistaken for a full-run summary by any reader.
     """
     run_id = run_id or uuid.uuid4().hex[:12]
     started_at = datetime.now(UTC)
@@ -301,7 +381,11 @@ async def run_queue(
     )
 
     active_consumer = consumer or _noop_consumer
-    producer_task = asyncio.create_task(produce_chunks(report, settings, queue))
+    preselected = chunk_handles is not None
+    if preselected:
+        producer_task = asyncio.create_task(produce_preselected(chunk_handles, queue))
+    else:
+        producer_task = asyncio.create_task(produce_chunks(report, settings, queue))
     worker_tasks = [
         asyncio.create_task(_worker(queue, active_consumer))
         for _ in range(settings.stage3_queue_workers)
@@ -317,6 +401,7 @@ async def run_queue(
         warnings=warnings,
         started_at=started_at,
         finished_at=finished_at,
+        preselected=preselected,
     )
     _write_summary(report.db_subfolder, summary)
     return summary
@@ -330,8 +415,14 @@ def _build_summary(
     warnings: list[str],
     started_at: datetime,
     finished_at: datetime,
+    preselected: bool = False,
 ) -> Stage3Summary:
-    if not report.targets:
+    if not report.targets and not preselected:
+        # A preselected run never reads report.targets to produce chunks
+        # (see run_queue's docstring) — an empty target list says nothing
+        # about whether the --chunks-file selection itself was empty
+        # (already rejected by chunk_index.load_chunk_selection before
+        # this is ever reached), so it must not force "no_targets" here.
         status = "no_targets"
     elif warnings and not queue.produced:
         # Every target hit a missing/unreadable cleaned artifact — the
@@ -391,4 +482,4 @@ def _write_summary(db_subfolder: Path, summary: Stage3Summary) -> None:
         pass
 
 
-__all__ = ["ChunkQueue", "produce_chunks", "run_queue"]
+__all__ = ["ChunkQueue", "produce_chunks", "produce_preselected", "run_queue"]

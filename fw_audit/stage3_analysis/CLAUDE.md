@@ -35,7 +35,8 @@ tree-sitter itself. Root `CLAUDE.md` covers only cross-cutting concerns
 | `ingest.py` | Step 1 orchestrator → `IngestionReport`; hosts `--debug`/`--debug-chunks` writers. |
 | `cleaned_io.py` | Step 2: loads Stage 2's persisted `cleaned/whole.c` + `functions.json`, reconstructs `ExtractedSource` by slicing — no tree-sitter, no re-parsing. |
 | `chunk/strategy.py` | Step 3: greedy function-preserving chunking, in-memory, no I/O. |
-| `chunk_queue.py` | Step 4: in-process `asyncio.Queue` + worker pool, persists chunk text to disk (`ChunkHandle` only carries a pointer). |
+| `chunk_queue.py` | Step 4: in-process `asyncio.Queue` + worker pool, persists chunk text to disk (`ChunkHandle` only carries a pointer). Two producers: `produce_chunks` (chunk-from-scratch, default) or `produce_preselected` (a `--chunks-file` selection, no chunking) — selected via `run_queue(chunk_handles=...)`. |
+| `chunk_index.py` | The editable `stage3/chunk_index.json` manifest: `write_chunk_index` (both chunking paths write it), `load_chunk_selection`/`resolve_chunk_handles` (`--analyze --chunks-file`'s input side — selects already-persisted chunks, no re-chunking). |
 | `layout.py`, `models.py`, `errors.py` | Path algebra, `Target`/`SkippedTarget`/`IngestionReport`, `Stage3InputError`. `Target` carries `cleaned_source_path`/`cleaned_index_path` (both `None` if Stage 2 skipped cleaning for that binary). |
 | `agent/prompts.py` | Worker system prompt + `[Lnnn]`-marked message builder. |
 | `agent/analyst.py` | `analyze_chunk()` — structured-output LLM call + bounded schema-repair retry. |
@@ -49,10 +50,14 @@ tree-sitter itself. Root `CLAUDE.md` covers only cross-cutting concerns
 fw-analyze data/db/<stem>/stage1_summary.json                      # ingest only
 fw-analyze data/db/<stem>/stage1_summary.json --only bin/httpd     # repeatable
 fw-analyze data/db/<stem>/stage1_summary.json --debug              # raw+cleaned dump
-fw-analyze data/db/<stem>/stage1_summary.json --debug-chunks --chunk-lines 500
-fw-analyze data/db/<stem>/stage1_summary.json --queue              # Step 4, no-op consumer
-fw-analyze data/db/<stem>/stage1_summary.json --analyze            # Component 2, real LLM
-fw-analyze data/db/<stem>/stage1_summary.json --analyze --model ollama:qwen2.5-coder:1.5b
+fw-analyze data/db/<stem>/stage1_summary.json --debug-chunks --chunk-lines 500  # writes chunk_index.json
+fw-analyze data/db/<stem>/stage1_summary.json --queue              # Step 4, no-op consumer; also writes chunk_index.json
+
+# --analyze NEVER chunks — requires --chunks-file (a JSON file naming which
+# already-persisted chunks to analyze). Produce it from chunk_index.json:
+cp data/db/<stem>/stage3/chunk_index.json selected.json   # edit: delete rows
+fw-analyze data/db/<stem>/stage1_summary.json --analyze --chunks-file selected.json
+fw-analyze data/db/<stem>/stage1_summary.json --analyze --chunks-file selected.json --model ollama:qwen2.5-coder:1.5b
 ```
 
 ## Input
@@ -63,9 +68,11 @@ mirror-tree fallback chain).
 ## Output — `data/db/<stem>/stage3/`
 
 `ingestion_report.json` (always) → `debug/<bin_id>.c`/`.cleaned.c`
-(`--debug`) → `chunks/<chunk_id>.c` (`--debug-chunks` or `--queue`/`--analyze`,
-unconditional) → `stage3_summary.json` (`--queue`/`--analyze`) →
-`findings/<chunk_id>.json` + `analysis_summary.json` (`--analyze`).
+(`--debug`) → `chunks/<chunk_id>.c` + `chunk_index.json` (`--debug-chunks`
+or `--queue`/`--analyze`'s chunking mode, unconditional) →
+`stage3_summary.json` (`--queue`/`--analyze`) → `findings/<chunk_id>.json`
++ `analysis_summary.json` (`--analyze`). `chunk_index.json` is an INPUT to
+`--analyze --chunks-file`, never read back automatically.
 
 ## Debugging
 
@@ -73,18 +80,19 @@ unconditional) → `stage3_summary.json` (`--queue`/`--analyze`) →
   `--analyze` run: one `stage3.chunk` root run per chunk, containing the
   analyst LLM call and any schema-repair retry (tagged `repair`,
   `attempt:N` in metadata) — see root `CLAUDE.md`'s Observability section.
-
-## Debugging
-
 - A `Target` with no cleaned artifact recorded (Stage 2 skipped cleaning
   for it — e.g. the `stage2` extra wasn't installed there): `--debug`'s
   cleaned dump is skipped for that target with a warning;
-  `--debug-chunks`/`--queue`/`--analyze` degrade the same way, per-target
-  (not a whole-run abandonment — that changed when cleaning moved to
-  Stage 2, where availability is decided once per binary rather than
-  process-wide).
-- `--analyze` needs `ANTHROPIC_API_KEY` (or `FWA_STAGE3_ANALYST_MODEL`) —
-  else `AnalystModelUnavailableError` before any chunk is processed.
+  `--debug-chunks`/`--queue` degrade the same way, per-target (not a
+  whole-run abandonment — that changed when cleaning moved to Stage 2,
+  where availability is decided once per binary rather than process-wide).
+  `--analyze --chunks-file` never reads the cleaned artifact at all, so
+  this doesn't affect it.
+- `--analyze` requires `--chunks-file PATH` (exit 2 otherwise) and needs
+  `ANTHROPIC_API_KEY` (or `FWA_STAGE3_ANALYST_MODEL`) — else
+  `AnalystModelUnavailableError` before any chunk is processed. A chunk id
+  in `--chunks-file` with no matching file under `stage3/chunks/` fails the
+  whole run before any LLM call, listing every missing id at once.
 - A chunk over `FWA_STAGE3_MAX_CHUNK_TOKENS` (100k default) is skipped, not
   retried. Retries cap at `FWA_STAGE3_QUEUE_MAX_ATTEMPTS` (3).
 - Unit: `pytest -m "not integration" tests/test_stage3_*.py tests/test_findings_schema.py`
