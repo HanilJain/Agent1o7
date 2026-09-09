@@ -558,7 +558,8 @@ def _build_from_spec(
     credential_kwargs: dict[str, Any],
     *,
     role: AgentRole | None = None,
-) -> "BaseChatModel":
+    settings: Settings,
+) -> BaseChatModel:
     """Shared `init_chat_model` call, factored out so `get_llm`'s
     preferred/fallback attempts don't duplicate the try/except ImportError
     handling.
@@ -573,6 +574,20 @@ def _build_from_spec(
     returns a `RunnableBinding` with no `with_config` counterpart, so
     per-call identity has to be attached at construction time, not chained
     on afterward.
+
+    `settings` (now required, not optional) is used the same way for two
+    MORE constructor fields that follow the identical rule: `callbacks`
+    (a `UsageTrackingCallbackHandler`, see `fw_audit.observability.usage`,
+    attached when `settings.llm_usage_tracking` is true — the default) and
+    `rate_limiter` (a shared `InMemoryRateLimiter`, see
+    `fw_audit.config.rate_limits`, attached when a nonzero requests-per-
+    second is configured). Both are `BaseChatModel` constructor kwargs for
+    the exact same `RunnableBinding`-has-no-`with_config` reason as
+    `tags`/`metadata` — this one function is therefore the single place
+    that makes token tracking and rate limiting apply to every one of this
+    repo's LLM call sites (5 structured, 4 raw, including Stage 1's
+    Identifier Agent, which passes no `config=` at all) with zero edits to
+    any of them.
     """
     identity_kwargs: dict[str, Any] = {}
     if role is not None:
@@ -583,6 +598,25 @@ def _build_from_spec(
             "model": spec.model,
         }
 
+    observability_kwargs: dict[str, Any] = {}
+    if settings.llm_usage_tracking:
+        from fw_audit.observability.usage import UsageTrackingCallbackHandler
+
+        observability_kwargs["callbacks"] = [
+            UsageTrackingCallbackHandler(
+                role=role.value if role is not None else "unknown",
+                provider=spec.provider.value,
+                model=spec.model,
+                settings=settings,
+            )
+        ]
+
+    from fw_audit.config.rate_limits import get_rate_limiter
+
+    limiter = get_rate_limiter(spec, role=role, settings=settings)
+    if limiter is not None:
+        observability_kwargs["rate_limiter"] = limiter
+
     from langchain.chat_models import init_chat_model
 
     try:
@@ -592,6 +626,7 @@ def _build_from_spec(
             temperature=spec.temperature,
             **credential_kwargs,
             **identity_kwargs,
+            **observability_kwargs,
             **spec.kwargs,
         )
     except ImportError as exc:
@@ -606,7 +641,7 @@ def get_llm(
     spec_or_role: ModelSpec | AgentRole = AgentRole.DEFAULT,
     *,
     settings: Settings | None = None,
-) -> "BaseChatModel":
+) -> BaseChatModel:
     """Build a chat model from a :class:`ModelSpec` or :class:`AgentRole`.
 
     Passing an :class:`AgentRole` resolves it to a spec via :func:`resolve_spec`
@@ -638,12 +673,12 @@ def get_llm(
     )
 
     usable_spec, credential_kwargs = _pick_usable_spec(spec, settings=settings)
-    return _build_from_spec(usable_spec, credential_kwargs, role=role)
+    return _build_from_spec(usable_spec, credential_kwargs, role=role, settings=settings)
 
 
 def get_llm_for_agent(
     role: AgentRole, *, settings: Settings | None = None
-) -> "BaseChatModel":
+) -> BaseChatModel:
     """Convenience wrapper: resolve `role` to a spec, then build the model.
 
     `settings` defaults to the cached singleton — see `resolve_spec`'s

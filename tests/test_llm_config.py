@@ -329,3 +329,72 @@ def test_get_llm_opencode_go_builds_chat_openai_via_init_chat_model():
     assert llm.model_name == "kimi-k3"
     assert llm.openai_api_base == "https://opencode.ai/zen/go/v1"
     assert "x-opencode-session" in llm.default_headers
+
+
+# ---------------------------------------------------------------------- #
+# Token usage tracking / rate limiting attachment (_build_from_spec)
+# ---------------------------------------------------------------------- #
+
+
+def test_build_from_spec_attaches_usage_tracking_callback_by_default():
+    from fw_audit.observability.usage import UsageTrackingCallbackHandler
+
+    pytest.importorskip("langchain_ollama")
+    spec = ModelSpec(provider=ModelProvider.OLLAMA, model="qwen2.5-coder:1.5b")
+    settings = Settings(_env_file=None)
+    llm = get_llm(spec, settings=settings)
+    assert llm.callbacks is not None
+    handlers = [h for h in llm.callbacks if isinstance(h, UsageTrackingCallbackHandler)]
+    assert len(handlers) == 1
+
+
+def test_build_from_spec_callback_carries_the_resolved_role():
+    from fw_audit.observability.usage import UsageTrackingCallbackHandler
+
+    pytest.importorskip("langchain_ollama")
+    settings = Settings(_env_file=None, use_local_model=True)
+    llm = get_llm(AgentRole.STAGE3_VULN_ANALYST, settings=settings)
+    handler = next(h for h in llm.callbacks if isinstance(h, UsageTrackingCallbackHandler))
+    assert handler._role == "stage3_vuln_analyst"
+
+
+def test_build_from_spec_omits_callbacks_when_usage_tracking_disabled():
+    pytest.importorskip("langchain_ollama")
+    spec = ModelSpec(provider=ModelProvider.OLLAMA, model="qwen2.5-coder:1.5b")
+    settings = Settings(_env_file=None, llm_usage_tracking=False)
+    llm = get_llm(spec, settings=settings)
+    assert not llm.callbacks
+
+
+def test_build_from_spec_omits_rate_limiter_when_rps_zero():
+    pytest.importorskip("langchain_ollama")
+    spec = ModelSpec(provider=ModelProvider.OLLAMA, model="qwen2.5-coder:1.5b")
+    settings = Settings(_env_file=None, llm_rate_limit_rps=0.0)
+    llm = get_llm(spec, settings=settings)
+    assert llm.rate_limiter is None
+
+
+def test_build_from_spec_attaches_shared_rate_limiter_across_two_get_llm_calls():
+    from fw_audit.config.rate_limits import reset_rate_limiters
+
+    pytest.importorskip("langchain_ollama")
+    reset_rate_limiters()
+    try:
+        spec = ModelSpec(provider=ModelProvider.OLLAMA, model="qwen2.5-coder:1.5b")
+        settings = Settings(_env_file=None, llm_rate_limit_rps=2.0)
+        llm1 = get_llm(spec, settings=settings)
+        llm2 = get_llm(spec, settings=settings)
+        assert llm1.rate_limiter is not None
+        assert llm1.rate_limiter is llm2.rate_limiter
+    finally:
+        reset_rate_limiters()
+
+
+def test_build_from_spec_tags_and_metadata_still_set_alongside_new_kwargs():
+    # Regression guard: the new callbacks/rate_limiter kwargs must not
+    # displace the existing tags/metadata identity stamping.
+    pytest.importorskip("langchain_ollama")
+    settings = Settings(_env_file=None, use_local_model=True)
+    llm = get_llm(AgentRole.STAGE3_VULN_ANALYST, settings=settings)
+    assert llm.tags == ["role:stage3_vuln_analyst"]
+    assert llm.metadata["role"] == "stage3_vuln_analyst"

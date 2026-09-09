@@ -699,6 +699,118 @@ class Settings(BaseSettings):
     static track, `stage5_dynamic_max_iterations` for the dynamic track)
     the exhausted track was using."""
 
+    # ---- LLM usage tracking & rate limiting ----------------------------
+    llm_usage_tracking: bool = Field(default=True, validation_alias="FWA_LLM_USAGE_TRACKING")
+    """Attach a `UsageTrackingCallbackHandler` to every constructed chat
+    model (`llm_config._build_from_spec`) so token usage/cost is counted
+    on every LLM call, across all 6 stages. On by default — same
+    precedent as `stage5_command_log`: a counter costs nothing and a
+    firmware run should never surprise an operator with an unknown bill.
+    NOT governed by `langsmith_tracing` — this works whether or not
+    LangSmith is configured (see `observability.usage`'s module
+    docstring)."""
+    llm_usage_artifact: bool = Field(default=True, validation_alias="FWA_LLM_USAGE_ARTIFACT")
+    """Write `<db_subfolder>/usage/<stage>.<run_id>.{jsonl,json}` at the
+    end of a run (see `observability.layout`). Independent of
+    `llm_usage_tracking` being on — tracking without the artifact still
+    powers the console/LangSmith summaries; the artifact adds durable,
+    per-call detail on disk."""
+    llm_usage_console: bool = Field(default=True, validation_alias="FWA_LLM_USAGE_CONSOLE")
+    """Print the "LLM usage" summary block at the end of each runner's
+    `main()`. Set `False` (or a runner's `--no-usage` flag) to suppress it
+    — e.g. for a scripted/CI invocation that parses stdout itself."""
+    llm_price_table_path: Path | None = Field(
+        default=None, validation_alias="FWA_LLM_PRICE_TABLE_PATH"
+    )
+    """Optional JSON file of `{"<provider>:<model-prefix>": {"input":
+    ..., "output": ..., "cache_read": ..., "cache_write": ...}}` price
+    entries (USD per million tokens), merged on top of
+    `observability.pricing`'s built-in table — lets an operator update
+    stale prices or add an unpriced model without touching source. A
+    malformed file logs one warning and is ignored, never crashes a run."""
+
+    llm_rate_limit_rps: float = Field(
+        default=0.0, ge=0.0, validation_alias="FWA_LLM_RATE_LIMIT_RPS"
+    )
+    """Default requests-per-second cap applied to every constructed chat
+    model via LangChain's `InMemoryRateLimiter` (`rate_limiter=`, a
+    `BaseChatModel` constructor kwarg — survives `with_structured_output`
+    for the same reason `tags`/`metadata`/`callbacks` do, see
+    `llm_config._build_from_spec`'s docstring). `0.0` (default) disables
+    rate limiting entirely — no existing run's throughput changes unless
+    this (or `llm_rate_limit_rps_by_provider`, or a runner's
+    `--rate-limit` flag) is set explicitly. The limiter for a given key
+    (see `llm_rate_limit_scope`) is SHARED across every model resolving to
+    that key, not one-per-model-instance — see `config.rate_limits`'s
+    module docstring for why that sharing is required."""
+    llm_rate_limit_rps_by_provider: dict[str, float] = Field(
+        default_factory=dict, validation_alias="FWA_LLM_RATE_LIMIT_RPS_BY_PROVIDER"
+    )
+    """Per-provider override of `llm_rate_limit_rps`, keyed by
+    `ModelProvider.value` (e.g. `{"anthropic": 0.8, "ollama": 0}`) — a JSON
+    object via the env var. Checked before the global default in
+    `config.rate_limits._resolve_rps`; a provider absent from this dict
+    falls through to `llm_rate_limit_rps`. Exists because a paid,
+    quota-limited API (Anthropic) and a local, unlimited one (Ollama)
+    warrant very different numbers, and this repo's Stage 5 alone can
+    hold up to 4 different roles/providers live at once."""
+    llm_rate_limit_burst: float = Field(
+        default=0.0, ge=0.0, validation_alias="FWA_LLM_RATE_LIMIT_BURST"
+    )
+    """`InMemoryRateLimiter`'s `max_bucket_size` (burst allowance) for
+    every shared limiter. `0.0` (default) means "use the limiter's own
+    requests-per-second value as the burst size" (`config.rate_limits
+    .get_rate_limiter`'s fallback) rather than serializing every worker
+    down to strict one-at-a-time pacing the moment `llm_rate_limit_rps` is
+    set."""
+    llm_rate_limit_scope: str = Field(
+        default="provider", validation_alias="FWA_LLM_RATE_LIMIT_SCOPE"
+    )
+    """`"provider"` (default), `"model"`, or `"role"` — the granularity at
+    which rate limiters are shared (see `config.rate_limits.limiter_key`).
+    `"provider"` matches how a real vendor quota actually works (one
+    budget per API key, not per model or per agent role); the other two
+    are available for finer-grained tuning if an operator's setup needs
+    it."""
+
+    llm_max_total_tokens: int = Field(
+        default=0, ge=0, validation_alias="FWA_LLM_MAX_TOTAL_TOKENS"
+    )
+    """Hard budget on TOTAL tokens (input + output, summed across every
+    role) for one run. `0` (default) = unlimited. Checked after every LLM
+    call in `UsageTrackingCallbackHandler._check_budget`; what happens on
+    crossing it is governed by `llm_budget_action`. This is a per-RUN
+    budget, not a per-second rate — LangChain's rate limiters are
+    request-only, so a runaway loop (e.g. Stage 5's repair/HITL retries)
+    is bounded here, not by `llm_rate_limit_rps`."""
+    llm_max_cost_usd: float = Field(
+        default=0.0, ge=0.0, validation_alias="FWA_LLM_MAX_COST_USD"
+    )
+    """Hard budget on estimated USD cost (see `observability.pricing`) for
+    one run. `0.0` (default) = unlimited. An unpriced model's calls never
+    count toward this budget (their `cost_usd` is `None`, not `0.0` — see
+    `observability.pricing`'s module docstring), so a run mixing priced
+    and unpriced models only gets a partial cost picture; `llm_max_total_tokens`
+    is the more reliable budget when unpriced models are in play."""
+    llm_budget_action: str = Field(default="warn", validation_alias="FWA_LLM_BUDGET_ACTION")
+    """`"warn"` (the only supported value right now) — log one warning on
+    crossing either budget above and let the run finish, flagging
+    `UsageReport.budget_exceeded` for the console/artifact. Matches this
+    repo's "tracing/observability must never break a real run" discipline.
+
+    A `"stop"` mode (raising `observability.usage.UsageBudgetExceededError`
+    from the callback handler to hard-abort the run) was prototyped and
+    deliberately pulled before shipping: it reproducibly HUNG the process
+    when the budget was crossed mid-stream during a structured-output
+    parse against a local Ollama model (a faulthandler dump showed the
+    interpreter stuck inside `pydantic.BaseModel.__init__`, suggesting a
+    thread/lock interaction between LangChain's streaming parse and the
+    callback firing mid-parse — not reproduced or root-caused yet). Do not
+    re-add a `"stop"` path without first reproducing that hang in
+    isolation (e.g. against `tests/test_usage_tracking.py`'s
+    `FakeChatModel`, no live network call needed) and confirming it no
+    longer occurs."""
+
     # ---- External tool invocation (LocalExecutor / the `docker` CLI call) -
     # Prepended to every host-level command. Firmware-extraction tool names
     # (binwalk/unsquashfs/etc.) are no longer configurable here — those run
@@ -724,6 +836,31 @@ class Settings(BaseSettings):
         """Allow a comma- or space-separated string for the command prefix."""
         if isinstance(value, str):
             return [tok for tok in value.replace(",", " ").split() if tok]
+        return value
+
+    @field_validator("llm_rate_limit_scope")
+    @classmethod
+    def _check_rate_limit_scope(cls, value: str) -> str:
+        allowed = {"provider", "model", "role"}
+        if value not in allowed:
+            raise ValueError(
+                f"FWA_LLM_RATE_LIMIT_SCOPE must be one of {sorted(allowed)}, got {value!r}"
+            )
+        return value
+
+    @field_validator("llm_budget_action")
+    @classmethod
+    def _check_budget_action(cls, value: str) -> str:
+        # "stop" was prototyped and pulled — see llm_budget_action's
+        # docstring for the reproducible hang that blocked it. Only
+        # "warn" is accepted until that's root-caused and fixed.
+        allowed = {"warn"}
+        if value not in allowed:
+            raise ValueError(
+                f"FWA_LLM_BUDGET_ACTION must be one of {sorted(allowed)}, got {value!r} "
+                f"('stop' was prototyped and pulled due to a reproducible hang — see "
+                f"Settings.llm_budget_action's docstring)"
+            )
         return value
 
     # ------------------------------------------------------------------ #

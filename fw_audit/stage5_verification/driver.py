@@ -89,6 +89,15 @@ class CandidateQueue:
         self.acked.append(item)
         self._queue.task_done()
 
+    def abandon(self, item: _WorkItem) -> None:
+        """Signal `task_done()` without ack/nack bookkeeping — see
+        `stage3_analysis.chunk_queue.ChunkQueue.abandon`'s docstring
+        (identical shape/rationale): used only when `_worker` re-raises a
+        `BaseException` (e.g. a "stop"-mode usage budget error) so
+        `close()`'s `join()` doesn't hang waiting on a `task_done()`
+        neither `ack()` nor `nack()` ever supplied."""
+        self._queue.task_done()
+
     async def nack(self, item: _WorkItem) -> None:
         self._queue.task_done()
         attempts_made = item.attempt + 1
@@ -317,6 +326,15 @@ async def _worker(queue: CandidateQueue, ctx: _RunContext) -> None:
                 error=str(exc),
             )
             await queue.nack(item)
+        except BaseException:
+            # Not caught above deliberately (e.g.
+            # observability.usage.UsageBudgetExceededError, a
+            # BaseException subclass so a "stop"-mode usage budget aborts
+            # the run instead of being retried) — must still call
+            # abandon() before propagating or close()'s join() hangs; see
+            # CandidateQueue.abandon's docstring.
+            queue.abandon(item)
+            raise
         else:
             queue.ack(item)
 

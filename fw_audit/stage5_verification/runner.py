@@ -38,8 +38,15 @@ from pathlib import Path
 
 from fw_audit.common.findings import Decision
 from fw_audit.common.verification import TranscriptEntry
-from fw_audit.config.settings import get_settings
+from fw_audit.config.settings import Settings, get_settings
 from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import layout as usage_layout
+from fw_audit.observability.usage import (
+    UsageBudgetExceededError,
+    UsageRegistry,
+    format_usage_summary,
+    usage_registry,
+)
 from fw_audit.stage5_verification import debug as debug_mod
 from fw_audit.stage5_verification import layout
 from fw_audit.stage5_verification.driver import run_queue
@@ -99,6 +106,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="trace",
         action="store_false",
         help="Force-disable LangSmith tracing for this run, overriding LANGSMITH_TRACING.",
+    )
+    parser.add_argument(
+        "--usage",
+        dest="usage",
+        action="store_true",
+        default=None,
+        help="Print the LLM token/cost usage summary at the end of this run (default: on).",
+    )
+    parser.add_argument(
+        "--no-usage",
+        dest="usage",
+        action="store_false",
+        help="Suppress the LLM token/cost usage summary.",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=None,
+        metavar="RPS",
+        help="Cap LLM requests-per-second for this run (default: FWA_LLM_RATE_LIMIT_RPS).",
+    )
+    parser.add_argument(
+        "--max-cost",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Warn-only budget on estimated USD cost for this run (default: FWA_LLM_MAX_COST_USD).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -271,8 +305,13 @@ def _parse_decisions(raw: str) -> frozenset[Decision]:
     return frozenset(result)
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
-    settings = get_settings()
+def _cmd_run(
+    args: argparse.Namespace,
+    *,
+    settings: Settings | None = None,
+    registry: UsageRegistry | None = None,
+) -> int:
+    settings = settings or get_settings()
     updates: dict[str, object] = {}
     if args.model is not None:
         updates["stage5_verifier_model"] = args.model
@@ -330,6 +369,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except Stage5InputError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except UsageBudgetExceededError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     print(f"Status: {summary.status}")
     print(
@@ -344,10 +386,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "(Full FVVW v3 fork-join run — pass --joern-only for the original "
             "static-only pipeline.)"
         )
+
+    show_usage = args.usage if args.usage is not None else settings.llm_usage_console
+    if show_usage and registry is not None:
+        summary_text = format_usage_summary(
+            registry.snapshot(stage="5", run_id=args.run_id or "")
+        )
+        if summary_text:
+            print(f"\n{summary_text}")
     return 0
 
 
-def _cmd_debug(args: argparse.Namespace) -> int:
+def _cmd_debug(
+    args: argparse.Namespace,
+    *,
+    settings: Settings | None = None,
+    registry: UsageRegistry | None = None,
+) -> int:
+    settings = settings or get_settings()
     try:
         if args.debug_command == "build-cpg":
             result = asyncio.run(debug_mod.debug_build_cpg(Path(args.db_subfolder), args.bin_id))
@@ -433,6 +489,15 @@ def _cmd_debug(args: argparse.Namespace) -> int:
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except UsageBudgetExceededError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    show_usage = args.usage if args.usage is not None else settings.llm_usage_console
+    if show_usage and registry is not None:
+        summary_text = format_usage_summary(registry.snapshot(stage="5-debug", run_id=""))
+        if summary_text:
+            print(f"\n{summary_text}")
     return 0
 
 
@@ -447,14 +512,36 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     if args.trace is not None:
         settings = settings.model_copy(update={"langsmith_tracing": args.trace})
+    if args.rate_limit is not None:
+        settings = settings.model_copy(update={"llm_rate_limit_rps": args.rate_limit})
+    if args.max_cost is not None:
+        settings = settings.model_copy(update={"llm_max_cost_usd": args.max_cost})
     configure_tracing(settings)
 
+    run_id = getattr(args, "run_id", None) or "run"
+    db_subfolder = Path(args.db_subfolder) if getattr(args, "db_subfolder", None) else None
+    jsonl_path = None
+    if settings.llm_usage_artifact and db_subfolder is not None:
+        usage_dir_ = usage_layout.usage_dir(db_subfolder)
+        jsonl_path = usage_layout.usage_jsonl_path(usage_dir_, stage="5", run_id=run_id)
+
     try:
-        if args.command == "run":
-            return _cmd_run(args)
-        if args.command == "debug":
-            return _cmd_debug(args)
-        return 2  # pragma: no cover - argparse enforces valid subcommands
+        with usage_registry(jsonl_path=jsonl_path, settings=settings) as registry:
+            try:
+                if args.command == "run":
+                    return _cmd_run(args, settings=settings, registry=registry)
+                if args.command == "debug":
+                    return _cmd_debug(args, settings=settings, registry=registry)
+                return 2  # pragma: no cover - argparse enforces valid subcommands
+            finally:
+                if settings.llm_usage_artifact and db_subfolder is not None:
+                    registry.write_report(
+                        usage_layout.usage_report_path(
+                            usage_layout.usage_dir(db_subfolder), stage="5", run_id=run_id
+                        ),
+                        stage="5",
+                        run_id=getattr(args, "run_id", None) or "",
+                    )
     finally:
         flush_traces()
 

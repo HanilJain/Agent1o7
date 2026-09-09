@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from fw_audit.observability.usage import current_registry
 from fw_audit.stage3_analysis.runner import _parse_args, main
 from tests.conftest import write_cleaned_artifact
 
@@ -691,3 +692,108 @@ def test_main_analyze_missing_chunk_ids_exits_2_listing_all(tmp_path: Path):
         [str(summary_path), "--analyze", "--chunks-file", str(selected_path)]
     )
     assert code == 2
+
+
+def _fake_analyze_chunk_recording_usage(**usage_kwargs):
+    """A fake `analyze_chunk` that also writes one synthetic usage record
+    into whatever `UsageRegistry` `runner.main()`'s `usage_registry()`
+    context has made current — exercises the runner's registry-scoping
+    and `--usage`/`--no-usage` print gating without a real LLM call."""
+    from fw_audit.common.findings import AnalysisReport
+
+    async def fake_analyze_chunk(text, *, chunk_id, rootfs_path, settings, function_names=()):
+        current_registry().record(
+            {
+                "ts": "",
+                "role": "stage3_vuln_analyst",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5",
+                "measured": True,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "cost_usd": 0.001,
+                **usage_kwargs,
+            }
+        )
+        return AnalysisReport(chunk_id=chunk_id, findings=[], checked_categories=[])
+
+    return fake_analyze_chunk
+
+
+def test_main_analyze_prints_usage_summary_by_default(tmp_path: Path, capsys, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk",
+        _fake_analyze_chunk_recording_usage(),
+    )
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert main([str(summary_path), "--queue"]) == 0
+
+    code = main(
+        [str(summary_path), "--analyze", "--chunks-file", str(stage3_dir / "chunk_index.json")]
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "LLM usage" in captured.out
+    assert "stage3_vuln_analyst" in captured.out
+
+
+def test_main_analyze_no_usage_flag_suppresses_summary(tmp_path: Path, capsys, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk",
+        _fake_analyze_chunk_recording_usage(),
+    )
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert main([str(summary_path), "--queue"]) == 0
+
+    code = main(
+        [
+            str(summary_path),
+            "--analyze",
+            "--chunks-file",
+            str(stage3_dir / "chunk_index.json"),
+            "--no-usage",
+        ]
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "LLM usage" not in captured.out
+
+
+def test_main_analyze_writes_usage_artifact(tmp_path: Path, monkeypatch):
+    pytest.importorskip("tree_sitter_c")
+    monkeypatch.setattr(
+        "fw_audit.stage3_analysis.agent.consumer.analyze_chunk",
+        _fake_analyze_chunk_recording_usage(),
+    )
+    summary_path = _setup_single_target_run(
+        tmp_path, source_text="int main(void) { return 0; }\n"
+    )
+    stage3_dir = tmp_path / "db" / "fw" / "stage3"
+    assert main([str(summary_path), "--queue"]) == 0
+
+    code = main(
+        [
+            str(summary_path),
+            "--analyze",
+            "--chunks-file",
+            str(stage3_dir / "chunk_index.json"),
+            "--run-id",
+            "testrun",
+        ]
+    )
+    assert code == 0
+    usage_dir = tmp_path / "db" / "fw" / "usage"
+    report_path = usage_dir / "3.testrun.json"
+    assert report_path.is_file()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["calls"] == 1
+    assert payload["total_tokens"] == 120

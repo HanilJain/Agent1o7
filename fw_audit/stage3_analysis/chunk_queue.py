@@ -159,6 +159,22 @@ class ChunkQueue:
         self.acked.append(handle)
         self._queue.task_done()
 
+    def abandon(self, handle: ChunkHandle) -> None:
+        """Signal `task_done()` for `handle` WITHOUT recording it as
+        acked/failed and WITHOUT re-queueing a retry — used only when
+        `_worker` is re-raising a `BaseException` (e.g.
+        `observability.usage.UsageBudgetExceededError` from a
+        "stop"-mode usage budget), i.e. the whole run is aborting, not
+        just this one chunk. Without this, `close()`'s `self._queue.join()`
+        would block forever: `_worker`'s `except Exception` clause (which
+        calls `nack()`) deliberately does NOT catch a `BaseException`, so
+        neither `ack()` nor `nack()` ever runs for that `get()` — `join()`
+        has no way to know it's done. `abandon()` is the minimal fix: it
+        satisfies `join()`'s bookkeeping without pretending the chunk
+        succeeded or scheduling a pointless retry the run is about to
+        abort anyway."""
+        self._queue.task_done()
+
     async def nack(self, handle: ChunkHandle) -> None:
         """Signal `task_done()` for `handle`'s `get()` (its attempt is
         over, successful or not), then either re-queue a NEW handle with
@@ -220,7 +236,17 @@ async def _worker(queue: ChunkQueue, consumer: Consumer) -> None:
     enumerate (network errors, timeouts, rate limits, malformed responses)
     — an unknown failure should retry/eventually-fail gracefully via
     `nack()`, not crash the whole worker pool and lose every other
-    in-flight chunk's progress."""
+    in-flight chunk's progress.
+
+    A `BaseException` that ISN'T an `Exception` (e.g.
+    `observability.usage.UsageBudgetExceededError`, deliberately not an
+    `Exception` subclass so it isn't silently retried past a usage
+    budget — see that class's docstring) is different: it must propagate
+    out of this worker to abort the whole run via `asyncio.gather`, not
+    be swallowed into a per-chunk retry. But it must still call
+    `queue.abandon(handle)` first — see that method's docstring for why
+    `close()`'s `join()` would otherwise hang forever waiting on a
+    `task_done()` that neither `ack()` nor `nack()` ever supplied."""
     async for handle in queue:
         try:
             await consumer(handle)
@@ -233,6 +259,9 @@ async def _worker(queue: ChunkQueue, consumer: Consumer) -> None:
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
             await queue.nack(handle)
+        except BaseException:
+            queue.abandon(handle)
+            raise
         else:
             queue.ack(handle)
 

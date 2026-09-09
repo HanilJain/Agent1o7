@@ -71,6 +71,12 @@ from pathlib import Path
 
 from fw_audit.config.settings import get_settings
 from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import layout as usage_layout
+from fw_audit.observability.usage import (
+    UsageBudgetExceededError,
+    format_usage_summary,
+    usage_registry,
+)
 from fw_audit.stage3_analysis import layout
 from fw_audit.stage3_analysis.agent.orchestrator import AnalystModelUnavailableError, run_analysis
 from fw_audit.stage3_analysis.chunk_index import load_chunk_selection, resolve_chunk_handles
@@ -199,6 +205,40 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Force-disable LangSmith tracing for this run, overriding LANGSMITH_TRACING.",
     )
+    parser.add_argument(
+        "--usage",
+        dest="usage",
+        action="store_true",
+        default=None,
+        help="Print the LLM token/cost usage summary at the end of this run (default: on).",
+    )
+    parser.add_argument(
+        "--no-usage",
+        dest="usage",
+        action="store_false",
+        help="Suppress the LLM token/cost usage summary.",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=None,
+        metavar="RPS",
+        help=(
+            "Cap LLM requests-per-second for this run (default: FWA_LLM_RATE_LIMIT_RPS, "
+            "0 = unlimited). Shared across every model resolving to the same provider."
+        ),
+    )
+    parser.add_argument(
+        "--max-cost",
+        type=float,
+        default=None,
+        metavar="USD",
+        help=(
+            "Warn-only budget on estimated USD cost for this run (default: "
+            "FWA_LLM_MAX_COST_USD, 0 = unlimited) — logs a warning and flags the "
+            "usage report/console summary; the run itself is never aborted."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -290,6 +330,11 @@ def main(argv: list[str] | None = None) -> int:
         settings = settings.model_copy(update={"stage3_analyst_model": args.model})
     if args.trace is not None:
         settings = settings.model_copy(update={"langsmith_tracing": args.trace})
+    if args.rate_limit is not None:
+        settings = settings.model_copy(update={"llm_rate_limit_rps": args.rate_limit})
+    if args.max_cost is not None:
+        settings = settings.model_copy(update={"llm_max_cost_usd": args.max_cost})
+    show_usage = args.usage if args.usage is not None else settings.llm_usage_console
     configure_tracing(settings)
 
     try:
@@ -313,54 +358,86 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Chunk index: {layout.chunk_index_path(stage3_dir)}")
 
     chunk_handles = None
-    if args.analyze:
-        assert chunk_selection is not None  # guaranteed by the exit-2 check above
-        try:
-            chunk_handles, resolve_warnings = resolve_chunk_handles(
-                chunk_selection, report=report
-            )
-        except Stage3InputError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        for w in resolve_warnings:
-            print(f"warning: {w}", file=sys.stderr)
-        print(
-            f"\nSelected chunks: {len(chunk_handles)} (chunking skipped; "
-            f"from {args.chunks_file})"
-        )
-
-        try:
-            analysis_summary, queue_summary = asyncio.run(
-                run_analysis(
-                    report,
-                    settings=settings,
-                    run_id=args.run_id,
-                    chunk_handles=chunk_handles,
+    usage_dir_ = usage_layout.usage_dir(report.db_subfolder)
+    with usage_registry(
+        jsonl_path=(
+            usage_layout.usage_jsonl_path(usage_dir_, stage="3", run_id=args.run_id or "run")
+            if settings.llm_usage_artifact
+            else None
+        ),
+        settings=settings,
+    ) as registry:
+        if args.analyze:
+            assert chunk_selection is not None  # guaranteed by the exit-2 check above
+            try:
+                chunk_handles, resolve_warnings = resolve_chunk_handles(
+                    chunk_selection, report=report
                 )
+            except Stage3InputError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            for w in resolve_warnings:
+                print(f"warning: {w}", file=sys.stderr)
+            print(
+                f"\nSelected chunks: {len(chunk_handles)} (chunking skipped; "
+                f"from {args.chunks_file})"
             )
-        except AnalystModelUnavailableError as exc:
-            print(f"error: analyst model unavailable: {exc}", file=sys.stderr)
-            return 2
-        print(
-            f"\nQueue: {queue_summary.total_chunks} chunks, {queue_summary.total_acked} acked, "
-            f"{queue_summary.total_failed} failed"
-        )
-        print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
-        print(
-            f"Analysis ({analysis_summary.model}): {analysis_summary.total_analyzed} analyzed, "
-            f"{analysis_summary.total_failed} failed, {analysis_summary.total_skipped} skipped, "
-            f"{analysis_summary.total_findings} findings"
-        )
-        print(f"Findings: {layout.findings_dir(stage3_dir)}/<chunk_id>.json")
-        print(f"Analysis summary: {layout.analysis_summary_path(stage3_dir)}")
-    elif args.queue:
-        summary = asyncio.run(run_queue(report, settings=settings, run_id=args.run_id))
-        print(
-            f"\nQueue: {summary.total_chunks} chunks, {summary.total_acked} acked, "
-            f"{summary.total_failed} failed"
-        )
-        print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
-        print(f"Chunk index: {layout.chunk_index_path(stage3_dir)}")
+
+            try:
+                analysis_summary, queue_summary = asyncio.run(
+                    run_analysis(
+                        report,
+                        settings=settings,
+                        run_id=args.run_id,
+                        chunk_handles=chunk_handles,
+                    )
+                )
+            except AnalystModelUnavailableError as exc:
+                print(f"error: analyst model unavailable: {exc}", file=sys.stderr)
+                return 2
+            except UsageBudgetExceededError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(
+                f"\nQueue: {queue_summary.total_chunks} chunks, "
+                f"{queue_summary.total_acked} acked, {queue_summary.total_failed} failed"
+            )
+            print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
+            print(
+                f"Analysis ({analysis_summary.model}): {analysis_summary.total_analyzed} "
+                f"analyzed, {analysis_summary.total_failed} failed, "
+                f"{analysis_summary.total_skipped} skipped, "
+                f"{analysis_summary.total_findings} findings"
+            )
+            print(f"Findings: {layout.findings_dir(stage3_dir)}/<chunk_id>.json")
+            print(f"Analysis summary: {layout.analysis_summary_path(stage3_dir)}")
+        elif args.queue:
+            try:
+                summary = asyncio.run(run_queue(report, settings=settings, run_id=args.run_id))
+            except UsageBudgetExceededError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(
+                f"\nQueue: {summary.total_chunks} chunks, {summary.total_acked} acked, "
+                f"{summary.total_failed} failed"
+            )
+            print(f"Stage 3 summary: {layout.stage3_summary_path(stage3_dir)}")
+            print(f"Chunk index: {layout.chunk_index_path(stage3_dir)}")
+
+        if settings.llm_usage_artifact:
+            registry.write_report(
+                usage_layout.usage_report_path(
+                    usage_dir_, stage="3", run_id=args.run_id or "run"
+                ),
+                stage="3",
+                run_id=args.run_id or "",
+            )
+        if show_usage:
+            summary_text = format_usage_summary(
+                registry.snapshot(stage="3", run_id=args.run_id or "")
+            )
+            if summary_text:
+                print(f"\n{summary_text}")
 
     flush_traces()
     return 1 if (not report.targets and chunk_handles is None) else 0

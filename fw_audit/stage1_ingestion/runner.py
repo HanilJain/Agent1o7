@@ -16,7 +16,14 @@ import uuid
 from pathlib import Path
 
 from fw_audit.common.schemas import extension_from_path
-from fw_audit.config.settings import get_settings
+from fw_audit.config.settings import Settings, get_settings
+from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import layout as usage_layout
+from fw_audit.observability.usage import (
+    UsageBudgetExceededError,
+    format_usage_summary,
+    usage_registry,
+)
 from fw_audit.stage1_ingestion.graph import get_graph
 from fw_audit.stage1_ingestion.state import IngestionStatus, initial_state
 
@@ -53,6 +60,46 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--run-id", type=str, default=None, help="Run identifier for logging (default: random)."
     )
+    parser.add_argument(
+        "--usage",
+        dest="usage",
+        action="store_true",
+        default=None,
+        help="Print the LLM token/cost usage summary at the end of this run (default: on).",
+    )
+    parser.add_argument(
+        "--no-usage",
+        dest="usage",
+        action="store_false",
+        help="Suppress the LLM token/cost usage summary.",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=None,
+        metavar="RPS",
+        help="Cap LLM requests-per-second for this run (default: FWA_LLM_RATE_LIMIT_RPS).",
+    )
+    parser.add_argument(
+        "--max-cost",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Warn-only budget on estimated USD cost for this run (default: FWA_LLM_MAX_COST_USD).",
+    )
+    parser.add_argument(
+        "--trace",
+        dest="trace",
+        action="store_true",
+        default=None,
+        help="Force-enable LangSmith tracing for this run, overriding LANGSMITH_TRACING.",
+    )
+    parser.add_argument(
+        "--no-trace",
+        dest="trace",
+        action="store_false",
+        help="Force-disable LangSmith tracing for this run, overriding LANGSMITH_TRACING.",
+    )
     return parser.parse_args(argv)
 
 
@@ -62,9 +109,10 @@ async def run_ingestion(
     is_tplink: bool = False,
     db_subfolder_name: str | None = None,
     run_id: str | None = None,
+    settings: Settings | None = None,
 ):
     """Run the Stage 1 graph end-to-end and return the final state."""
-    settings = get_settings()
+    settings = settings or get_settings()
     settings.ensure_dirs()
 
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -120,15 +168,63 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: firmware path does not exist or is not a file: {firmware_path}", file=sys.stderr)
         return 2
 
-    result = asyncio.run(
-        run_ingestion(
-            str(firmware_path),
-            is_tplink=args.tplink,
-            db_subfolder_name=args.db_subfolder,
-            run_id=args.run_id,
-        )
-    )
-    _print_summary(result)
+    settings = get_settings()
+    if args.trace is not None:
+        settings = settings.model_copy(update={"langsmith_tracing": args.trace})
+    if args.rate_limit is not None:
+        settings = settings.model_copy(update={"llm_rate_limit_rps": args.rate_limit})
+    if args.max_cost is not None:
+        settings = settings.model_copy(update={"llm_max_cost_usd": args.max_cost})
+    show_usage = args.usage if args.usage is not None else settings.llm_usage_console
+    configure_tracing(settings)
+
+    run_id = args.run_id or "run"
+    # `db_subfolder` isn't known until `run_ingestion` resolves the stem, so
+    # the JSONL path is built from the SAME `settings.db_subfolder(stem)`
+    # logic `run_ingestion` uses internally — see that function's body.
+    stem = args.db_subfolder or firmware_path.stem
+    usage_dir_ = usage_layout.usage_dir(settings.db_subfolder(stem))
+
+    try:
+        with usage_registry(
+            jsonl_path=(
+                usage_layout.usage_jsonl_path(usage_dir_, stage="1", run_id=run_id)
+                if settings.llm_usage_artifact
+                else None
+            ),
+            settings=settings,
+        ) as registry:
+            try:
+                result = asyncio.run(
+                    run_ingestion(
+                        str(firmware_path),
+                        is_tplink=args.tplink,
+                        db_subfolder_name=args.db_subfolder,
+                        run_id=args.run_id,
+                        settings=settings,
+                    )
+                )
+            except UsageBudgetExceededError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            finally:
+                if settings.llm_usage_artifact:
+                    registry.write_report(
+                        usage_layout.usage_report_path(usage_dir_, stage="1", run_id=run_id),
+                        stage="1",
+                        run_id=args.run_id or "",
+                    )
+
+            _print_summary(result)
+
+            if show_usage:
+                summary_text = format_usage_summary(
+                    registry.snapshot(stage="1", run_id=args.run_id or "")
+                )
+                if summary_text:
+                    print(f"\n{summary_text}")
+    finally:
+        flush_traces()
 
     # Emit a machine-readable summary alongside the human one, for scripted
     # callers (Stage 2). Per the policy, this JSON — not the Database — is

@@ -31,6 +31,12 @@ from pathlib import Path
 
 from fw_audit.config.settings import get_settings
 from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import layout as usage_layout
+from fw_audit.observability.usage import (
+    UsageBudgetExceededError,
+    format_usage_summary,
+    usage_registry,
+)
 from fw_audit.stage3b_claims import layout
 from fw_audit.stage3b_claims.debug import debug_extract, debug_resolve, debug_segment
 from fw_audit.stage3b_claims.driver import ExtractorModelUnavailableError, ingest_report
@@ -85,6 +91,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--debug", action="store_true",
         help="Write stage3b/debug/<doc_stem>.blocks.json (segmenter output) alongside the run.",
     )
+    ingest_parser.add_argument(
+        "--usage", dest="usage", action="store_true", default=None,
+        help="Print the LLM token/cost usage summary at the end of this run (default: on).",
+    )
+    ingest_parser.add_argument(
+        "--no-usage", dest="usage", action="store_false",
+        help="Suppress the LLM token/cost usage summary.",
+    )
+    ingest_parser.add_argument(
+        "--rate-limit", type=float, default=None, metavar="RPS",
+        help="Cap LLM requests-per-second for this run (default: FWA_LLM_RATE_LIMIT_RPS).",
+    )
+    ingest_parser.add_argument(
+        "--max-cost", type=float, default=None, metavar="USD",
+        help="Warn-only budget on estimated USD cost for this run (default: FWA_LLM_MAX_COST_USD).",
+    )
 
     debug_parser = subparsers.add_parser("debug", help="Zero-token inspection commands.")
     debug_sub = debug_parser.add_subparsers(dest="debug_command", required=True)
@@ -125,41 +147,74 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         settings = settings.model_copy(update={"stage3b_extractor_model": args.model})
     if args.trace is not None:
         settings = settings.model_copy(update={"langsmith_tracing": args.trace})
+    if args.rate_limit is not None:
+        settings = settings.model_copy(update={"llm_rate_limit_rps": args.rate_limit})
+    if args.max_cost is not None:
+        settings = settings.model_copy(update={"llm_max_cost_usd": args.max_cost})
+    show_usage = args.usage if args.usage is not None else settings.llm_usage_console
     configure_tracing(settings)
 
-    try:
-        summary = asyncio.run(
-            ingest_report(
-                pdf_path,
-                db_subfolder=db_subfolder,
-                settings=settings,
-                run_id=args.run_id,
-                pages=args.pages,
-                write_debug_blocks=args.debug,
+    run_id = args.run_id or "run"
+    usage_dir_ = usage_layout.usage_dir(db_subfolder)
+    with usage_registry(
+        jsonl_path=(
+            usage_layout.usage_jsonl_path(usage_dir_, stage="3b", run_id=run_id)
+            if settings.llm_usage_artifact
+            else None
+        ),
+        settings=settings,
+    ) as registry:
+        try:
+            summary = asyncio.run(
+                ingest_report(
+                    pdf_path,
+                    db_subfolder=db_subfolder,
+                    settings=settings,
+                    run_id=args.run_id,
+                    pages=args.pages,
+                    write_debug_blocks=args.debug,
+                )
             )
-        )
-    except Stage3bInputError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        flush_traces()
-        return 2
-    except ExtractorModelUnavailableError as exc:
-        print(f"error: extractor model unavailable: {exc}", file=sys.stderr)
-        flush_traces()
-        return 2
+        except Stage3bInputError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            flush_traces()
+            return 2
+        except ExtractorModelUnavailableError as exc:
+            print(f"error: extractor model unavailable: {exc}", file=sys.stderr)
+            flush_traces()
+            return 2
+        except UsageBudgetExceededError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            flush_traces()
+            return 1
+        finally:
+            if settings.llm_usage_artifact:
+                registry.write_report(
+                    usage_layout.usage_report_path(usage_dir_, stage="3b", run_id=run_id),
+                    stage="3b",
+                    run_id=args.run_id or "",
+                )
 
-    stage3b_dir_ = layout.stage3b_dir(db_subfolder)
-    print(
-        f"Document: {summary.doc_stem} "
-        f"({summary.page_count} pages, {summary.block_count} blocks)"
-    )
-    print(f"Model: {summary.model}")
-    print(
-        f"Claims: {summary.total_claims} total, {summary.total_emitted} emitted, "
-        f"{summary.total_failed} failed, {summary.total_unresolved_binary} with an "
-        f"unresolved binary"
-    )
-    print(f"Findings: {layout.findings_dir(stage3b_dir_)}/<chunk_id>.json")
-    print(f"Summary: {layout.claims_summary_path(stage3b_dir_)}")
+        stage3b_dir_ = layout.stage3b_dir(db_subfolder)
+        print(
+            f"Document: {summary.doc_stem} "
+            f"({summary.page_count} pages, {summary.block_count} blocks)"
+        )
+        print(f"Model: {summary.model}")
+        print(
+            f"Claims: {summary.total_claims} total, {summary.total_emitted} emitted, "
+            f"{summary.total_failed} failed, {summary.total_unresolved_binary} with an "
+            f"unresolved binary"
+        )
+        print(f"Findings: {layout.findings_dir(stage3b_dir_)}/<chunk_id>.json")
+        print(f"Summary: {layout.claims_summary_path(stage3b_dir_)}")
+
+        if show_usage:
+            summary_text = format_usage_summary(
+                registry.snapshot(stage="3b", run_id=args.run_id or "")
+            )
+            if summary_text:
+                print(f"\n{summary_text}")
 
     flush_traces()
     return 1 if summary.status in ("no_claims", "pdf_unreadable") else 0
