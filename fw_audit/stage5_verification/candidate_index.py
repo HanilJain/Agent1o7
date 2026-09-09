@@ -205,11 +205,23 @@ def discover_candidates(
     db_subfolder: Path,
     *,
     decisions: frozenset[Decision] = DEFAULT_DECISIONS,
+    findings_dir: Path | None = None,
 ) -> list[VerificationCandidate]:
     """Globs `<db_subfolder>/stage3/findings/*.json`, loads each as an
     `AnalysisReport`, and flattens every `Finding` whose `decision` is in
     `decisions` into a `VerificationCandidate` — resolving `source_path`
     against `stage2_summary.json` along the way.
+
+    `findings_dir`, if given, overrides the derived
+    `<db_subfolder>/stage3/findings` location entirely — the hook
+    `fw-verify run --claims` uses to point discovery at
+    `<db_subfolder>/stage3b/findings` (Stage 3b's externally-sourced PDF
+    report claims, see `stage3b_claims.layout.findings_dir`) instead. This
+    does NOT relax the "Stage 3 findings only, never `stage4/taint/*.json`"
+    hard constraint documented in this stage's CLAUDE.md — it's the same
+    `AnalysisReport` shape either way, just a different (still explicitly
+    selected, never chained-in) source of it. `None` (default) preserves
+    the original Stage-3-only behavior exactly.
 
     Raises `Stage5InputError` if `stage2_summary.json` itself can't be
     loaded (needed for EVERY candidate's `source_path`) — fails fast,
@@ -220,11 +232,11 @@ def discover_candidates(
     `sink_index.discover_sink_candidates`'s discipline.
     """
     stage3_dir = db_subfolder / "stage3"
-    findings_dir = stage3_dir / "findings"
-    if not findings_dir.is_dir():
+    target_findings_dir = findings_dir if findings_dir is not None else stage3_dir / "findings"
+    if not target_findings_dir.is_dir():
         return []
 
-    findings_paths = sorted(findings_dir.glob("*.json"))
+    findings_paths = sorted(target_findings_dir.glob("*.json"))
     if not findings_paths:
         # Nothing to resolve a source path for — don't require
         # stage2_summary.json to exist just to return an empty list.

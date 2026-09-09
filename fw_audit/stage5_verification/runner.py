@@ -175,6 +175,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(Settings.stage5_command_log=False) — the LangSmith span record (if --trace is "
         "also passed) is unaffected either way.",
     )
+    run.add_argument(
+        "--claims",
+        action="store_true",
+        help=(
+            "Read <db_subfolder>/stage3b/findings/ (Stage 3b's externally-sourced PDF "
+            "report claims — see `fw-claims ingest`) instead of Stage 3's own "
+            "<db_subfolder>/stage3/findings/."
+        ),
+    )
 
     dbg = sub.add_parser("debug", help="Inspect/verify one component in isolation.")
     dbg_sub = dbg.add_subparsers(dest="debug_command", required=True)
@@ -303,6 +312,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     summary_path_fn = (
         layout.stage5_summary_path if joern_only else layout.fvvw_summary_path
     )
+    findings_dir = (
+        (db_subfolder / "stage3b" / "findings") if getattr(args, "claims", False) else None
+    )
 
     try:
         summary = asyncio.run(
@@ -311,6 +323,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 settings=settings,
                 only_global_ids=only,
                 run_id=args.run_id,
+                findings_dir=findings_dir,
                 **decisions_kwargs,
             )
         )

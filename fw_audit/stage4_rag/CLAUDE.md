@@ -46,6 +46,7 @@ fw-trace build-corpus --db-subfolder data/db/<stem> \
   --stage2-binaries data/db/<stem>/stage2/binaries
 
 fw-trace run --db-subfolder data/db/<stem>
+fw-trace run --db-subfolder data/db/<stem> --claims  # Stage 3b's PDF-report claims instead
 fw-trace debug corpus --db-subfolder data/db/<stem>
 fw-trace debug parity
 fw-trace debug taint --db-subfolder data/db/<stem> --gid "<chunk_id>::<finding_id>"
@@ -54,8 +55,10 @@ fw-trace debug taint --db-subfolder data/db/<stem> --gid "<chunk_id>::<finding_i
 ## Input
 
 Stage 1's rootfs directory + Stage 2's `stage2/binaries/` (C1+C2); Stage 3's
-`stage3/findings/*.json` (C0/C6) — never `stage3_summary.json`/
-`analysis_summary.json`, both best-effort and often absent.
+`stage3/findings/*.json` (C0/C6), or with `--claims`, Stage 3b's
+`stage3b/findings/*.json` (see `fw-claims ingest`) — never
+`stage3_summary.json`/`analysis_summary.json`, both best-effort and often
+absent.
 
 ## Output — `<db_subfolder>/stage4/`
 

@@ -101,13 +101,18 @@ fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report
 # decisive verdict, forces stage5_workers=1
 fw-verify run --db-subfolder data/db/<stem> --hitl=prompt \
     --max-iterations 10 --dynamic-max-iterations 8
+
+# Verify Stage 3b's externally-sourced PDF report claims instead of
+# Stage 3's own findings (see fw_audit/stage3b_claims/README.md)
+fw-verify run --db-subfolder data/db/<stem> --claims
 ```
 
 ## Input
 
-`stage3/findings/*.json` (Stage 3) + `stage2/stage2_summary.json` (Stage 2
-— resolves the static track's decompiled C AND, new for the dynamic track,
-the real ELF/rootfs/arch facts).
+`stage3/findings/*.json` (Stage 3), or `stage3b/findings/*.json` (Stage 3b,
+with `--claims`) + `stage2/stage2_summary.json` (Stage 2 — resolves the
+static track's decompiled C AND, new for the dynamic track, the real
+ELF/rootfs/arch facts).
 
 ## Output
 

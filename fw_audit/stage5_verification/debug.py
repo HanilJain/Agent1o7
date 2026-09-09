@@ -91,20 +91,29 @@ async def debug_run_script(
     )
 
 
-def find_candidate(db_subfolder: Path, global_id: str) -> VerificationCandidate:
+def find_candidate(
+    db_subfolder: Path, global_id: str, *, claims: bool = False
+) -> VerificationCandidate:
     """Look up one candidate by its `global_id`, scanning EVERY `Decision`
     value (not just `DEFAULT_DECISIONS`) — debug tooling should never
     silently hide an item the user explicitly asked for by id, mirroring
     `stage4_rag.debug._find_candidate`'s exact precedent. Public (no
     leading underscore) so `fvvw.debug`'s own debug entry points can reuse
-    this lookup instead of re-deriving it."""
+    this lookup instead of re-deriving it.
+
+    `claims=True` scans `<db_subfolder>/stage3b/findings/` (Stage 3b's
+    externally-sourced PDF report claims) instead of Stage 3's own."""
     from fw_audit.common.findings import Decision
 
-    all_candidates = discover_candidates(db_subfolder, decisions=frozenset(Decision))
+    findings_dir = (db_subfolder / "stage3b" / "findings") if claims else None
+    all_candidates = discover_candidates(
+        db_subfolder, decisions=frozenset(Decision), findings_dir=findings_dir
+    )
     for candidate in all_candidates:
         if candidate.global_id == global_id:
             return candidate
-    raise ValueError(f"No finding with global_id {global_id!r} found under {db_subfolder}/stage3")
+    source = "stage3b" if claims else "stage3"
+    raise ValueError(f"No finding with global_id {global_id!r} found under {db_subfolder}/{source}")
 
 
 _find_candidate = find_candidate

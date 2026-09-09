@@ -54,6 +54,7 @@ def discover_sink_candidates(
     stage3_dir: Path,
     *,
     decisions: frozenset[Decision] = DEFAULT_DECISIONS,
+    findings_dir: Path | None = None,
 ) -> list[SinkCandidate]:
     """Globs `stage3_dir/findings/*.json`, loads each as an `AnalysisReport`,
     and flattens every `Finding` whose `decision` is in `decisions` into a
@@ -61,13 +62,22 @@ def discover_sink_candidates(
     skipped rather than aborting the whole scan — mirrors the rest of this
     pipeline's "per-item problems don't abort the run" discipline (see
     `stage3_analysis.ingest`'s `SkippedTarget` precedent).
+
+    `findings_dir`, if given, OVERRIDES the derived `stage3_dir/findings`
+    location entirely — the hook `fw-trace run --claims` uses to point
+    this same discovery logic at `stage3b/findings/` (Stage 3b's
+    externally-sourced claims — see `stage3b_claims.layout.findings_dir`)
+    instead of Stage 3's own findings. `AnalysisReport`'s on-disk shape and
+    the `#` -> `__` filename convention are identical either way, so no
+    other logic in this function needs to change. `None` (default)
+    preserves the original behavior exactly.
     """
-    findings_dir = stage3_dir / "findings"
-    if not findings_dir.is_dir():
+    target_dir = findings_dir if findings_dir is not None else stage3_dir / "findings"
+    if not target_dir.is_dir():
         return []
 
     candidates: list[SinkCandidate] = []
-    for path in sorted(findings_dir.glob("*.json")):
+    for path in sorted(target_dir.glob("*.json")):
         try:
             report = AnalysisReport.model_validate_json(path.read_text(encoding="utf-8"))
         except (OSError, ValidationError, ValueError) as exc:

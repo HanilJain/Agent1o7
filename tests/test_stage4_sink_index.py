@@ -111,3 +111,27 @@ def test_discover_sink_candidates_custom_decisions(tmp_path):
 
 def test_default_decisions_are_escalate_and_context_required():
     assert frozenset({Decision.ESCALATE, Decision.CONTEXT_REQUIRED}) == DEFAULT_DECISIONS
+
+
+def test_findings_dir_override_reads_from_alternate_location(tmp_path):
+    """Stage 3b's `--claims` hook: an explicit `findings_dir` must be read
+    INSTEAD of `stage3_dir/findings`, even when the latter also exists."""
+    stage3_dir = tmp_path / "stage3"
+    _write_report(
+        stage3_dir / "findings", "stage3bin#0000", [_finding("from_stage3", Decision.ESCALATE)]
+    )
+    alt_dir = tmp_path / "stage3b" / "findings"
+    _write_report(alt_dir, "stage3bbin#9000", [_finding("from_stage3b", Decision.ESCALATE)])
+
+    candidates = discover_sink_candidates(stage3_dir, findings_dir=alt_dir)
+
+    assert {c.finding.finding_id for c in candidates} == {"from_stage3b"}
+
+
+def test_findings_dir_none_preserves_default_behavior(tmp_path):
+    stage3_dir = tmp_path / "stage3"
+    _write_report(stage3_dir / "findings", "bin#0000", [_finding("c1", Decision.ESCALATE)])
+
+    candidates = discover_sink_candidates(stage3_dir, findings_dir=None)
+
+    assert {c.finding.finding_id for c in candidates} == {"c1"}

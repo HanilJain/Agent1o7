@@ -26,7 +26,8 @@ required for any part of the pipeline.
    Stage 2's cleaned decompiled C (`cleaned/whole.c` per binary) is
    **excluded by default** — set `FWA_STAGE4_INCLUDE_DECOMPILED_C=true`
    (`Settings.stage4_include_decompiled_c`) to fold it back in.
-2. **`fw-trace run`** (C3-C6) — for each Stage 3 finding with
+2. **`fw-trace run`** (C3-C6) — for each Stage 3 finding (or, with
+   `--claims`, Stage 3b's externally-sourced claim) with
    `decision in {ESCALATE, CONTEXT_REQUIRED}`: generates 4-5 search
    queries (C3), retrieves + merges top-k matching chunks (C4, embedding
    queries with the exact same model as step 1), and reasons over the
@@ -47,6 +48,7 @@ fw-trace build-corpus --db-subfolder data/db/<stem> \
   --stage2-binaries data/db/<stem>/stage2/binaries
 
 fw-trace run --db-subfolder data/db/<stem>
+fw-trace run --db-subfolder data/db/<stem> --claims  # Stage 3b's PDF-report claims instead
 ```
 
 ## Optional: Colab path for C1+C2

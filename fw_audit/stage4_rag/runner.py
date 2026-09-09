@@ -82,6 +82,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--model-planner", type=str, default=None, metavar="PROVIDER:MODEL")
     run.add_argument("--model-analyst", type=str, default=None, metavar="PROVIDER:MODEL")
     run.add_argument("--run-id", type=str, default=None)
+    run.add_argument(
+        "--claims",
+        action="store_true",
+        help=(
+            "Read <db_subfolder>/stage3b/findings/ (Stage 3b's externally-sourced PDF "
+            "report claims — see `fw-claims ingest`) instead of Stage 3's own "
+            "<db_subfolder>/stage3/findings/."
+        ),
+    )
 
     dbg = sub.add_parser("debug", help="Inspect/verify one component in isolation.")
     dbg_sub = dbg.add_subparsers(dest="debug_command", required=True)
@@ -153,6 +162,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     db_subfolder = Path(args.db_subfolder)
     only = frozenset(args.only) if args.only else None
+    findings_dir = (db_subfolder / "stage3b" / "findings") if args.claims else None
     try:
         summary = asyncio.run(
             run_queue(
@@ -160,6 +170,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 settings=settings,
                 only_global_ids=only,
                 run_id=args.run_id,
+                findings_dir=findings_dir,
             )
         )
     except (Stage4InputError, VectorStoreUnavailableError) as exc:

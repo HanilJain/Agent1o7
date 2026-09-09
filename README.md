@@ -76,6 +76,7 @@ fw_audit/
   stage1_ingestion/         # Stage 1 — see its CLAUDE.md/README.md
   stage2_extraction/        # Stage 2 — see its CLAUDE.md/README.md
   stage3_analysis/           # Stage 3 — see its CLAUDE.md/README.md
+  stage3b_claims/            # Stage 3b (PDF claim ingestion, parallel to Stage 3) — see its CLAUDE.md/README.md
   stage4_rag/                # Stage 4 — see its CLAUDE.md/README.md
   stage5_verification/        # Stage 5 (Joern agent) — see its CLAUDE.md/README.md
   stage6_reporting/          # Scaffolded, not yet implemented
@@ -143,9 +144,13 @@ fw-extract data/db/<firmware-stem>/stage1_summary.json # Stage 2
 fw-analyze data/db/<firmware-stem>/stage1_summary.json --queue
 fw-analyze data/db/<firmware-stem>/stage1_summary.json --analyze --chunks-file data/db/<firmware-stem>/stage3/chunk_index.json
 
+# Stage 3b (optional, parallel to Stage 3): transcribe a third-party PDF
+# report's claims into the same findings shape (see fw_audit/stage3b_claims/CLAUDE.md).
+fw-claims ingest report.pdf --db-subfolder data/db/<stem>
+
 fw-trace build-corpus --db-subfolder data/db/<stem> ...          # Stage 4
-fw-trace run --db-subfolder data/db/<stem>                       # Stage 4
-fw-verify run --db-subfolder data/db/<stem>                      # Stage 5
+fw-trace run --db-subfolder data/db/<stem>                       # Stage 4 (add --claims for Stage 3b)
+fw-verify run --db-subfolder data/db/<stem>                      # Stage 5 (add --claims for Stage 3b)
 ```
 
 Full flag reference, expected input/output, and debugging steps for each

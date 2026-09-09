@@ -163,6 +163,18 @@ class AgentRole(str, Enum):
     section from the completed STM — professional narrative composition,
     genuinely open-ended. Overridable via `FWA_STAGE5_REPORT_MODEL`,
     falling back to `stage5_verifier_model`."""
+    STAGE3B_CLAIM_EXTRACTOR = "stage3b_claim_extractor"
+    """Stage 3b's only LLM role (`stage3b_claims.agent.converter`): given
+    one claim-shaped block of PDF report TEXT (never the whole document —
+    see `stage3b_claims.segmenter`), returns a structured
+    `common.claims.ClaimExtractionBatch`. Deliberately routed to
+    `ModelTier.BALANCED`, not `HIGH_REASONING`, unlike every other
+    structured-output role in this table — this is cheap transcription of
+    what a report already states, not open-ended reasoning over
+    decompiled code, and the project owner confirmed this stage should
+    stay token-cheap (see `stage3b_claims/CLAUDE.md`). Runs once per claim
+    block, potentially dozens of times per report, across
+    `stage3b_workers` parallel workers."""
 
 
 @dataclass(frozen=True)
@@ -214,6 +226,14 @@ ROLE_TO_TIER: dict[AgentRole, ModelTier] = {
     # override either independently.
     AgentRole.STAGE5_STRATEGY_AGENT: ModelTier.HIGH_REASONING,
     AgentRole.STAGE5_REPORT_WRITER: ModelTier.HIGH_REASONING,
+    # Stage 3b is deliberately the ONE exception to this table's
+    # HIGH_REASONING-by-default pattern: it transcribes what a PDF report
+    # already states into a narrow schema, not open-ended reasoning over
+    # code — BALANCED is the right tier, and keeping this cheap is a
+    # confirmed project requirement (see AgentRole.STAGE3B_CLAIM_EXTRACTOR's
+    # docstring). `FWA_STAGE3B_EXTRACTOR_MODEL` overrides this role
+    # specifically if a stronger/weaker model is ever warranted.
+    AgentRole.STAGE3B_CLAIM_EXTRACTOR: ModelTier.BALANCED,
 }
 
 # ---------------------------------------------------------------------- #
@@ -277,6 +297,7 @@ _ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, tuple[str, ...]] = {
     AgentRole.STAGE5_RESULT_EVALUATOR: ("stage5_evaluator_model", "stage5_verifier_model"),
     AgentRole.STAGE5_STRATEGY_AGENT: ("stage5_strategy_model", "stage5_verifier_model"),
     AgentRole.STAGE5_REPORT_WRITER: ("stage5_report_model", "stage5_verifier_model"),
+    AgentRole.STAGE3B_CLAIM_EXTRACTOR: ("stage3b_extractor_model",),
 }
 
 

@@ -107,3 +107,26 @@ def test_stage3_llm_worker_defaults():
     assert settings.stage3_llm_retry_backoff_seconds == 2.0
     assert settings.stage3_max_chunk_tokens == 100_000
     assert settings.stage3_repair_attempts == 1
+
+
+def test_stage3b_extractor_model_override_from_env():
+    settings = Settings(_env_file=None, FWA_STAGE3B_EXTRACTOR_MODEL="ollama:qwen2.5-coder:1.5b")
+    assert settings.stage3b_extractor_model == "ollama:qwen2.5-coder:1.5b"
+
+
+def test_stage3b_defaults():
+    settings = Settings(_env_file=None)
+    assert settings.stage3b_extractor_model is None
+    assert settings.stage3b_workers == 4
+    assert settings.stage3b_repair_attempts == 1
+    assert settings.stage3b_structured_output_method == "json_schema"
+    assert settings.stage3b_max_block_chars == 12_000
+    assert settings.stage3b_llm_timeout_seconds == 120
+    assert settings.stage3b_log_prompts is False
+
+
+def test_stage3b_dir_helper_creates_directory(tmp_path):
+    settings = Settings(_env_file=None, FWA_DATABASE_DIR=str(tmp_path / "db"))
+    path = settings.stage3b_dir("my_firmware")
+    assert path == tmp_path / "db" / "my_firmware" / "stage3b"
+    assert path.is_dir()

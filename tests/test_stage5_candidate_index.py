@@ -212,3 +212,39 @@ def test_malformed_stage2_summary_raises(tmp_path):
 
     with pytest.raises(Stage5InputError, match="does not match the Stage2Summary contract"):
         discover_candidates(tmp_path)
+
+
+def test_findings_dir_override_reads_from_alternate_location(tmp_path):
+    """Stage 3b's `--claims` hook: an explicit `findings_dir` must be read
+    INSTEAD of `<db_subfolder>/stage3/findings`, even when the latter also
+    exists — the source of the Joern-C resolution (stage2_summary.json)
+    doesn't change either way."""
+    bin_id = "sbin_httpd__abc123"
+    relpath = f"stage2/binaries/{bin_id}/normalized/joern/whole.c"
+    _write_report(
+        tmp_path / "stage3" / "findings",
+        f"{bin_id}#0000",
+        [_finding("from_stage3", Decision.ESCALATE)],
+    )
+    alt_dir = tmp_path / "stage3b" / "findings"
+    _write_report(alt_dir, f"{bin_id}#9000", [_finding("from_stage3b", Decision.ESCALATE)])
+    _write_stage2_summary(tmp_path, bin_id=bin_id, normalized_joern_c_relpath=relpath)
+    _write_joern_c(tmp_path, relpath)
+
+    candidates = discover_candidates(tmp_path, findings_dir=alt_dir)
+
+    assert {c.finding.finding_id for c in candidates} == {"from_stage3b"}
+
+
+def test_findings_dir_none_preserves_default_behavior(tmp_path):
+    bin_id = "sbin_httpd__abc123"
+    relpath = f"stage2/binaries/{bin_id}/normalized/joern/whole.c"
+    _write_report(
+        tmp_path / "stage3" / "findings", f"{bin_id}#0000", [_finding("c1", Decision.ESCALATE)]
+    )
+    _write_stage2_summary(tmp_path, bin_id=bin_id, normalized_joern_c_relpath=relpath)
+    _write_joern_c(tmp_path, relpath)
+
+    candidates = discover_candidates(tmp_path, findings_dir=None)
+
+    assert {c.finding.finding_id for c in candidates} == {"c1"}

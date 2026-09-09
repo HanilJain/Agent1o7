@@ -380,6 +380,54 @@ class Settings(BaseSettings):
     source text and would otherwise flood the console on every one of
     potentially hundreds of chunk calls per firmware."""
 
+    # ---- Stage 3b: external claim ingestion (PDF -> Stage-3-compatible) --
+    stage3b_extractor_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE3B_EXTRACTOR_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE3B_CLAIM_EXTRACTOR`, same
+    `"<provider>:<model>"` syntax as `stage3_analyst_model`. Unlike Stage
+    3's analyst, this role defaults to `ModelTier.BALANCED` (see
+    `config.llm_config.ROLE_TO_TIER`) — this is cheap transcription, not
+    open-ended reasoning."""
+    stage3b_workers: int = Field(default=4, ge=1, le=16, validation_alias="FWA_STAGE3B_WORKERS")
+    """Concurrent claim-extraction tasks `driver.ingest_report()` runs, via
+    a plain `asyncio.Semaphore` — NOT Stage 3's `chunk_queue.ChunkQueue`
+    machinery. Stage 3b has no backpressure problem worth a disk-backed
+    queue: claim blocks are text already held in memory (from one PDF,
+    already bounded), not a firmware's entire chunk set."""
+    stage3b_repair_attempts: int = Field(
+        default=1, ge=0, validation_alias="FWA_STAGE3B_REPAIR_ATTEMPTS"
+    )
+    """Same repair-retry budget/semantics as `stage3_repair_attempts`,
+    applied to `agent.converter.extract_claims`."""
+    stage3b_structured_output_method: str = Field(
+        default="json_schema", validation_alias="FWA_STAGE3B_STRUCTURED_OUTPUT_METHOD"
+    )
+    """`method=` passed to `BaseChatModel.with_structured_output(...)` in
+    `agent.converter.extract_claims` — see `stage3_structured_output_method`'s
+    docstring for what each value does and why a local Ollama model may
+    need `"function_calling"` instead of the default."""
+    stage3b_max_block_chars: int = Field(
+        default=12_000, ge=500, validation_alias="FWA_STAGE3B_MAX_BLOCK_CHARS"
+    )
+    """Hard per-block character cap consumed by `segmenter.segment()` — the
+    main token-control lever for this stage (see that module's docstring).
+    Lower this to shrink each LLM call's input at the cost of more calls;
+    raise it to send fewer, larger calls."""
+    stage3b_llm_timeout_seconds: int = Field(
+        default=120, ge=1, validation_alias="FWA_STAGE3B_LLM_TIMEOUT_SECONDS"
+    )
+    """Per-block wall-clock cap on the extractor LLM call, enforced via
+    `asyncio.wait_for` in `driver.py`. Lower than `stage3_llm_timeout_seconds`
+    (300s) because a single narrow-schema block extraction is a much
+    smaller call than Stage 3's full chunk analysis."""
+    stage3b_log_prompts: bool = Field(
+        default=False, validation_alias="FWA_STAGE3B_LOG_PROMPTS"
+    )
+    """Same "opt-in, verbose debugging aid" discipline as
+    `stage3_log_prompts` — logs the full message list sent to the
+    extractor LLM at INFO level when true."""
+
     # ---- Stage 4: RAG sink-to-source identifier (local, all components) --
     stage4_embedding_model: str = Field(
         default="Qwen/Qwen3-Embedding-0.6B", validation_alias="FWA_STAGE4_EMBEDDING_MODEL"
@@ -715,6 +763,14 @@ class Settings(BaseSettings):
     def stage3_dir(self, firmware_stem: str) -> Path:
         """Return (and create) `<db_subfolder>/stage3/` for a firmware image."""
         path = self.db_subfolder(firmware_stem) / "stage3"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def stage3b_dir(self, firmware_stem: str) -> Path:
+        """Return (and create) `<db_subfolder>/stage3b/` for a firmware
+        image — Stage 3b's own directory, a sibling of `stage3_dir`, never
+        written into by Stage 3 itself."""
+        path = self.db_subfolder(firmware_stem) / "stage3b"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

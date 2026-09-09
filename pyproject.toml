@@ -44,6 +44,7 @@ all = [
     "langchain-openai>=1.0.0",
     "langsmith>=0.10",
     "langgraph-checkpoint-sqlite>=2.0",
+    "pdfplumber>=0.11",
 ]
 # LangSmith tracing for Stages 3 (agentic analysis), 4 (RAG) and 5
 # (verification) — see fw_audit/observability/. Already present as a
@@ -66,6 +67,20 @@ observability = ["langsmith>=0.10"]
 # tree-sitter-c==0.23.2 together are correct (sane row numbers, no crash, full file
 # parses in ~10s). Re-verify with the same reproduction before ever bumping either.
 stage2 = ["tree-sitter==0.23.2", "tree-sitter-c==0.23.2"]
+# Stage 3b's PDF text extraction (fw_audit.stage3b_claims.extractor) needs
+# a PDF library — the first one this project depends on. pdfplumber over
+# the lighter pypdf specifically for layout fidelity: extract_tables()
+# keeps a report's code listings/severity tables intact instead of
+# flattening them into ambiguous whitespace-separated text (see
+# extractor.py's module docstring). Imported LAZILY inside
+# extract_document(), never at module import time, so the unit suite never
+# needs this installed — same "lazy import, real dependency only when you
+# actually run the CLI" discipline as stage4's chromadb/sentence-
+# transformers and stage5-fvvw's sqlite checkpointer.
+pdf = ["pdfplumber>=0.11"]
+# Alias kept for symmetry with stage2/stage4/stage5's `pip install
+# -e ".[stageN]"` convention — identical to the `pdf` extra above.
+stage3b = ["pdfplumber>=0.11"]
 # Alias kept for backward compatibility with `pip install -e ".[stage3]"` — cleaning
 # moved from Stage 3 into Stage 2 (see stage2_extraction.clean), but the install
 # command shouldn't silently break for anyone still using the old extra name.
@@ -111,6 +126,7 @@ dev = [
 fw-ingest = "fw_audit.stage1_ingestion.runner:main"
 fw-extract = "fw_audit.stage2_extraction.runner:main"
 fw-analyze = "fw_audit.stage3_analysis.runner:main"
+fw-claims = "fw_audit.stage3b_claims.runner:main"
 fw-trace = "fw_audit.stage4_rag.runner:main"
 fw-verify = "fw_audit.stage5_verification.runner:main"
 

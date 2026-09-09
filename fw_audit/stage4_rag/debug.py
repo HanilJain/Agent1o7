@@ -105,15 +105,18 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def debug_sinks(
-    db_subfolder: Path, *, decisions: frozenset = DEFAULT_DECISIONS
+    db_subfolder: Path, *, decisions: frozenset = DEFAULT_DECISIONS, claims: bool = False
 ) -> list[SinkCandidate]:
     """Runs `sink_index.discover_sink_candidates` and returns the result —
-    the caller (CLI) prints counts by decision."""
+    the caller (CLI) prints counts by decision. `claims=True` reads
+    `<db_subfolder>/stage3b/findings/` (Stage 3b's externally-sourced PDF
+    report claims) instead of Stage 3's own findings."""
     stage3_dir = db_subfolder / "stage3"
-    return discover_sink_candidates(stage3_dir, decisions=decisions)
+    findings_dir = (db_subfolder / "stage3b" / "findings") if claims else None
+    return discover_sink_candidates(stage3_dir, decisions=decisions, findings_dir=findings_dir)
 
 
-def _find_candidate(db_subfolder: Path, global_id: str) -> SinkCandidate:
+def _find_candidate(db_subfolder: Path, global_id: str, *, claims: bool = False) -> SinkCandidate:
     # DEFAULT_DECISIONS may exclude the finding the caller wants to debug
     # (e.g. a DISCARD-decision finding) — debug tooling should never
     # silently hide an item the user explicitly asked for by id, so this
@@ -121,13 +124,15 @@ def _find_candidate(db_subfolder: Path, global_id: str) -> SinkCandidate:
     # default filter.
     from fw_audit.common.findings import Decision
 
+    findings_dir = (db_subfolder / "stage3b" / "findings") if claims else None
     all_candidates = discover_sink_candidates(
-        db_subfolder / "stage3", decisions=frozenset(Decision)
+        db_subfolder / "stage3", decisions=frozenset(Decision), findings_dir=findings_dir
     )
     for candidate in all_candidates:
         if candidate.global_id == global_id:
             return candidate
-    raise ValueError(f"No finding with global_id {global_id!r} found under {db_subfolder}/stage3")
+    source = "stage3b" if claims else "stage3"
+    raise ValueError(f"No finding with global_id {global_id!r} found under {db_subfolder}/{source}")
 
 
 async def debug_query(

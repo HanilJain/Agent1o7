@@ -14,9 +14,13 @@ cross-cutting concerns (Executor abstraction, LLM routing, Settings).
 
 - Never write into `stage2/`, `stage3/`, or `stage4/` — only into this
   stage's own `stage5/` directory.
-- `candidate_index.discover_candidates()` reads **Stage 3 findings only**
-  (`stage3/findings/*.json`) — never `stage4/taint/*.json`, even when
-  present. A deliberate scope choice, not an oversight.
+- `candidate_index.discover_candidates()` reads **Stage 3 (or, with
+  `--claims`, Stage 3b's externally-sourced) findings only**
+  (`stage3/findings/*.json`, or `stage3b/findings/*.json` when
+  `findings_dir=` is explicitly passed) — never `stage4/taint/*.json`, even
+  when present. A deliberate scope choice, not an oversight: `--claims`
+  swaps WHICH `AnalysisReport`-shaped directory is read, it never chains in
+  Stage 4's derived taint output.
 - **Never reintroduce `--param cpgPath=`.** The CPG is bound POSITIONALLY
   as `cpg` (`joern --script q.sc cpg.bin`) — `--param` only binds to a
   script-declared `@main def`, which a plain expression script doesn't
@@ -131,6 +135,11 @@ fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report
 # own budget without a decisive verdict; forces stage5_workers=1
 fw-verify run --db-subfolder data/db/<stem> --hitl=prompt \
     --max-iterations 10 --dynamic-max-iterations 8 --no-command-log
+
+# --claims: verify Stage 3b's externally-sourced PDF report claims instead
+# of Stage 3's own findings — reads stage3b/findings/ instead of
+# stage3/findings/; every other flag composes with it normally.
+fw-verify run --db-subfolder data/db/<stem> --claims
 ```
 
 `--model` sets `FWA_STAGE5_VERIFIER_MODEL`, which every Stage 5 LLM role
@@ -139,9 +148,10 @@ falls back to unless its own `FWA_STAGE5_*_MODEL` (`GENERATOR`/`EVALUATOR`/
 
 ## Input
 
-`stage3/findings/*.json` (Stage 3) + `stage2/stage2_summary.json` (Stage 2
-— resolves both the static track's `normalized/joern/whole.c` AND, new for
-the dynamic track, the real ELF via `rootfs_dir`/`DecompiledBinary.
+`stage3/findings/*.json` (Stage 3), or `stage3b/findings/*.json` (Stage 3b,
+with `--claims` — see `fw-claims ingest`) + `stage2/stage2_summary.json`
+(Stage 2 — resolves both the static track's `normalized/joern/whole.c` AND,
+new for the dynamic track, the real ELF via `rootfs_dir`/`DecompiledBinary.
 rootfs_path` plus `.elf`/`.functions`).
 
 ## Output — `data/db/<stem>/stage5/`

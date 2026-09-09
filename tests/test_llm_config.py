@@ -229,6 +229,30 @@ def test_agent_role_has_stage3_vuln_analyst_member():
     assert AgentRole.STAGE3_VULN_ANALYST.value == "stage3_vuln_analyst"
 
 
+def test_agent_role_has_stage3b_claim_extractor_member():
+    assert AgentRole.STAGE3B_CLAIM_EXTRACTOR.value == "stage3b_claim_extractor"
+
+
+def test_resolve_spec_stage3b_claim_extractor_is_balanced_not_high_reasoning():
+    """Confirmed project requirement: Stage 3b must stay cheap — the ONE
+    exception to this table's HIGH_REASONING-by-default pattern."""
+    from fw_audit.config.llm_config import ROLE_TO_TIER, ModelTier
+
+    assert ROLE_TO_TIER[AgentRole.STAGE3B_CLAIM_EXTRACTOR] == ModelTier.BALANCED
+
+
+def test_resolve_spec_stage3b_extractor_model_override(monkeypatch):
+    monkeypatch.setenv("FWA_STAGE3B_EXTRACTOR_MODEL", "ollama:qwen2.5-coder:1.5b")
+    _clear_settings_cache()
+    try:
+        spec = resolve_spec(AgentRole.STAGE3B_CLAIM_EXTRACTOR)
+        assert spec.provider == ModelProvider.OLLAMA
+        assert spec.model == "qwen2.5-coder:1.5b"
+    finally:
+        monkeypatch.delenv("FWA_STAGE3B_EXTRACTOR_MODEL", raising=False)
+        _clear_settings_cache()
+
+
 def test_model_provider_langchain_id_maps_opencode_go_to_openai():
     # OpenCode Go (https://opencode.ai/docs/go/) is mechanically an
     # OpenAI-compatible endpoint, just with its own API key/base_url — it

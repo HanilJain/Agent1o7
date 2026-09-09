@@ -231,6 +231,7 @@ async def run_queue(
     decisions: frozenset = DEFAULT_DECISIONS,
     only_global_ids: frozenset[str] | None = None,
     run_id: str | None = None,
+    findings_dir: Path | None = None,
 ) -> Stage4RunSummary:
     """Component 6's entry point: discovers Stage 3 findings via
     `sink_index.discover_sink_candidates`, then runs C3->C4->C5 for each
@@ -239,9 +240,16 @@ async def run_queue(
     `chunk_queue.run_queue`'s "written by the orchestrator function"
     precedent).
 
+    `findings_dir`, if given, overrides the default `<db_subfolder>/
+    stage3/findings` location — this is `fw-trace run --claims`'s hook to
+    point discovery at `<db_subfolder>/stage3b/findings` (Stage 3b's
+    externally-sourced claims, see `stage3b_claims.layout.findings_dir`)
+    instead. `None` (default) preserves the original Stage-3-only
+    behavior exactly.
+
     Raises `Stage4InputError`/`VectorStoreUnavailableError` up front if the
-    Stage 3 findings directory or the local Chroma collection isn't usable
-    — fail fast before spawning any worker, per this stage's `errors.py`
+    findings directory or the local Chroma collection isn't usable — fail
+    fast before spawning any worker, per this stage's `errors.py`
     convention.
     """
     settings = settings or get_settings()
@@ -249,14 +257,17 @@ async def run_queue(
     started_at = datetime.now(UTC)
 
     stage3_dir = db_subfolder / "stage3"
-    if not (stage3_dir / "findings").is_dir():
+    target_findings_dir = findings_dir if findings_dir is not None else stage3_dir / "findings"
+    if not target_findings_dir.is_dir():
         raise Stage4InputError(
-            f"No Stage 3 findings directory at {stage3_dir / 'findings'} — run "
-            "`fw-analyze ... --queue` then `fw-analyze ... --analyze --chunks-file "
-            "<stage3/chunk_index.json>` first."
+            f"No findings directory at {target_findings_dir} — run `fw-analyze ... --queue` "
+            "then `fw-analyze ... --analyze --chunks-file <stage3/chunk_index.json>` "
+            "(or `fw-claims ingest ...` for --claims) first."
         )
 
-    candidates = discover_sink_candidates(stage3_dir, decisions=decisions)
+    candidates = discover_sink_candidates(
+        stage3_dir, decisions=decisions, findings_dir=findings_dir
+    )
     if only_global_ids is not None:
         candidates = [c for c in candidates if c.global_id in only_global_ids]
 

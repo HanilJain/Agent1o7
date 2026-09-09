@@ -264,6 +264,7 @@ async def run_fvvw_queue(
     decisions: frozenset = DEFAULT_DECISIONS,
     only_global_ids: frozenset[str] | None = None,
     run_id: str | None = None,
+    findings_dir: Path | None = None,
 ) -> VerificationRunSummary:
     """The fork-join's entry point — same discovery/candidate-filtering
     contract as `stage5_verification.driver.run_queue`, but drives
@@ -272,20 +273,27 @@ async def run_fvvw_queue(
     `VerificationRunSummary` as its return type (same shape the static-only
     path already returns) so `runner.py`'s `_cmd_run` can print either
     result identically.
+
+    `findings_dir`, if given, overrides the default
+    `<db_subfolder>/stage3/findings` location — see `stage5_verification.
+    driver.run_queue`'s docstring for the `--claims` rationale, identical
+    here.
     """
     settings = settings or get_settings()
     run_id = run_id or uuid.uuid4().hex[:12]
     started_at = datetime.now(UTC)
 
-    stage3_findings_dir = db_subfolder / "stage3" / "findings"
-    if not stage3_findings_dir.is_dir():
+    target_findings_dir = (
+        findings_dir if findings_dir is not None else db_subfolder / "stage3" / "findings"
+    )
+    if not target_findings_dir.is_dir():
         raise Stage5InputError(
-            f"No Stage 3 findings directory at {stage3_findings_dir} — run "
-            "`fw-analyze ... --queue` then `fw-analyze ... --analyze --chunks-file "
-            "<stage3/chunk_index.json>` first."
+            f"No findings directory at {target_findings_dir} — run `fw-analyze ... --queue` "
+            "then `fw-analyze ... --analyze --chunks-file <stage3/chunk_index.json>` "
+            "(or `fw-claims ingest ...` for --claims) first."
         )
 
-    candidates = discover_candidates(db_subfolder, decisions=decisions)
+    candidates = discover_candidates(db_subfolder, decisions=decisions, findings_dir=findings_dir)
     if only_global_ids is not None:
         candidates = [c for c in candidates if c.global_id in only_global_ids]
 

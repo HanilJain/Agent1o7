@@ -328,29 +328,39 @@ async def run_queue(
     decisions: frozenset = DEFAULT_DECISIONS,
     only_global_ids: frozenset[str] | None = None,
     run_id: str | None = None,
+    findings_dir: Path | None = None,
 ) -> VerificationRunSummary:
     """Stage 5's entry point: discovers Stage 3 candidates via
     `candidate_index.discover_candidates`, then verifies each through a
     bounded worker pool, persisting every candidate's JSON + Markdown
     report and writing `stage5_summary.json` itself.
 
-    Raises `Stage5InputError` up front if Stage 3's findings or Stage 2's
-    summary aren't usable — fail fast before spawning any worker, mirroring
-    `stage4_rag.driver.run_queue`'s precedent.
+    `findings_dir`, if given, overrides the default
+    `<db_subfolder>/stage3/findings` location — `fw-verify run --claims`'s
+    hook to point discovery at `<db_subfolder>/stage3b/findings` (Stage
+    3b's externally-sourced claims) instead. `None` (default) preserves
+    the original Stage-3-only behavior exactly — see
+    `candidate_index.discover_candidates`'s docstring.
+
+    Raises `Stage5InputError` up front if the findings directory or Stage
+    2's summary aren't usable — fail fast before spawning any worker,
+    mirroring `stage4_rag.driver.run_queue`'s precedent.
     """
     settings = settings or get_settings()
     run_id = run_id or uuid.uuid4().hex[:12]
     started_at = datetime.now(UTC)
 
-    stage3_findings_dir = db_subfolder / "stage3" / "findings"
-    if not stage3_findings_dir.is_dir():
+    target_findings_dir = (
+        findings_dir if findings_dir is not None else db_subfolder / "stage3" / "findings"
+    )
+    if not target_findings_dir.is_dir():
         raise Stage5InputError(
-            f"No Stage 3 findings directory at {stage3_findings_dir} — run "
-            "`fw-analyze ... --queue` then `fw-analyze ... --analyze --chunks-file "
-            "<stage3/chunk_index.json>` first."
+            f"No findings directory at {target_findings_dir} — run `fw-analyze ... --queue` "
+            "then `fw-analyze ... --analyze --chunks-file <stage3/chunk_index.json>` "
+            "(or `fw-claims ingest ...` for --claims) first."
         )
 
-    candidates = discover_candidates(db_subfolder, decisions=decisions)
+    candidates = discover_candidates(db_subfolder, decisions=decisions, findings_dir=findings_dir)
     if only_global_ids is not None:
         candidates = [c for c in candidates if c.global_id in only_global_ids]
 
