@@ -16,6 +16,66 @@ _INCLUDE_GUARD = "FW_AUDIT_GHIDRA_TYPES_H"
 # Sizes (in bytes) that map directly onto a native fixed-width integer type.
 _NATIVE_SIZE_TO_TYPE = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 
+# Container type (may be WIDER than the size itself, for 3/5/6/7) and its
+# bitmask literal — shared by `_undefined_family` and the CONCAT generator,
+# so an operand narrower than its container is masked consistently
+# everywhere it's cast (see `_concat_macros`'s docstring for why the mask
+# is mandatory, not cosmetic).
+_CONTAINER_TYPE = {
+    1: "uint8_t", 2: "uint16_t", 3: "uint32_t", 4: "uint32_t",
+    5: "uint64_t", 6: "uint64_t", 7: "uint64_t", 8: "uint64_t",
+}  # fmt: skip
+_CONTAINER_MASK = {n: f"0x{'FF' * n}ULL" for n in range(1, 9)}
+
+
+def _fixed_width_types() -> str:
+    """Self-contained `uintN_t`/`intN_t`/`uintptr_t`/`intptr_t` typedefs —
+    NOT `#include <stdint.h>`. Two independent reasons this include must
+    never come back:
+
+    1. `joern-parse` (Eclipse CDT) resolves an `#include` against NO system
+       include path — it expands `#define`s in the translation unit but
+       cannot follow `<stdint.h>` to anything, so every `uint32_t` etc. in
+       this very header would be an unknown type IN THE CPG ITSELF. This is
+       the decisive reason, independent of any host toolchain.
+    2. On the host (`gcc -fsyntax-only`, used by this pipeline's optional
+       validation layer), the REAL `<stdint.h>` transitively redeclares
+       several of the same POSIX-internal names this file also declares
+       (`size_t`, `ssize_t`, `time_t`, `intptr_t`, `__gnuc_va_list`, ...)
+       with a different underlying type on different hosts (confirmed:
+       MinGW and glibc each collide on a DIFFERENT subset) — same width,
+       distinct C type, so it's a hard conflict even though semantically
+       harmless. This translation unit never links against real libc, so
+       it has no reason to depend on any host header at all.
+
+    Widths here are NOMINAL (chosen to be correct on both LP64 and LLP64),
+    not host-exact — nothing in this file is ever executed.
+
+    `uintptr_t`/`intptr_t` are NOT optional: `passes.declare_register_vars`
+    synthesizes `uintptr_t NAME;` locals for every `in_*`/`unaff_*`/
+    `extraout_*` reference, and depended on `<stdint.h>` for that type
+    before this function existed (measured on real firmware: 8 uses of
+    `uintptr_t`, 2 of `intptr_t`, in one binary alone).
+
+    Deliberately does NOT declare `size_t`/`ssize_t`: Ghidra emits its own
+    (`typedef ulong size_t;`, confirmed present in real output) — adding
+    ours would recreate exactly the conflict this function exists to
+    eliminate."""
+    return "\n".join(
+        [
+            "typedef unsigned char       uint8_t;",
+            "typedef signed char         int8_t;",
+            "typedef unsigned short      uint16_t;",
+            "typedef short               int16_t;",
+            "typedef unsigned int        uint32_t;",
+            "typedef int                 int32_t;",
+            "typedef unsigned long long  uint64_t;",
+            "typedef long long           int64_t;",
+            "typedef unsigned long long  uintptr_t;",
+            "typedef long long           intptr_t;",
+        ]
+    )
+
 
 def _undefined_family() -> str:
     lines = ["typedef unsigned char undefined;", "typedef unsigned char undefined1;"]
@@ -117,25 +177,61 @@ def _unk_wide_types() -> str:
 
 
 def _concat_macros() -> str:
-    """`CONCAT<H><L>(high, low)` concatenates an H-byte high part and an
-    L-byte low part into one H+L-byte value — generated only for the
-    power-of-two result widths {2, 4, 8, 16} Ghidra emits most often; wider,
-    non-power-of-two results are rare enough in practice to leave unhandled
-    rather than bloat this header with ~60 combinations for little gain."""
+    """`CONCAT<H><L>(hi, lo)` concatenates an H-byte high part and an
+    L-byte low part into one H+L-byte value. Generated for every `H, L in
+    1..8` whose result fits in 8 bytes (28 macros) — a FULL combinatorial
+    set, not only the power-of-two totals {2, 4, 8} an earlier version of
+    this function covered.
+
+    That earlier, narrower version was not just incomplete — it was
+    ACTIVELY WRONG for any 3/5/6/7-byte operand: it cast the operand to a
+    type like `uint24_t`/`uint40_t`/`uint48_t`/`uint56_t`, none of which
+    exist anywhere (confirmed against real firmware: `CONCAT13`/`CONCAT17`/
+    `CONCAT26`/`CONCAT31`/`CONCAT35`/`CONCAT53`/`CONCAT62`/`CONCAT71` all
+    referenced `uintNN_t` types this very header never defines — 8 of the
+    11 CONCAT macros shipped were poison that detonated on use, and all 8
+    ARE used on real firmware). This version casts every operand to its
+    CONTAINER type (`_CONTAINER_TYPE`, which for 3/5/6/7 is the next-wider
+    NATIVE type: `uint32_t`/`uint64_t`) instead — a type that always
+    exists — and then MASKS it (`_CONTAINER_MASK`) before shifting/OR-ing.
+    The mask is what makes this correct, not merely parse-legal: a 3-byte
+    operand's high byte inside its (wider) `uint32_t` container is garbage
+    from whatever produced it, and without the mask that garbage would
+    leak into the concatenated result's own high bits.
+
+    9-16 byte results need a 128-bit container (`unsigned __int128`, a
+    GCC/Clang extension both gcc's `-fsyntax-only` and Joern's Eclipse-CDT
+    frontend accept) guarded by `#ifdef __SIZEOF_INT128__`. Rather than all
+    228 combinatorially possible wide forms (~30 KB of largely-unused
+    macros in every normalized file), only the forms actually observed on
+    real firmware are generated: `CONCAT88` (the two 8-byte-operand halves
+    of a 16-byte result). Deliberately NO `#else` fallback for these: a
+    lossy 64-bit definition would silently change semantics for whichever
+    caller uses it, whereas leaving a rare wide form undefined is
+    correct — Eclipse CDT treats an unknown macro-shaped call as an
+    ordinary (unresolved) function call and still builds the CPG; this
+    module's validation gate separately reports any USED-but-undefined
+    intrinsic, so the guarded set can grow from evidence rather than
+    speculation without ever reintroducing the `uint24_t`-style poison."""
     lines: list[str] = []
-    for total, result_type in ((2, "uint16_t"), (4, "uint32_t"), (8, "uint64_t")):
-        for h in range(1, total):
-            low = total - h
-            if low < 1:
+    seen: set[str] = set()
+    for h in range(1, 9):
+        for lo in range(1, 9):
+            total = h + lo
+            if total > 8:
                 continue
+            name = f"CONCAT{h}{lo}"
+            assert name not in seen, f"duplicate macro name generated: {name}"
+            seen.add(name)
+            result_type = _CONTAINER_TYPE[total]
+            hi_type, hi_mask = _CONTAINER_TYPE[h], _CONTAINER_MASK[h]
+            lo_type, lo_mask = _CONTAINER_TYPE[lo], _CONTAINER_MASK[lo]
             lines.append(
-                f"#define CONCAT{h}{low}(hi, lo) "
-                f"(({result_type})((({result_type})(uint{h * 8}_t)(hi)) << {low * 8}"
-                f" | ({result_type})(uint{low * 8}_t)(lo)))"
+                f"#define {name}(hi, lo) "
+                f"(({result_type})"
+                f"((({result_type})(({hi_type})(hi) & ({hi_type}){hi_mask}) << {lo * 8})"
+                f" | (({result_type})(({lo_type})(lo) & ({lo_type}){lo_mask}))))"
             )
-    # 16-byte results (e.g. CONCAT88) need a 128-bit container; `__int128`
-    # is a GCC/Clang extension, which both gcc's `-fsyntax-only` and Joern's
-    # Eclipse-CDT-based C frontend accept.
     lines.append("#ifdef __SIZEOF_INT128__")
     lines.append(
         "#define CONCAT88(hi, lo) "
@@ -149,29 +245,92 @@ def _concat_macros() -> str:
 def _sub_zext_sext_macros() -> str:
     """`SUB<X><Y>(v, n)` extracts Y bytes starting at byte offset `n` from an
     X-byte value; `ZEXT<X><Y>`/`SEXT<X><Y>` zero/sign-extend an X-byte value
-    to Y bytes. Generated for the widths {1, 2, 4, 8} Ghidra uses."""
-    widths = (1, 2, 4, 8)
+    to Y bytes. Generated for the FULL combinatorial set `X, Y in 1..8`
+    (28 SUB + 28 ZEXT + 28 SEXT), not only `{1, 2, 4, 8}` — an earlier
+    version's narrower set was silent (parse-legal, but the macro simply
+    didn't exist) for any 3/5/6/7-byte operand, the same failure mode
+    `_concat_macros` had for its result type, just without that version's
+    additional "references a type that doesn't exist" defect, since these
+    two macro families only ever cast to/from `_CONTAINER_TYPE`'s (always-
+    real) native types.
+
+    `SUB<X><Y>`'s `X` container may be WIDER than `X` bytes (3/5/6/7 map to
+    a native 4/8-byte container) — masking with `_CONTAINER_MASK[x]` before
+    the right-shift is what keeps a genuinely 3-byte value's upper
+    (garbage) container byte from leaking into the extracted result,
+    exactly as in `_concat_macros`.
+
+    Also generates the narrow, `__int128`-guarded 9-16 byte forms
+    `SUB16{1,2,4,8}` / `ZEXT{1,2,4,8}16` / `SEXT{1,2,4,8}16` — the same
+    "guard the wide forms, generate only what's evidenced, no `#else`
+    fallback" policy `_concat_macros` applies to `CONCAT88`, for the same
+    reason: the full 9-16-byte combinatorial set is ~130 more macros for
+    forms that (unlike the portable {1..8} set) are rare in practice, and
+    an undefined wide form is CORRECT for Joern (an unknown macro-shaped
+    call still lets CDT build the CPG) whereas a lossy `#else` definition
+    would silently change semantics."""
     lines: list[str] = []
-    for x in widths:
-        x_type = _NATIVE_SIZE_TO_TYPE[x]
-        for y in widths:
-            if y >= x:
-                continue
-            y_type = _NATIVE_SIZE_TO_TYPE[y]
+    seen: set[str] = set()
+    for x in range(1, 9):
+        x_type, x_mask = _CONTAINER_TYPE[x], _CONTAINER_MASK[x]
+        for y in range(1, x):
+            name = f"SUB{x}{y}"
+            assert name not in seen, f"duplicate macro name generated: {name}"
+            seen.add(name)
+            y_type = _CONTAINER_TYPE[y]
             lines.append(
-                f"#define SUB{x}{y}(v, n) (({y_type})(({x_type})(v) >> ((n) * 8)))"
+                f"#define {name}(v, n) "
+                f"(({y_type})((({x_type})(v) & ({x_type}){x_mask}) >> ((n) * 8)))"
             )
-    for x in widths:
-        x_type = _NATIVE_SIZE_TO_TYPE[x]
-        x_signed = f"int{x * 8}_t"
-        for y in widths:
-            if y <= x:
-                continue
-            y_type = _NATIVE_SIZE_TO_TYPE[y]
-            y_signed = f"int{y * 8}_t"
-            lines.append(f"#define ZEXT{x}{y}(v) (({y_type})({x_type})(v))")
-            lines.append(f"#define SEXT{x}{y}(v) (({y_signed})({x_signed})(v))")
+    for x in range(1, 9):
+        x_type = _CONTAINER_TYPE[x]
+        x_signed = f"int{bit_width(x)}_t"
+        for y in range(x + 1, 9):
+            y_type = _CONTAINER_TYPE[y]
+            y_signed = f"int{bit_width(y)}_t"
+            zext_name, sext_name = f"ZEXT{x}{y}", f"SEXT{x}{y}"
+            assert zext_name not in seen and sext_name not in seen, (
+                f"duplicate macro name generated: {zext_name}/{sext_name}"
+            )
+            seen.add(zext_name)
+            seen.add(sext_name)
+            lines.append(f"#define {zext_name}(v) (({y_type})({x_type})(v))")
+            lines.append(f"#define {sext_name}(v) (({y_signed})({x_signed})(v))")
+
+    lines.append("#ifdef __SIZEOF_INT128__")
+    for x in (1, 2, 4, 8):
+        x_type, x_mask = _CONTAINER_TYPE[x], _CONTAINER_MASK[x]
+        sub_name = f"SUB16{x}"
+        assert sub_name not in seen, f"duplicate macro name generated: {sub_name}"
+        seen.add(sub_name)
+        lines.append(
+            f"#define {sub_name}(v, n) "
+            f"(({x_type})((unsigned __int128)(v) >> ((n) * 8)) & ({x_type}){x_mask})"
+        )
+    for x in (1, 2, 4, 8):
+        x_type = _CONTAINER_TYPE[x]
+        x_signed = f"int{bit_width(x)}_t"
+        zext_name, sext_name = f"ZEXT{x}16", f"SEXT{x}16"
+        assert zext_name not in seen and sext_name not in seen, (
+            f"duplicate macro name generated: {zext_name}/{sext_name}"
+        )
+        seen.add(zext_name)
+        seen.add(sext_name)
+        lines.append(f"#define {zext_name}(v) ((unsigned __int128)({x_type})(v))")
+        lines.append(f"#define {sext_name}(v) ((__int128)({x_signed})(v))")
+    lines.append("#endif")
     return "\n".join(lines)
+
+
+def bit_width(container_bytes: int) -> int:
+    """Bit width of the NATIVE container type for `container_bytes` — 3
+    maps to 32 (its container is `uint32_t`), not 24 (`uint24_t` does not
+    exist; this is exactly the mistake `_concat_macros`'s docstring
+    documents). Used to build `intN_t`/`uintN_t` names that are guaranteed
+    to already exist, from `_fixed_width_types` or Ghidra's own `stdint`-
+    family typedefs — never `int24_t`/`int40_t`/`int48_t`/`int56_t`."""
+    type_name = _CONTAINER_TYPE[container_bytes]
+    return int(type_name.removeprefix("uint").removesuffix("_t"))
 
 
 def _halt_baddata_stub() -> str:
@@ -205,15 +364,23 @@ def _libc_declarations() -> str:
 def generate_prelude_header() -> str:
     """The full `ghidra_types.h` content, deterministic given no inputs —
     it depends only on Ghidra's fixed emitter vocabulary, not on any
-    specific binary."""
+    specific binary.
+
+    Deliberately ZERO `#include` directives — see `_fixed_width_types`'s
+    docstring for why `#include <stdint.h>` specifically must never come
+    back. This header is a fully self-contained, closed-world translation
+    unit by design."""
     sections = [
         f"#ifndef {_INCLUDE_GUARD}",
         f"#define {_INCLUDE_GUARD}",
         "",
         "/* Generated by fw_audit.stage2_extraction.normalize.prelude — do not",
-        " * hand-edit; regenerate by re-running Stage 2. */",
+        " * hand-edit; regenerate by re-running Stage 2. No #include: this",
+        " * header is a self-contained, closed-world translation unit — see",
+        " * _fixed_width_types()'s docstring. */",
         "",
-        "#include <stdint.h>",
+        "/* ---- Self-contained fixed-width types (NOT <stdint.h>) --------- */",
+        _fixed_width_types(),
         "",
         "/* ---- Ghidra's `undefined`-family byte-sized types ------------- */",
         _undefined_family(),

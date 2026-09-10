@@ -1,0 +1,59 @@
+# .claudeignore — keeps large/binary/generated content out of Claude's
+# context. This is separate from .gitignore: some things here ARE tracked
+# in git (or exist locally) but are still useless (or huge) to read.
+
+# Python environment & caches
+.venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+fw_audit.egg-info/
+.eggs/
+build/
+dist/
+
+# Tooling caches / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# VCS internals
+.git/
+
+# Secrets / local env (never read into context)
+.env
+.env.*
+!.env.example
+
+# Firmware inputs & extraction DB — real firmware images, Ghidra/Joern
+# outputs, decompiled trees, chunked artifacts: huge and binary/generated.
+data/firmware/*
+data/db/*
+!data/firmware/.gitkeep
+!data/db/.gitkeep
+
+# Large pre-fetched/one-off binary artifacts
+docker/.joern-cli.zip
+stage4_colab_input.zip
+*.zip
+*.tar.gz
+*.7z
+
+# Stage 2 validation scratch output (generated, regenerated on each run)
+fw_audit/stage2_extraction/validate/__pycache__/
+
+# Skill-generated scratch explanations
+Developer/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/

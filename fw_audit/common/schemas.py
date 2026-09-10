@@ -325,6 +325,17 @@ class DecompiledBinary(BaseModel):
     (prelude, type declarations, thunk-wall externs, scaffolding comments)
     — `ExtractedSource.dropped_line_count`, persisted here since the
     in-memory `ExtractedSource` itself doesn't survive past Stage 2."""
+    validation_issue_count: int = 0
+    """Total `stage2_extraction.validate.ValidationIssue` count (every
+    severity, every layer actually run) found in this binary's normalized
+    Joern-target `whole.c` — 0 if validation found nothing, or if
+    `Settings.stage2_validation == "off"`. The full per-issue detail lives
+    in `normalized/normalization_report.json`'s `"validation"` field; this
+    is only a summary count so Stage 5 (or a human) can decide whether to
+    fetch that detail without reading every binary's full report. Kept as
+    a plain int (not a bool "has issues") so a later fail-policy tuning
+    pass can distinguish "one cosmetic warning" from "hundreds of errors"
+    without re-reading the report."""
     artifacts: DecompilationArtifacts = Field(default_factory=DecompilationArtifacts)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)

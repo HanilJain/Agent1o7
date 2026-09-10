@@ -67,6 +67,27 @@ def test_never_writes_into_raw():
     assert not offending, f"normalize/ files perform filesystem writes: {offending}"
 
 
+def test_normalize_does_not_import_validate():
+    """`normalize/` and `validate/` are deliberate siblings, not parent/
+    child — `validate/syntax.py` imports `subprocess`, so if `normalize/`
+    ever imported `validate/` (even transitively, even just `validate.
+    result`, which is itself pure), the import-purity test above would
+    need special-casing to still make sense. Grepping for an actual
+    `import`/`from ... import` STATEMENT (not any mention of the word —
+    `report.py`'s own docstring legitimately explains why it does NOT
+    import `validate.result.ValidationResult`) is enough here: this is a
+    "never write this import" guarantee, not a transitive-closure one."""
+    import re
+
+    package_dir = Path(__file__).parent.parent / "fw_audit" / "stage2_extraction" / "normalize"
+    import_re = re.compile(r"^\s*(?:import|from)\s+.*\bvalidate\b", re.MULTILINE)
+    offending: list[str] = []
+    for py_file in package_dir.glob("*.py"):
+        if import_re.search(py_file.read_text(encoding="utf-8")):
+            offending.append(py_file.name)
+    assert not offending, f"normalize/ files import validate/: {offending}"
+
+
 # --------------------------------------------------------------------- #
 # spans.py
 # --------------------------------------------------------------------- #
@@ -138,6 +159,108 @@ def test_p05_is_idempotent():
     assert once == twice
 
 
+# --------------------------------------------------------------------- #
+# p01b — canonicalize_ghidra_symbols (Defect Class 3, and the root cause
+# it feeds into — see passes.py's module docstring for the full argument)
+# --------------------------------------------------------------------- #
+
+
+def test_p01b_sanitizes_illegal_characters_in_a_declared_symbol():
+    before = 'undefined *PTR_s_<?xml_version="1.0"_encoding="ut_1000011c;\n'
+    after = passes.canonicalize_ghidra_symbols(before)
+    assert "PTR_s___xml_version__1_0__encoding__ut_1000011c" in after
+    assert "<" not in after and '"' not in after
+
+
+def test_p01b_converges_declaration_and_use_spellings_to_one_identifier():
+    """Ghidra spells the SAME symbol differently at its declaration site
+    (the referenced-globals block) than at use sites — confirmed against
+    real firmware. A char-for-char rewrite must converge both spellings to
+    ONE identifier, not merely legalize each independently."""
+    import re
+
+    decl = 'undefined *PTR_s_<?xml_version="1.0"_encoding="ut_1000011c;\n'
+    use = "puVar1 = PTR_s_<_xml_version__1_0__encoding__ut_1000011c;\n"
+    after = passes.canonicalize_ghidra_symbols(decl + use)
+    names = re.findall(r"PTR_s_\w+", after)
+    assert len(names) == 2
+    assert names[0] == names[1]
+
+
+def test_p01b_leaves_undeclared_symbol_shaped_token_alone():
+    """A greedy match can bridge two adjacent, unrelated tokens (e.g. a
+    ternary `c?DAT_1000:DAT_2000`) — the sanitized bridge must not match
+    any DECLARED symbol, so the whitelist gate leaves it untouched rather
+    than silently merging two distinct globals into one identifier."""
+    before = "int *DAT_1000;\nint *DAT_2000;\nx = c?DAT_1000:DAT_2000;\n"
+    after = passes.canonicalize_ghidra_symbols(before)
+    assert "DAT_1000:DAT_2000" in after
+
+
+def test_p01b_sanitizes_quote_bearing_token_even_without_a_declaration():
+    """A quote inside a Ghidra-symbol-shaped token guarantees a tokenizer
+    desync regardless of whether it matches a known declaration — this is
+    the escape hatch that fires even for an undeclared symbol."""
+    before = 'x = PTR_s_no"where_declared_1000abcd;\n'
+    after = passes.canonicalize_ghidra_symbols(before)
+    assert '"' not in after
+
+
+def test_p01b_is_idempotent():
+    before = 'undefined *PTR_s_<?xml_version="1.0"_encoding="ut_1000011c;\n'
+    once = passes.canonicalize_ghidra_symbols(before)
+    twice = passes.canonicalize_ghidra_symbols(once)
+    assert once == twice
+
+
+def test_p01b_leaves_switchd_case_labels_for_p08_to_handle():
+    """`switchD_`/`caseD_`/`switchdataD_` are deliberately excluded from
+    this pass's prefix set — `fix_illegal_switch_labels` (p08) owns `::`
+    inside those names and expects to see it intact."""
+    before = "  switchD_0040593c::caseD_5:\n"
+    after = passes.canonicalize_ghidra_symbols(before)
+    assert "switchD_0040593c::caseD_5" in after
+
+
+def test_p01b_does_not_use_apply_to_code():
+    """The tokenizer is the thing this pass exists to repair — routing it
+    through `apply_to_code` (which depends on a healthy tokenizer) would
+    silently reintroduce the exact defect it fixes. Pinned by source
+    inspection so a future refactor can't "clean this up" by accident.
+    Checks the function BODY only (docstring stripped) — the docstring
+    itself legitimately names `apply_to_code` while explaining why it's
+    not used."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(passes.canonicalize_ghidra_symbols))
+    tree = ast.parse(source)
+    func = tree.body[0]
+    body_without_docstring = func.body[1:] if ast.get_docstring(func) else func.body
+    body_source = "\n".join(ast.unparse(node) for node in body_without_docstring)
+    assert "apply_to_code" not in body_source
+
+
+def test_span_tokenizer_stays_synchronized_after_canonicalization():
+    """The headline regression test: on real firmware, an unbalanced quote
+    inside a Ghidra symbol name desynced spans.tokenize's STRING regex for
+    91 spans / 4,680 swallowed lines — this pins that C has NO raw newline
+    inside a string/char literal, ever, so the bound is exactly 0, both on
+    the dedicated fixture and on the interaction fixture."""
+    for text in (
+        (FIXTURES_DIR / "defect_illegal_identifiers.c").read_text(encoding="utf-8"),
+        _load_fixture(),
+    ):
+        out = passes.canonicalize_ghidra_symbols(text)
+        offenders = [
+            s
+            for s in tokenize(out)
+            if s.kind in (SpanKind.STRING, SpanKind.CHAR) and "\n" in s.text
+        ]
+        assert not offenders, f"{len(offenders)} span(s) cross a newline after canonicalization"
+
+
 def test_p08_rewrites_double_colon_switch_labels():
     before = "  goto switchD_00401234::caseD_5;\nswitchD_00401234::caseD_5:\n"
     after = passes.fix_illegal_switch_labels(before)
@@ -153,6 +276,60 @@ def test_p08_rewrites_double_colon_default_switch_label():
     after = passes.fix_illegal_switch_labels(before)
     assert "::" not in after
     assert "switchD_00112f76_default" in after
+
+
+# --------------------------------------------------------------------- #
+# p08c — name_anonymous_enumerators (Defect Class 1)
+# --------------------------------------------------------------------- #
+
+
+def test_p08c_names_a_value_only_enumerator():
+    before = "typedef enum X {\n    A=1,\n    =1879048203,\n    B=3,\n} X;\n"
+    after = passes.name_anonymous_enumerators(before)
+    assert "X_RESERVED_1879048203=1879048203" in after
+    assert not any(line.strip().startswith("=") for line in after.split("\n"))
+
+
+def test_p08c_disambiguates_repeated_values_across_different_enums():
+    """Enumerators share one file-scope namespace in C — two anonymous
+    enumerators with the same value, even in DIFFERENT enums, must not
+    synthesize the same name twice."""
+    before = (
+        "typedef enum X {\n    A=1,\n    =99,\n} X;\n"
+        "typedef enum Y {\n    B=1,\n    =99,\n} Y;\n"
+    )
+    after = passes.name_anonymous_enumerators(before)
+    names = [line.split("=")[0].strip() for line in after.split("\n") if "RESERVED" in line]
+    assert len(names) == len(set(names)) == 2
+
+
+def test_p08c_handles_negative_and_hex_values():
+    before = "typedef enum X {\n    =-5,\n    =0x1F,\n} X;\n"
+    after = passes.name_anonymous_enumerators(before)
+    assert "X_RESERVED_n5=-5" in after
+    assert "X_RESERVED_0x1F=0x1F" in after or "X_RESERVED_0X1F=0x1F" in after
+
+
+def test_p08c_does_not_touch_a_named_enumerator():
+    before = "typedef enum X {\n    A=1,\n    B=2,\n} X;\n"
+    after = passes.name_anonymous_enumerators(before)
+    assert after == before
+
+
+def test_p08c_only_matches_inside_an_enum_body():
+    """A bare `=value,` line OUTSIDE an enum body (e.g. an array
+    initializer element on its own line) must never be mistaken for an
+    anonymous enumerator."""
+    before = "int arr[] = {\n    1,\n    2,\n};\n"
+    after = passes.name_anonymous_enumerators(before)
+    assert after == before
+
+
+def test_p08c_is_idempotent():
+    before = "typedef enum X {\n    A=1,\n    =1879048203,\n} X;\n"
+    once = passes.name_anonymous_enumerators(before)
+    twice = passes.name_anonymous_enumerators(once)
+    assert once == twice
 
 
 def test_p08b_halt_baddata_joern_becomes_declared_noop_call():
@@ -331,6 +508,113 @@ def test_p13_does_not_touch_indented_call_site():
     assert after == before
 
 
+# --------------------------------------------------------------------- #
+# p13b — repair_void_function_results (Defect Class 5)
+# --------------------------------------------------------------------- #
+
+
+def test_p13b_promotes_void_function_used_as_a_value():
+    before = (
+        "void FUN_1(void)\n{\n  return;\n}\n\n"
+        "int caller(void)\n{\n  int iVar1;\n  iVar1 = FUN_1();\n  return iVar1;\n}\n"
+    )
+    after = passes.repair_void_function_results(before)
+    assert "int FUN_1(void)" in after
+    assert "void FUN_1(void)" not in after
+
+
+def test_p13b_leaves_a_genuinely_void_function_untouched():
+    before = (
+        "void FUN_1(void)\n{\n  return;\n}\n\n"
+        "void caller(void)\n{\n  FUN_1();\n}\n"
+    )
+    after = passes.repair_void_function_results(before)
+    assert after == before
+
+
+def test_p13b_recognizes_a_call_site_wrapped_across_lines():
+    """Ghidra wraps a long call site across lines the same way it wraps a
+    long function HEADER — confirmed on real firmware
+    (`iVar9 = tls_global_set_verify\\n  (args);`)."""
+    before = (
+        "void FUN_1(int a, int b, int c)\n{\n  return;\n}\n\n"
+        "int caller(void)\n{\n  int iVar1;\n"
+        "  iVar1 = FUN_1\n                (1, 2, 3);\n  return iVar1;\n}\n"
+    )
+    after = passes.repair_void_function_results(before)
+    assert "int FUN_1(int a, int b, int c)" in after
+
+
+def test_p13b_is_idempotent():
+    before = (
+        "void FUN_1(void)\n{\n  return;\n}\n\n"
+        "int caller(void)\n{\n  int iVar1;\n  iVar1 = FUN_1();\n  return iVar1;\n}\n"
+    )
+    once = passes.repair_void_function_results(before)
+    twice = passes.repair_void_function_results(once)
+    assert once == twice
+
+
+def test_p13b_does_not_promote_void_pointer_return_type():
+    before = (
+        "void *FUN_1(void)\n{\n  return (void *)0;\n}\n\n"
+        "int caller(void)\n{\n  void *p;\n  p = FUN_1();\n  return 0;\n}\n"
+    )
+    after = passes.repair_void_function_results(before)
+    assert after == before
+
+
+# --------------------------------------------------------------------- #
+# p13c — hoist_function_prototypes (Defect Class 6)
+# --------------------------------------------------------------------- #
+
+
+def test_p13c_forward_declares_a_function_called_before_its_definition():
+    before = (
+        "int SECOND(int x)\n{\n  return FIRST(x) + 1;\n}\n\n"
+        "int FIRST(int x)\n{\n  return x * 2;\n}\n"
+    )
+    after = passes.hoist_function_prototypes(EMPTY_CONTEXT, before)
+    assert "int FIRST(int x);" in after
+    # The prototype must appear BEFORE SECOND's own definition.
+    assert after.index("int FIRST(int x);") < after.index("int SECOND(int x)\n{")
+
+
+def test_p13c_does_not_hoist_a_function_never_called_before_its_definition():
+    before = (
+        "int FIRST(int x)\n{\n  return x * 2;\n}\n\nint SECOND(int x)\n{\n  return FIRST(x);\n}\n"
+    )
+    after = passes.hoist_function_prototypes(EMPTY_CONTEXT, before)
+    assert after == before
+
+
+def test_p13c_vetoes_a_name_context_flags_as_a_thunk():
+    """Real shape confirmed on firmware: a MIPS PLT/GOT trampoline body
+    Ghidra decompiled from a statically linked binary uses real system-
+    header type names (sockaddr, FILE, ...) in ITS OWN header — hoisting a
+    type-correct-looking prototype for such a name would reference a type
+    that never exists in this closed-world translation unit.
+    `context.thunk_names` is a POSITIVE veto, unlike `may_stub`'s
+    "not contradicted" bias-toward-True."""
+    before = (
+        "int caller(void)\n{\n  return connect(0, 0, 0);\n}\n\n"
+        "int connect(int fd, void *addr, int len)\n{\n  return 0;\n}\n"
+    )
+    context = BinaryContext(thunk_names=frozenset({"connect"}))
+    after = passes.hoist_function_prototypes(context, before)
+    assert "int connect(int fd, void *addr, int len);" not in after
+
+
+def test_p13c_is_idempotent():
+    before = (
+        "int SECOND(int x)\n{\n  return FIRST(x) + 1;\n}\n\n"
+        "int FIRST(int x)\n{\n  return x * 2;\n}\n"
+    )
+    once = passes.hoist_function_prototypes(EMPTY_CONTEXT, before)
+    twice = passes.hoist_function_prototypes(EMPTY_CONTEXT, once)
+    assert once == twice
+
+
 def test_p14_collapses_blank_lines():
     before = "a;\n\n\n\n\nb;\n"
     after = passes.collapse_blank_lines(before)
@@ -441,6 +725,52 @@ def test_joern_pipeline_is_idempotent():
     assert once == twice
 
 
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "defect_anonymous_enumerator.c",
+        "defect_illegal_identifiers.c",
+        "defect_intrinsic_macros.c",
+        "defect_void_function_result.c",
+        "defect_missing_prototypes.c",
+        "defect_stdint_free.c",
+    ],
+)
+def test_joern_pipeline_is_idempotent_on_each_defect_fixture(fixture_name):
+    """Each of the seven defect-class fixtures, individually, through the
+    FULL Joern pipeline (not just the one pass each is named for) — proves
+    idempotency holds under pass INTERACTION, not only in isolation."""
+    text = (FIXTURES_DIR / fixture_name).read_text(encoding="utf-8")
+    once = normalize(text, JOERN_PIPELINE).text
+    twice = normalize(once, JOERN_PIPELINE).text
+    assert once == twice
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "defect_anonymous_enumerator.c",
+        "defect_illegal_identifiers.c",
+        "defect_intrinsic_macros.c",
+        "defect_void_function_result.c",
+        "defect_missing_prototypes.c",
+        "defect_stdint_free.c",
+    ],
+)
+def test_joern_pipeline_leaves_zero_error_severity_validation_issues(fixture_name):
+    """Every defect-class fixture, after the full Joern pipeline, must
+    pass `validate.structural.run` with zero ERROR-severity issues — the
+    end-to-end proof that fixing the pass also satisfies the gate meant to
+    catch a regression in it."""
+    from fw_audit.stage2_extraction.validate import structural as validate_structural
+
+    text = (FIXTURES_DIR / fixture_name).read_text(encoding="utf-8")
+    result = normalize(text, JOERN_PIPELINE)
+    issues = validate_structural.run(result.text)
+    errors = [i for i in issues if i.severity.value == "error"]
+    assert not errors, f"{fixture_name}: {[(e.check, e.message) for e in errors]}"
+
+
 def test_pipelines_are_idempotent_on_plain_c_with_no_distortions():
     plain = "int add(int a, int b)\n{\n  return a + b;\n}\n"
     for pipeline in (JOERN_PIPELINE,):
@@ -510,15 +840,18 @@ def test_clean_pipeline_shares_head_and_body_passes_with_joern():
 
     shared = {
         "normalize_line_endings",
+        "canonicalize_ghidra_symbols",
         "strip_calling_conventions",
         "fix_illegal_array_declarations",
         "fix_illegal_switch_labels",
+        "name_anonymous_enumerators",
         "replace_thunk_bodies",
         "declare_register_vars",
         "collapse_redundant_casts",
         "dedupe_type_definitions",
         "dedupe_global_declarations",
         "drop_conflicting_builtin_decls",
+        "repair_void_function_results",
         "collapse_blank_lines",
     }
     assert shared <= set(joern_names)
@@ -555,3 +888,78 @@ def test_prelude_covers_every_type_family_referenced_in_fixtures():
         assert re.search(rf"\b{re.escape(name)}\b", PRELUDE_HEADER), (
             f"{name!r} appears in a fixture but has no declaration in ghidra_types.h"
         )
+
+
+# --------------------------------------------------------------------- #
+# Prelude — Defect Classes 4 and 7 (self-contained types, full
+# combinatorial intrinsic set, no phantom types, no name collisions)
+# --------------------------------------------------------------------- #
+
+
+def test_prelude_has_no_include_directive():
+    """Class 4: `joern-parse` (Eclipse CDT) resolves against NO system
+    include path, so an `#include` is never merely unnecessary — it's
+    silently wrong. Checked as an actual directive line, not a substring
+    match, since the prelude's own comments legitimately mention
+    `#include`/`<stdint.h>` in prose explaining why there isn't one."""
+    import re
+
+    directives = [
+        line for line in PRELUDE_HEADER.split("\n") if re.match(r"^\s*#\s*include\b", line)
+    ]
+    assert directives == []
+
+
+def test_prelude_has_no_phantom_fixed_width_types():
+    """Direct regression for the `uint24_t`/`uint40_t`/`uint48_t`/
+    `uint56_t` poison an earlier version of `_concat_macros` shipped —
+    confirmed on real firmware: 8 of 11 CONCAT macros referenced one of
+    these, and all 8 were used, i.e. this was a live, hard compile
+    failure waiting to happen on any binary that exercised them."""
+    import re
+
+    assert not re.search(r"\buint(24|40|48|56)_t\b", PRELUDE_HEADER)
+
+
+def test_prelude_macro_names_are_unique():
+    """A silent `#define` name collision is a redefinition error at the
+    END of a multi-thousand-line file — miserable to debug. Pins the
+    invariant `_concat_macros`/`_sub_zext_sext_macros` already assert
+    internally, at the level a test failure actually explains why."""
+    import re
+
+    names = re.findall(r"#define\s+(\w+)\(", PRELUDE_HEADER)
+    assert len(names) == len(set(names))
+
+
+def test_prelude_defines_concat21_the_originally_reported_symptom():
+    """The literal symptom the Stage 2 Normalization Hardening Spec
+    reported: CONCAT21 used, never `#define`d, under the old power-of-
+    two-only {2,4,8} result-width generator."""
+    assert "#define CONCAT21(" in PRELUDE_HEADER
+
+
+def test_prelude_declares_uintptr_t_and_intptr_t():
+    """Not optional: `declare_register_vars` synthesizes `uintptr_t NAME;`
+    locals and depended on `<stdint.h>` for that type before this prelude
+    became self-contained."""
+    assert "typedef unsigned long long  uintptr_t;" in PRELUDE_HEADER
+    assert "typedef long long           intptr_t;" in PRELUDE_HEADER
+
+
+def test_prelude_defines_every_intrinsic_used_in_defect_fixture():
+    """Mirrors `test_prelude_covers_every_type_family_referenced_in_
+    fixtures` above, for intrinsic macros instead of types — self-
+    maintaining: a future prelude change that narrows macro coverage
+    fails here against real, previously-broken CONCAT/SUB/ZEXT forms."""
+    import re
+
+    fixture_text = (FIXTURES_DIR / "defect_intrinsic_macros.c").read_text(encoding="utf-8")
+    used = {
+        m.group(1) for m in re.finditer(r"\b((?:CONCAT|SUB|ZEXT|SEXT)\d{2,3})\s*\(", fixture_text)
+    }
+    defined = {
+        m.group(1)
+        for m in re.finditer(r"#define\s+((?:CONCAT|SUB|ZEXT|SEXT)\d{2,3})", PRELUDE_HEADER)
+    }
+    assert used <= defined

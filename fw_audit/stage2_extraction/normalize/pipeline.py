@@ -4,26 +4,42 @@ pipeline, and fold it over one file's text.
 Ordering is deliberate:
 
 1. `normalize_line_endings` — a stable base every later regex pass relies on.
-2. Warning-comment handling — decided before anything else touches comments.
-3. Prelude insertion — the first substantive content change, so every later
+2. `canonicalize_ghidra_symbols` — MUST be second, before anything that
+   trusts `spans.tokenize`. Ghidra names string-derived symbols after the
+   string's own content, and an embedded unbalanced quote desyncs the
+   STRING-span regex for hundreds of lines afterward; every pass from step
+   3 onward (via `apply_to_code`) is a silent no-op inside a desynced
+   window until this pass runs. See `passes.py`'s module docstring for the
+   measured impact and why this one pass cannot itself use `apply_to_code`.
+3. Warning-comment handling — decided before anything else touches comments.
+4. Prelude insertion — the first substantive content change, so every later
    pass's output already reflects the file as it will actually be delivered.
-4. Calling-convention stripping, illegal-array-declaration fix, illegal-
-   label fix, halt_baddata rewrite — syntax repairs that must land before
-   anything walks function bodies.
-5. `replace_thunk_bodies` — deletes/declares thunk stubs BEFORE
+5. Calling-convention stripping, illegal-array-declaration fix, illegal-
+   switch-label fix, anonymous-enumerator naming, halt_baddata rewrite —
+   syntax repairs that must land before anything walks function bodies.
+6. `replace_thunk_bodies` — deletes/declares thunk stubs BEFORE
    `declare_register_vars` walks bodies, so that pass never has to look
    inside a body that's about to disappear, and so its text edits can never
    collide with the thunk pass's edits to the same span.
-6. `declare_register_vars`, `collapse_redundant_casts`, `dedupe_type_
+7. `declare_register_vars`, `collapse_redundant_casts`, `dedupe_type_
    definitions`, `dedupe_global_declarations`, `drop_conflicting_builtin_
    decls` — the remaining substantive rewrites. `dedupe_global_declarations`
-   runs after `fix_illegal_array_declarations` (step 4), so it can already
+   runs after `fix_illegal_array_declarations` (step 5), so it can already
    see a repaired `TYPE NAME[N];` declaration as one declaring `NAME` —
    before the fix, the illegal `TYPE[N] NAME;` form wouldn't be recognized
    as a declaration of `NAME` at all.
-7. `collapse_blank_lines` — last, cleaning up blank lines any earlier
-   removal pass left behind. Also the idempotence anchor: everything before
-   it should already be a fixed point (see `tests/test_normalizer.py`).
+8. `repair_void_function_results` — MUST run before `hoist_function_
+   prototypes` (step 9): it promotes a function's `void` return type to
+   `int` wherever a call site uses the result, and a prototype hoisted
+   from the OLD `void` header would conflict with the corrected definition.
+9. `hoist_function_prototypes` — last in the body-pass group, so its
+   emitted column-0 prototype lines are never re-examined by
+   `dedupe_global_declarations` or `replace_thunk_bodies` (both already ran
+   in step 6/7). Emits only for names actually called before their
+   definition, guarded by its own idempotency marker.
+10. `collapse_blank_lines` — last, cleaning up blank lines any earlier
+    removal pass left behind. Also the idempotence anchor: everything
+    before it should already be a fixed point (see `tests/test_normalizer.py`).
 
 `build_joern_pipeline` takes the three passes that are inherently
 target-specific (warning-comment handling, prelude insertion, and the
@@ -63,14 +79,20 @@ class NamedPass(NamedTuple):
 
 
 def _head_passes(warnings_pass: NamedPass, prelude_pass: NamedPass) -> tuple[NamedPass, ...]:
-    """Steps 1-4 above: line endings, warning comments, prelude insertion,
-    then the syntax repairs that must land before anything walks function
-    bodies. Shared verbatim by both pipelines except the two passed in."""
+    """Steps 1-5 above: line endings, symbol canonicalization, warning
+    comments, prelude insertion, then the syntax repairs that must land
+    before anything walks function bodies. Shared verbatim by both
+    pipelines except the two passed in."""
     return (
         NamedPass(
             "normalize_line_endings",
             passes.normalize_line_endings,
             "CRLF -> LF, trim trailing whitespace",
+        ),
+        NamedPass(
+            "canonicalize_ghidra_symbols",
+            passes.canonicalize_ghidra_symbols,
+            "illegal chars in PTR_/DAT_/FUN_/... symbol names -> '_'",
         ),
         warnings_pass,
         prelude_pass,
@@ -89,13 +111,24 @@ def _head_passes(warnings_pass: NamedPass, prelude_pass: NamedPass) -> tuple[Nam
             passes.fix_illegal_switch_labels,
             "switchD_X::caseD_Y -> switchD_X_caseD_Y",
         ),
+        NamedPass(
+            "name_anonymous_enumerators",
+            passes.name_anonymous_enumerators,
+            "value-only enum members -> TAG_RESERVED_<value> = value",
+        ),
     )
 
 
-def _body_passes(context: BinaryContext, halt_pass: NamedPass) -> tuple[NamedPass, ...]:
-    """Steps 5-6 above: everything that inspects or rewrites a function
-    body, or a context-scoped set of declarations. `halt_pass` is the only
-    target-specific pass in this group."""
+def _body_passes(
+    context: BinaryContext, halt_pass: NamedPass, prototype_pass: NamedPass
+) -> tuple[NamedPass, ...]:
+    """Steps 6-9 above: everything that inspects or rewrites a function
+    body, or a context-scoped set of declarations. `halt_pass` and
+    `prototype_pass` are the two target-specific passes in this group —
+    `prototype_pass` is a no-op for the clean pipeline, since tree-sitter's
+    function-only filter discards every declaration `hoist_function_
+    prototypes` would emit anyway (same reasoning as `_NOOP_PRELUDE_PASS`
+    below)."""
     return (
         halt_pass,
         NamedPass(
@@ -128,6 +161,16 @@ def _body_passes(context: BinaryContext, halt_pass: NamedPass) -> tuple[NamedPas
             passes.drop_conflicting_builtin_decls,
             "remove known-buggy Ghidra builtin decls",
         ),
+        NamedPass(
+            "repair_void_function_results",
+            passes.repair_void_function_results,
+            "void FUN_x(...) used as a value -> int FUN_x(...)",
+        ),
+        NamedPass(
+            prototype_pass.name,
+            functools.partial(prototype_pass.apply, context),
+            prototype_pass.description,
+        ),
     )
 
 
@@ -147,11 +190,12 @@ def _build_pipeline(
     warnings_pass: NamedPass,
     prelude_pass: NamedPass,
     halt_pass: NamedPass,
+    prototype_pass: NamedPass,
     context: BinaryContext,
 ) -> tuple[NamedPass, ...]:
     return (
         _head_passes(warnings_pass, prelude_pass)
-        + _body_passes(context, halt_pass)
+        + _body_passes(context, halt_pass, prototype_pass)
         + _tail_passes()
     )
 
@@ -177,6 +221,11 @@ def build_joern_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedP
             "rewrite_halt_baddata",
             passes.rewrite_halt_baddata_for_joern,
             "halt_baddata() -> declared no-op call",
+        ),
+        prototype_pass=NamedPass(
+            "hoist_function_prototypes",
+            passes.hoist_function_prototypes,
+            "forward-declare functions called before their own definition",
         ),
         context=context,
     )
@@ -207,12 +256,21 @@ _NOOP_HALT_PASS = NamedPass(
     "reads the original Ghidra intrinsic call just fine",
 )
 
+_NOOP_PROTOTYPE_PASS = NamedPass(
+    "noop_hoist_function_prototypes",
+    lambda _context, text: text,
+    "no-op: clean.extract.extract_functions's function-only filter "
+    "discards every declaration anyway (same reasoning as "
+    "_NOOP_PRELUDE_PASS), so a forward-declaration block here would burn "
+    "tokens on text that never survives into cleaned/whole.c",
+)
+
 
 def build_clean_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedPass, ...]:
     """The LLM/cleaning-targeted pipeline, bound to `context` exactly like
     `build_joern_pipeline`. Reuses `_head_passes`/`_body_passes`/
     `_tail_passes` verbatim (see this module's docstring, lines 28-33,
-    which anticipated exactly this pipeline) with three target-specific
+    which anticipated exactly this pipeline) with four target-specific
     substitutions:
 
     * `warnings_pass` — same as Joern's (`strip_all_ghidra_warnings`);
@@ -224,6 +282,8 @@ def build_clean_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedP
     * `halt_pass` — a no-op: `rewrite_halt_baddata_for_joern` exists only
       to make Joern's CDT-based C frontend accept `halt_baddata()`; an
       LLM has no such requirement.
+    * `prototype_pass` — a no-op, for the same "discarded by the
+      function-only filter anyway" reason as `prelude_pass`.
 
     This runs BEFORE `stage2_extraction.clean.extract.extract_functions`
     (see `extract.py::_clean_whole_c`) — unlike the Joern pipeline, whose
@@ -240,6 +300,7 @@ def build_clean_pipeline(context: BinaryContext = EMPTY_CONTEXT) -> tuple[NamedP
         ),
         prelude_pass=_NOOP_PRELUDE_PASS,
         halt_pass=_NOOP_HALT_PASS,
+        prototype_pass=_NOOP_PROTOTYPE_PASS,
         context=context,
     )
 

@@ -242,6 +242,30 @@ class Settings(BaseSettings):
     """Cap on the lazily-built rootfs basename index used to recover an
     IdentifiedBinary.path that doesn't resolve directly (see
     stage2_extraction.resolve)."""
+    stage2_validation: str = Field(
+        default="warn", validation_alias="FWA_STAGE2_VALIDATION"
+    )
+    """One of "off" / "warn" / "fail" — what `stage2_extraction.validate`
+    does when a normalized Joern-target `whole.c` fails a structural check.
+    "warn" (default): record every issue, keep the artifact — a per-binary
+    failure here must never sink an otherwise-successful Stage 2 run on
+    day one. "fail": additionally mark that binary DecompilationStatus.
+    FAILED (the artifact is still written — it's the evidence for the
+    failure, not something to discard). "off": skip validation entirely."""
+    stage2_validation_gcc: bool = Field(
+        default=False, validation_alias="FWA_STAGE2_VALIDATION_GCC"
+    )
+    """Opt-in second validation layer: run `gcc -fsyntax-only` (via
+    `stage2_validation_cc`, if it's on PATH — never required, never
+    installed by this pipeline) alongside the always-on, dependency-free
+    structural checks. No Docker image Stage 2/5 uses ships a C compiler,
+    so this only ever does anything on a host that happens to have one."""
+    stage2_validation_cc: str = Field(
+        default="gcc", validation_alias="FWA_STAGE2_VALIDATION_CC"
+    )
+    """Compiler executable name/path Layer B resolves via `shutil.which`
+    when `stage2_validation_gcc` is set. Absent from PATH -> that layer is
+    recorded as skipped, never an error."""
 
     # ---- Stage 3: analysis core (ingest / clean / chunk / queue) --------
     stage3_chunk_lines: int = Field(
@@ -836,6 +860,16 @@ class Settings(BaseSettings):
         """Allow a comma- or space-separated string for the command prefix."""
         if isinstance(value, str):
             return [tok for tok in value.replace(",", " ").split() if tok]
+        return value
+
+    @field_validator("stage2_validation")
+    @classmethod
+    def _check_stage2_validation(cls, value: str) -> str:
+        allowed = {"off", "warn", "fail"}
+        if value not in allowed:
+            raise ValueError(
+                f"FWA_STAGE2_VALIDATION must be one of {sorted(allowed)}, got {value!r}"
+            )
         return value
 
     @field_validator("llm_rate_limit_scope")

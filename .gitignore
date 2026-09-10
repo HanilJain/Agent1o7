@@ -37,3 +37,6 @@ Thumbs.db
 # fetch stage comment for why it's referenced via local COPY instead of a
 # RUN curl).
 docker/.joern-cli.zip
+
+#skill generated explnations
+Developer/

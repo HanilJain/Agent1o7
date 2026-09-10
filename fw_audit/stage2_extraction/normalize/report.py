@@ -80,6 +80,18 @@ class NormalizationReport:
     ends up in `cleaned/whole.c` (which is `ExtractedSource.to_text()`,
     the filtered/concatenated result). `None` if cleaning didn't run for
     this binary (see `DecompiledBinary.warnings`)."""
+    validation: tuple[Mapping, ...] = field(default_factory=tuple)
+    """Every `stage2_extraction.validate.ValidationResult.to_json_dict()`
+    produced for `joern_whole_c` (one per layer actually run — structural
+    always, gcc only when `Settings.stage2_validation_gcc` is set and a
+    compiler is on PATH). Deliberately typed as plain `Mapping`s here, NOT
+    as `validate.result.ValidationResult` — `normalize/` must never import
+    anything from the sibling `validate/` package (see this module's own
+    "no execution" privilege class and `normalize/__init__.py`'s import-
+    purity guarantee); `extract.py` (which imports both packages) is
+    responsible for calling `.to_json_dict()` before constructing this
+    report, so this dataclass never needs to know `ValidationResult`
+    exists at all."""
 
     def to_json_dict(self) -> dict:
         return {
@@ -89,4 +101,5 @@ class NormalizationReport:
             "cleaned_whole_c": self.cleaned_whole_c.to_json_dict()
             if self.cleaned_whole_c
             else None,
+            "validation": [dict(v) for v in self.validation],
         }

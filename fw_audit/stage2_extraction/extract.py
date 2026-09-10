@@ -58,6 +58,9 @@ from fw_audit.stage2_extraction.stage1_io import (
     load_stage1_summary,
     resolve_rootfs_dir,
 )
+from fw_audit.stage2_extraction.validate import validate_text
+from fw_audit.stage2_extraction.validate.policy import apply_policy
+from fw_audit.stage2_extraction.validate.result import ValidationResult
 
 __all__ = ["Stage2InputError", "run_extraction"]
 
@@ -204,7 +207,12 @@ async def run_extraction(
 
     logger.info("stage2[%s]: normalizing %d decompiled binaries", run_id, len(decompiled))
     decompiled, mirror_warnings = _normalize_all(
-        decompiled, stage2_dir, db_subfolder, decompiled_tree=decompiled_tree, progress=progress
+        decompiled,
+        stage2_dir,
+        db_subfolder,
+        decompiled_tree=decompiled_tree,
+        progress=progress,
+        settings=settings,
     )
     warnings.extend(mirror_warnings)
 
@@ -317,6 +325,7 @@ def _normalize_all(
     *,
     decompiled_tree: Path | None = None,
     progress: bool = True,
+    settings: Settings | None = None,
 ) -> tuple[list[DecompiledBinary], list[str]]:
     """Pure CPU, no executor — runs after every Ghidra call has completed.
     A binary that never produced raw C (any non-succeeded/partial status)
@@ -329,7 +338,14 @@ def _normalize_all(
     oriented `stage2/` tree. Returns `(binaries, warnings)`; a mirror-write
     failure is a warning, never a failed binary — the authoritative
     artifact under `stage2/` is unaffected either way.
+
+    `settings` defaults to `get_settings()` (same convention as
+    `run_extraction`) — every direct/programmatic caller (Stage 3, tests)
+    that doesn't need to override `stage2_validation`/`stage2_validation_
+    gcc`/`stage2_validation_cc` still gets the same defaults `fw-extract`
+    itself uses.
     """
+    settings = settings or get_settings()
     updated: list[DecompiledBinary] = []
     all_warnings: list[str] = []
     bar = ProgressBar(len(decompiled), label="stage2 normalize") if progress else None
@@ -342,7 +358,12 @@ def _normalize_all(
                 continue
             bin_dir = layout.binary_dir(stage2_dir, binary.bin_id)
             binary = _normalize_one(
-                binary, bin_dir, workspace, decompiled_tree=decompiled_tree, warnings=all_warnings
+                binary,
+                bin_dir,
+                workspace,
+                decompiled_tree=decompiled_tree,
+                warnings=all_warnings,
+                settings=settings,
             )
             updated.append(binary)
             if bar is not None:
@@ -360,11 +381,13 @@ def _normalize_one(
     *,
     decompiled_tree: Path | None,
     warnings: list[str],
+    settings: Settings,
 ) -> DecompiledBinary:
     """Normalize one binary's raw Ghidra output for both delivery targets
     (Joern's CPG-compilable whole-program C, and Stage 3/4's LLM-facing
-    function-only extraction), write every artifact, and return the binary
-    with `artifacts`/counters updated.
+    function-only extraction), write every artifact, validate the Joern
+    target, and return the binary with `artifacts`/`counters`/`status`
+    updated.
 
     Builds a `BinaryContext` from `binary.functions` (already parsed from
     `metadata.json` by `ghidra/client.py` — no extra file read here) so the
@@ -376,8 +399,15 @@ def _normalize_one(
     artifacts_update: dict[str, str] = {}
     counters_update: dict[str, int] = {}
 
-    joern_result = _normalize_whole_c(
-        binary, bin_dir, workspace, joern_pipeline, decompiled_tree, artifacts_update, warnings
+    joern_result, validation_results = _normalize_whole_c(
+        binary,
+        bin_dir,
+        workspace,
+        joern_pipeline,
+        decompiled_tree,
+        artifacts_update,
+        warnings,
+        settings,
     )
     cleaned_result = _clean_whole_c(
         binary, bin_dir, workspace, context, artifacts_update, counters_update, warnings
@@ -392,14 +422,33 @@ def _normalize_one(
         },
         joern_whole_c=joern_result,
         cleaned_whole_c=cleaned_result,
+        validation=tuple(v.to_json_dict() for v in validation_results),
     )
     _write_normalization_report(bin_dir, report, warnings)
 
-    if not artifacts_update and not counters_update:
+    should_fail, validation_messages = apply_policy(
+        validation_results, settings.stage2_validation
+    )
+    for message in validation_messages:
+        warnings.append(f"{binary.bin_id}: {message}")
+    total_issues = sum(len(r.issues) for r in validation_results)
+    if total_issues:
+        counters_update["validation_issue_count"] = total_issues
+
+    if not artifacts_update and not counters_update and not should_fail:
         return binary
     updates: dict[str, object] = dict(counters_update)
     if artifacts_update:
         updates["artifacts"] = binary.artifacts.model_copy(update=artifacts_update)
+    if should_fail:
+        updates["status"] = DecompilationStatus.FAILED
+        updates["errors"] = [
+            *binary.errors,
+            f"Stage 2 validation failed ({binary.bin_id}): "
+            "at least one ERROR-severity issue in the normalized Joern "
+            "target — see normalized/normalization_report.json for details. "
+            "The artifact is still written; only the reported status changed.",
+        ]
     return binary.model_copy(update=updates)
 
 
@@ -411,13 +460,26 @@ def _normalize_whole_c(
     decompiled_tree: Path | None,
     artifacts_update: dict[str, str],
     warnings: list[str],
-) -> NormalizationResult | None:
+    settings: Settings,
+) -> tuple[NormalizationResult | None, tuple[ValidationResult, ...]]:
     """Normalize `raw/decompiled/whole.c` for the Joern target, write it,
-    mirror it, and return the `NormalizationResult` (or `None` if there was
-    no raw whole-program C to normalize)."""
+    mirror it, validate it (`Settings.stage2_validation`), and return the
+    `NormalizationResult` (or `None` if there was no raw whole-program C to
+    normalize) alongside every `ValidationResult` produced.
+
+    Validation runs immediately after `joern_out.write_text(...)`, against
+    the EXACT bytes just written — `ValidationResult.checked_sha256` is
+    computed from `result.text`, the same string, so a report reader can
+    always confirm a validation result actually describes the artifact on
+    disk. `settings.stage2_validation == "off"` still writes the artifact
+    (validation is skipped entirely, not merely non-fatal); "warn"/"fail"
+    both always keep the artifact regardless of what's found — the
+    normalized text is the evidence for any issue reported against it, so
+    deleting it on failure would make the report unusable (see
+    `Settings.stage2_validation`'s docstring for the full policy)."""
     whole_c = layout.raw_decompiled_whole_c(bin_dir)
     if not whole_c.is_file():
-        return None
+        return None, ()
     joern_out = layout.normalized_joern_whole_c(bin_dir)
     joern_out.parent.mkdir(parents=True, exist_ok=True)
     raw_text = whole_c.read_text(encoding="utf-8", errors="replace")
@@ -428,7 +490,16 @@ def _normalize_whole_c(
         mirrored = _write_mirror(decompiled_tree, binary.rootfs_path, result.text, warnings)
         if mirrored is not None:
             artifacts_update["decompiled_tree_c"] = mirrored
-    return result
+
+    validation_results: tuple[ValidationResult, ...] = ()
+    if settings.stage2_validation != "off":
+        validation_results = validate_text(
+            result.text,
+            target="joern_whole_c",
+            run_gcc=settings.stage2_validation_gcc,
+            compiler=settings.stage2_validation_cc,
+        )
+    return result, validation_results
 
 
 def _clean_whole_c(

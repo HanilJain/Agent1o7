@@ -26,6 +26,21 @@ reasons, all confirmed against real Ghidra output:
    162 bodies found in one real binary). The pattern here spans lines but
    cannot run away, because `;`, `{`, and `}` are all excluded from what it
    may match.
+
+`_FUNCTION_HEADER_RE` also matches a column-0 control-flow statement whose
+condition happens to close a line by itself, most often right after a
+`LAB_xxx:`/`joined_r0x...:`/`switchD_..._caseD_...:` goto label Ghidra
+emitted at column 0 inside a real function's body:
+    LAB_00432d70:
+      switch(local_38) {
+`switch(local_38) {` satisfies `_FUNCTION_HEADER_RE` exactly as validly as
+a real header does — nothing in that regex distinguishes a keyword from a
+declarator name. Measured on real firmware: 30 such false positives
+(`if` x29, `switch` x1) BEFORE any pass in this pipeline runs, so this is
+not something a normalization pass introduces — it is Ghidra's own emitted
+shape. `find_function_bodies` excludes every C keyword that can precede a
+parenthesized condition (`if`/`switch`/`while`/`for`) at the declarator-
+name check below, since none of those is ever a legal function name.
 """
 
 from __future__ import annotations
@@ -48,6 +63,14 @@ _FUNCTION_HEADER_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 
+# An enum header: optional `typedef`, `enum`, an optional tag name, then
+# `{`. Runs against masked text for the same comment/string-blindness
+# reason as `_FUNCTION_HEADER_RE`.
+_ENUM_HEADER_RE = re.compile(
+    r"^(?:typedef\s+)?enum\s+(?P<tag>[A-Za-z_]\w*)?\s*\{",
+    re.MULTILINE,
+)
+
 # The declarator name is the identifier immediately before the parameter
 # list's opening '('.
 _DECLARATOR_NAME_RE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}()]*\)\s*\{\Z", re.DOTALL)
@@ -56,6 +79,12 @@ _DECLARATOR_NAME_RE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}()]*\)\s*\{\Z", re.DO
 # comma-separated chunk (skips `void`, `...`, and bare type names with no
 # name, all of which have no trailing identifier of interest).
 _PARAM_NAME_RE = re.compile(r"([A-Za-z_]\w*)\s*$")
+
+# C keywords that can be immediately followed by `(condition) {` — never a
+# legal function (or any other identifier's) name, so a `_DECLARATOR_NAME_
+# RE` match against one of these is always a control-flow statement that
+# `_FUNCTION_HEADER_RE` mistook for a header, never a real declaration.
+_CONTROL_FLOW_KEYWORDS = frozenset({"if", "switch", "while", "for"})
 
 
 class FunctionBody(NamedTuple):
@@ -143,6 +172,8 @@ def find_function_bodies(text: str) -> tuple[FunctionBody, ...]:
         name_match = _DECLARATOR_NAME_RE.search(header_text)
         if not name_match:
             continue
+        if name_match.group(1) in _CONTROL_FLOW_KEYWORDS:
+            continue
         paren_start = header_text.index("(", name_match.start())
         paren_end = header_text.rindex(")")
         params = _parse_params(header_text[paren_start + 1 : paren_end])
@@ -155,6 +186,39 @@ def find_function_bodies(text: str) -> tuple[FunctionBody, ...]:
                 body_start=header_end,
                 body_end=body_end,
             )
+        )
+    return tuple(bodies)
+
+
+class EnumBody(NamedTuple):
+    """One `enum { ... }` body found in a file's text — offsets index into
+    the ORIGINAL (unmasked) text, same convention as `FunctionBody`."""
+
+    tag: str | None
+    """The enum's tag name, or `None` for an anonymous `enum { ... }`."""
+    body_start: int
+    """Index just past the opening `{`."""
+    body_end: int
+    """Index of the matching closing `}`."""
+
+
+def find_enum_bodies(text: str) -> tuple[EnumBody, ...]:
+    """Every `enum { ... }` body in `text`, in source order — used by
+    `passes.name_anonymous_enumerators` to scope its rewrite to genuine
+    enumerator lists (never an array initializer or any other brace-
+    delimited construct that happens to contain a bare `=value,` line)."""
+    masked = mask_non_code(text)
+    brace_offsets = _brace_offsets(masked)
+    bodies: list[EnumBody] = []
+    for match in _ENUM_HEADER_RE.finditer(masked):
+        open_pos = match.end() - 1
+        if masked[open_pos] != "{":
+            continue
+        body_end = _matching_brace(masked, brace_offsets, open_pos)
+        if body_end is None:
+            continue
+        bodies.append(
+            EnumBody(tag=match.group("tag"), body_start=match.end(), body_end=body_end)
         )
     return tuple(bodies)
 
@@ -176,4 +240,4 @@ def splice(text: str, edits: Sequence[tuple[int, int, str]]) -> str:
     return "".join(pieces)
 
 
-__all__ = ["FunctionBody", "find_function_bodies", "splice"]
+__all__ = ["EnumBody", "FunctionBody", "find_enum_bodies", "find_function_bodies", "splice"]
