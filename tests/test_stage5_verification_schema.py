@@ -21,6 +21,7 @@ from fw_audit.common.verification import (
 def test_evaluator_verdict_round_trips_through_json():
     verdict = EvaluatorVerdict(
         verdict=EvaluationVerdict.PASS,
+        hypothesis_proved="A",
         confidence="HIGH",
         reasoning="the script ran and clearly settled the question",
         feedback_for_retry="",
@@ -29,12 +30,29 @@ def test_evaluator_verdict_round_trips_through_json():
     assert parsed == verdict
 
 
+def test_evaluator_verdict_hypothesis_proved_defaults_to_none():
+    # Backward compatibility: an already-persisted verifications/*.json
+    # transcript from before this field existed must still parse.
+    verdict = EvaluatorVerdict(verdict=EvaluationVerdict.PASS)
+    assert verdict.hypothesis_proved == "none"
+
+
 def test_evaluator_verdict_rejects_unknown_verdict():
     import pytest
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
         EvaluatorVerdict.model_validate({"verdict": "NOT_A_REAL_VERDICT"})
+
+
+def test_evaluator_verdict_rejects_unknown_hypothesis_proved():
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        EvaluatorVerdict.model_validate(
+            {"verdict": "PASS", "hypothesis_proved": "C"}
+        )
 
 
 def test_evaluation_verdict_enum_values():

@@ -223,10 +223,28 @@ def terminal_prompter(req: HitlRequest) -> HitlDecision:
 
 
 def is_budget_exhausted(result: TrackResult) -> bool:
-    """The HITL trigger condition, checked against the FACT tagged by the
-    producing track (see this module's docstring) — never re-derived from
-    the bare verdict value alone."""
+    """The per-track HITL trigger condition, checked against the FACT tagged
+    by the producing track (see this module's docstring) — never re-derived
+    from the bare verdict value alone."""
     return bool((result.evidence or {}).get("budget_exhausted"))
+
+
+def neither_proved(static_result: TrackResult, dynamic_result: TrackResult) -> bool:
+    """The joint HITL trigger condition: NEITHER track positively proved a
+    hypothesis, even if neither individually exhausted its own iteration
+    budget (`is_budget_exhausted`, checked separately per track). Two tracks
+    that both settle on `proved_hypothesis == "none"` without either one
+    hitting its cap would otherwise flow straight into `joint_evaluate`
+    unprompted — this is the case that catches them. A track whose verdict
+    was set by a human (`evidence["human_attributed"]`) counts as having
+    "proved" something for this purpose — a second human prompt over a
+    decision a human already made would be redundant."""
+    for result in (static_result, dynamic_result):
+        if result.proved_hypothesis in ("A", "B"):
+            return False
+        if (result.evidence or {}).get("human_attributed"):
+            return False
+    return True
 
 
 def force_verdict_result(
@@ -236,10 +254,13 @@ def force_verdict_result(
     `evidence["human_attributed"]=True` is what lets `joint_evaluate`'s
     `collect_residual_unknowns` (and `fvvw.report`'s prompt) state the
     attribution explicitly rather than presenting a hand-set verdict as
-    machine-derived. `proved_hypothesis` maps the same way
-    `fvvw.static_track` already does (CONFIRMED->A, REFUTED->B, else
-    'none') so downstream consumers of `proved_hypothesis` don't need a
-    special case for a human-forced result."""
+    machine-derived. `proved_hypothesis` maps CONFIRMED->A, REFUTED->B, else
+    'none' — unlike `fvvw.static_track.run_static_track` (which now reads
+    the evaluator's OWN `hypothesis_proved` judgement rather than relabelling
+    its verdict), this mapping is deliberately kept here: a human operator
+    directly asserted `verdict` via this action, so the "positive proof"
+    requirement is satisfied by the human's own rationale, carried in
+    `evidence["rationale"]` and flagged by `human_attributed`."""
     if verdict == VerificationVerdict.CONFIRMED:
         proved_hypothesis = "A"
     elif verdict == VerificationVerdict.REFUTED:
@@ -299,6 +320,7 @@ __all__ = [
     "build_human_review_record",
     "force_verdict_result",
     "is_budget_exhausted",
+    "neither_proved",
     "prompt_for_track",
     "terminal_prompter",
 ]

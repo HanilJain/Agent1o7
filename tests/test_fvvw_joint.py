@@ -69,9 +69,30 @@ def test_agreement_refuted_vs_error_is_one_sided():
     assert a == Agreement.ONE_SIDED
 
 
-def test_agreement_both_inconclusive_is_one_sided():
+def test_agreement_both_inconclusive_is_neither_not_one_sided():
+    # NEITHER is distinct from ONE_SIDED: ONE_SIDED requires exactly one
+    # track to have reached a definite verdict. Two tracks that both settled
+    # on INCONCLUSIVE said nothing about the finding at all -- conflating
+    # that with "one witness spoke" would misrepresent a total absence of
+    # evidence as a single-track result.
     a = classify_agreement(
         _result(VerificationVerdict.INCONCLUSIVE), _result(VerificationVerdict.INCONCLUSIVE)
+    )
+    assert a == Agreement.NEITHER
+
+
+def test_agreement_both_error_is_neither():
+    a = classify_agreement(
+        _result(VerificationVerdict.ERROR), _result(VerificationVerdict.ERROR)
+    )
+    assert a == Agreement.NEITHER
+
+
+def test_agreement_one_confirmed_one_inconclusive_is_still_one_sided():
+    # ONE_SIDED must still fire correctly when exactly one track is
+    # definite -- the NEITHER branch must not swallow this case.
+    a = classify_agreement(
+        _result(VerificationVerdict.CONFIRMED), _result(VerificationVerdict.INCONCLUSIVE)
     )
     assert a == Agreement.ONE_SIDED
 

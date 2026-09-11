@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -40,9 +41,16 @@ class VerificationVerdict(str, Enum):
     prompt too (see `stage5_verification.agent.prompts`)."""
 
     CONFIRMED = "CONFIRMED"
-    """CPG evidence establishes the finding's claimed security condition."""
+    """CPG evidence establishes the finding's claimed security condition —
+    requires `EvaluatorVerdict.hypothesis_proved == "A"` (a concrete
+    source->sink path was exhibited)."""
     REFUTED = "REFUTED"
-    """CPG evidence contradicts the finding's claimed security condition."""
+    """CPG evidence POSITIVELY contradicts the finding's claimed security
+    condition — requires `EvaluatorVerdict.hypothesis_proved == "B"` (a
+    specific sanitizer/guard/constant was exhibited, or a demonstrably
+    healthy dataflow engine still found no path). An empty
+    `reachableByFlows` result on its own is NEVER sufficient for REFUTED —
+    see `agent.prompts.EVALUATOR_SYSTEM_PROMPT`'s cardinal rule."""
     INCONCLUSIVE = "INCONCLUSIVE"
     """Queries ran without error but neither proved nor disproved the claim
     within the allotted attempts."""
@@ -57,9 +65,12 @@ class EvaluationVerdict(str, Enum):
     consumer should extend without updating that prompt too."""
 
     PASS = "PASS"
-    """The script ran and produced a real answer about the finding —
-    including a clean FLOW_NOT_FOUND, which is a conclusive result, not a
-    failure. Never loop just because the finding wasn't confirmed."""
+    """The script ran and its output can be judged on the merits — this is
+    NOT the same as having settled the question. Which hypothesis (if any)
+    the round positively proved is carried separately in
+    `EvaluatorVerdict.hypothesis_proved`; `agent.graph.evaluate_node`
+    converts a PASS with `hypothesis_proved == "none"` back into a retry
+    rather than concluding on it."""
     FAIL_RETRY = "FAIL_RETRY"
     """The script itself is broken (bad method name, CPGQL syntax error,
     forgotten `println`, timeout) — this run says nothing about the finding
@@ -77,10 +88,22 @@ class EvaluatorVerdict(BaseModel):
     response, not `with_structured_output` (see this module's docstring)."""
 
     verdict: EvaluationVerdict
+    hypothesis_proved: Literal["A", "B", "none"] = Field(
+        default="none",
+        description=(
+            'Which competing hypothesis this round POSITIVELY proved. "A": a '
+            'concrete source->sink path was exhibited. "B": a specific '
+            'sanitizer, guard, or constant sink argument was exhibited, OR the '
+            "script's own engine-health checks all passed and a demonstrably "
+            'working dataflow engine still found no path. "none": neither. An '
+            'empty reachableByFlows result, alone, is NEVER "B".'
+        ),
+    )
     confidence: str = Field(
         default="LOW",
         description=(
-            "HIGH, MEDIUM, or LOW — how confidently the script's output settles the question."
+            "HIGH, MEDIUM, or LOW — how confidently the script's output settles the question, "
+            "not how cleanly the script ran."
         ),
     )
     reasoning: str = Field(
@@ -454,8 +477,10 @@ class TrackResult(BaseModel):
         description="confirmed/refuted/inconclusive/error, reusing the SAME enum the "
         "existing static track already produces."
     )
-    proved_hypothesis: str = Field(
-        default="none", description='"A", "B", or "none".'
+    proved_hypothesis: Literal["A", "B", "none"] = Field(
+        default="none",
+        description='"A", "B", or "none" — "A"/"B" require POSITIVE proof, '
+        "never inferred from absence of evidence (see EvaluatorVerdict.hypothesis_proved).",
     )
     evidence: dict = Field(default_factory=dict)
     iters_used: int = 0
@@ -471,6 +496,9 @@ class Agreement(str, Enum):
     CONCORDANT_REFUTE = "concordant_refute"
     DISCORDANT = "discordant"
     ONE_SIDED = "one_sided"
+    NEITHER = "neither"
+    """Neither track reached a definite (CONFIRMED/REFUTED) verdict — distinct
+    from ONE_SIDED, which requires exactly one track to have reached one."""
 
 
 class MechanismConfidence(str, Enum):

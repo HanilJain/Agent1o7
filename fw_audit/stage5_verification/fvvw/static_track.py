@@ -237,16 +237,16 @@ async def run_static_track(
         # tracks without special-casing which one it's looking at.
         evidence["budget_exhausted"] = True
 
-    # The static track has no A/B hypothesis-switch of its own (that logic
-    # applies primarily to the dynamic track) — CONFIRMED implies A,
-    # REFUTED implies B, matching joern_evaluate's existing
-    # confirm/refute/inconclusive taxonomy, per the design doc's own
-    # closing note on this.
-    if verdict == VerificationVerdict.CONFIRMED:
-        proved_hypothesis = "A"
-    elif verdict == VerificationVerdict.REFUTED:
-        proved_hypothesis = "B"
-    else:
+    # A track may only claim a hypothesis it POSITIVELY proved. Previously
+    # this relabelled the verdict (CONFIRMED->A, REFUTED->B), which minted
+    # "B proved" from a bare empty flow result whenever the static track
+    # happened to land on REFUTED. The evaluator now states which hypothesis
+    # it proved (`EvaluatorVerdict.hypothesis_proved`), `agent.graph.
+    # final_status` derives `verdict` from that SAME judgement, so the two
+    # can no longer disagree — reading it straight off final_state here is a
+    # correctness fix, not just a rename.
+    proved_hypothesis = final_state.get("hypothesis_proved") or "none"
+    if proved_hypothesis not in ("A", "B"):
         proved_hypothesis = "none"
 
     return TrackResult(
@@ -306,6 +306,9 @@ async def run_injected_static_script(
 
     marker = extract_result_marker(attempt.stdout, attempt.stderr)
     evaluation_verdict = EvaluationVerdict.PASS if attempt.ok else EvaluationVerdict.FAIL_STOP
+    # No evaluator round ran an operator-injected script — final_status's
+    # legacy marker-only fallback applies (hypothesis_proved omitted), since
+    # a human authored/vouched for this script directly.
     verdict = final_status(evaluation_verdict, marker)
 
     if verdict == VerificationVerdict.CONFIRMED:

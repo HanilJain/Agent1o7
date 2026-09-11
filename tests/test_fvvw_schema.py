@@ -135,6 +135,7 @@ def test_agreement_enum_values():
         "concordant_refute",
         "discordant",
         "one_sided",
+        "neither",
     }
 
 

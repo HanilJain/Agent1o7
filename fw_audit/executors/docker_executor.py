@@ -38,6 +38,23 @@ def _host_user_flag() -> list[str]:
     return ["--user", f"{getuid()}:{getgid()}"]
 
 
+def _hostname_flags(container_name: str) -> list[str]:
+    """Force a deterministic hostname AND make it locally resolvable.
+
+    Containers run `--network=none`, so there is no DNS and Docker's default
+    hostname (the container ID) resolves nowhere. JVM tools -- Joern's log4j
+    init, Ghidra's -- call `InetAddress.getLocalHost()` at startup and, on
+    failure, dump a ~30-line `UnknownHostException` stack trace into stdout
+    (e.g. "Could not determine local host name" / "Temporary failure in name
+    resolution"), which then lands in every persisted transcript and
+    evidence blob. Non-fatal — the tool still completes — but pure noise.
+    `--add-host` alone is not enough: the hostname it must resolve is the
+    container ID Docker assigns by default, not `--name`, so the hostname
+    is forced to match what `--add-host` resolves.
+    """
+    return ["--hostname", container_name, "--add-host", f"{container_name}:127.0.0.1"]
+
+
 def to_container_path(host_path: str | Path, workspace_root: Path) -> str:
     """Translate a host path under `workspace_root` to its in-container mount path.
 
@@ -93,6 +110,7 @@ class DockerExecutor(Executor):
         # like Ghidra's JVM can otherwise leave behind as PID 1.
         container_name = f"fw-audit-{uuid.uuid4().hex[:12]}"
         docker_args = ["run", "--rm", "--init", "--network=none", "--name", container_name]
+        docker_args += _hostname_flags(container_name)
         if settings.docker_run_as_host_user:
             docker_args += _host_user_flag()
 

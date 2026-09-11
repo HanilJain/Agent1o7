@@ -29,6 +29,11 @@ def classify_agreement(static_result: TrackResult, dynamic_result: TrackResult) 
       REFUTED) while the other is INCONCLUSIVE or ERROR (i.e. never really
       ran to a decisive answer) — NOT the same as `discordant`, since there
       is no actual contradiction, just one missing witness.
+    - `neither`: NEITHER track reached a definite verdict — distinct from
+      `one_sided`, which requires exactly one witness to have spoken. Two
+      tracks that both landed on INCONCLUSIVE/ERROR say nothing about the
+      finding at all; conflating that with `one_sided` would let a single
+      surviving witness and a total absence of witnesses look the same.
     """
     s, d = static_result.verdict, dynamic_result.verdict
     definite = {VerificationVerdict.CONFIRMED, VerificationVerdict.REFUTED}
@@ -39,6 +44,8 @@ def classify_agreement(static_result: TrackResult, dynamic_result: TrackResult) 
         return Agreement.CONCORDANT_REFUTE
     if {s, d} == definite:
         return Agreement.DISCORDANT
+    if s not in definite and d not in definite:
+        return Agreement.NEITHER
     return Agreement.ONE_SIDED
 
 
@@ -59,14 +66,18 @@ def classify_mechanism_confidence(
     - `discordant` agreement -> `discordant_hold`, ALWAYS — never
       auto-resolved by trusting one track by default, per the design doc's
       hard requirement. This is the one case a human reviewer must look at.
-    - Everything else (both inconclusive/error, or one_sided with the
-      surviving track REFUTED — treated as leaning refuted rather than
-      confirmed) -> `inconclusive`.
+    - `neither` agreement (no witness reached a definite verdict at all) ->
+      `inconclusive`, explicitly — never silently absorbed into the same
+      bucket as a `one_sided` REFUTED without being named as its own case.
+    - Everything else (one_sided with the surviving track REFUTED — treated
+      as leaning refuted rather than confirmed) -> `inconclusive`.
     """
     if agreement == Agreement.CONCORDANT_CONFIRM:
         return MechanismConfidence.CONFIRMED_STRONG
     if agreement == Agreement.DISCORDANT:
         return MechanismConfidence.DISCORDANT_HOLD
+    if agreement == Agreement.NEITHER:
+        return MechanismConfidence.INCONCLUSIVE
     if agreement == Agreement.ONE_SIDED:
         surviving = _surviving_definite_verdict(static_result, dynamic_result)
         if surviving == VerificationVerdict.CONFIRMED:
@@ -169,6 +180,27 @@ def collect_residual_unknowns(
             "static track did not reach a decisive verdict "
             f"({static_result.verdict.value}) — see its own evidence for the attempt history."
         )
+
+    # Defense in depth: a track may only claim REFUTED with a positively
+    # proved hypothesis B (see agent.graph.final_status/EvaluatorVerdict.
+    # hypothesis_proved). This should be structurally impossible for the
+    # static/dynamic tracks now, but flag it explicitly rather than trusting
+    # that invariant silently — it catches any future regression that
+    # reintroduces verdict-relabelling, including in code paths added later,
+    # and costs nothing when the invariant holds (an unset/"none"
+    # proved_hypothesis on a human-forced verdict is already covered by the
+    # human_attributed caveat below, so this only fires on an UNFLAGGED
+    # REFUTED lacking "B" — the genuine regression case).
+    for label, result in (("static", static_result), ("dynamic", dynamic_result)):
+        if (
+            result.verdict == VerificationVerdict.REFUTED
+            and result.proved_hypothesis != "B"
+            and not (result.evidence or {}).get("human_attributed")
+        ):
+            unknowns.append(
+                f"{label} track reported REFUTED without a positively-proved hypothesis B "
+                "— the refutation rests on absence of evidence and should not be relied on."
+            )
 
     # A forced human verdict (HITL's `force_verdict` action — see
     # fvvw.hitl.force_verdict_result) is flagged as an explicit caveat on

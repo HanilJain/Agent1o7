@@ -20,7 +20,7 @@ value.
 from __future__ import annotations
 
 import operator
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, TypedDict
 
 from fw_audit.common.findings import Finding
 from fw_audit.common.verification import (
@@ -68,7 +68,6 @@ class FVVWState(TypedDict, total=False):
     emulation_plan: dict
     gdb_transcript: str
     signals: Annotated[list[dict], operator.add]
-    active_hypothesis: Literal["A", "B"]
 
     # ---- mem.repair.* — bringup_stabilize -----------------------------------
     repair_return_to: str
@@ -98,8 +97,8 @@ class FVVWState(TypedDict, total=False):
 
 STATIC_TRACK_READABLE_KEYS: tuple[str, ...] = ("claim", "target", "plan")
 """Keys the static-track subgraph may READ. Notably excludes every
-`dynamic_*`/`emulation_plan`/`gdb_transcript`/`signals`/`active_hypothesis`/
-`repair_*` key — the static-track isolation rule."""
+`dynamic_*`/`emulation_plan`/`gdb_transcript`/`signals`/`repair_*` key — the
+static-track isolation rule."""
 
 STATIC_TRACK_WRITABLE_KEYS: tuple[str, ...] = ("static_result",)
 """Keys the static-track subgraph may WRITE."""
@@ -113,7 +112,6 @@ DYNAMIC_TRACK_WRITABLE_KEYS: tuple[str, ...] = (
     "emulation_plan",
     "gdb_transcript",
     "signals",
-    "active_hypothesis",
     "repair_return_to",
     "repair_applied_fixes",
     "repair_quirks_discovered",

@@ -1,13 +1,17 @@
 """The fork-join's dynamic (QEMU+GDB) track — FVVW v3 §6 nodes 9-15, §7's
 GDB session recipe, §8's `bringup_stabilize` repair catalog, and §9's
-hypothesis A/B switching logic.
+hypothesis A/B rule engine (`dynamic_evaluate` — deliberately SYMMETRIC
+between A and B, both requiring the same multi-signal corroboration bar; an
+earlier `active_hypothesis`-switching mechanism was removed for never
+actually changing what evidence was gathered, see that function's
+docstring).
 
 Every function here is written to be called EITHER as a standalone
 function (tests, `fw-verify debug dynamic`) or wrapped as a LangGraph node
 by `fvvw.graph` (Phase 5) — each takes/returns plain dicts shaped like
 `fvvw.state.FVVWState`'s `dynamic_*`/`emulation_plan`/`gdb_transcript`/
-`signals`/`active_hypothesis`/`repair_*` keys, the same "node returns only
-its own new state" shape `agent.graph`'s nodes already establish.
+`signals`/`repair_*` keys, the same "node returns only its own new state"
+shape `agent.graph`'s nodes already establish.
 
 Command composition for every QEMU/GDB invocation lives in
 `tools.qemu_gdb_tool` (imported, never re-implemented here) — this module
@@ -983,33 +987,38 @@ def dynamic_evaluate(
     captured_sink_argument: str | None,
     signals: list[dict],
     plan: DynamicPlan,
-    active_hypothesis: Literal["A", "B"],
     iteration: int,
     max_iterations: int,
 ) -> dict:
-    """Deterministic (script, no LLM) verdict + hypothesis-switch router —
-    FVVW §9's rule, applied mechanically:
+    """Deterministic (script, no LLM) verdict router — FVVW §9's rule,
+    applied mechanically and SYMMETRICALLY between the two hypotheses (an
+    earlier version threaded an `active_hypothesis` switch through this
+    function that never actually changed what evidence was gathered — rules
+    2/3 below ran identically regardless of its value — so it was dropped
+    rather than kept as a parameter that looked like it did something it
+    didn't; see `stage5_verification/CLAUDE.md`):
 
     1. Not reached (breakpoint never fired) -> retry signal, no verdict yet
        (unless the retry budget is exhausted, in which case `inconclusive`).
-    2. Reached + marker present unmodified in >= 3 signals -> hypothesis A
-       proved, `verdict=confirmed`.
-    3. Reached + marker demonstrably NEUTRALIZED (captured but the marker
-       text is absent/altered) -> that IS proof of B, `verdict=refuted`.
-    4. Same non-confirming, non-refuting result recurring at the iteration
-       cap -> SWITCH `active_hypothesis` to the other one and signal the
-       caller to re-run reach/guards/trigger aimed at proving the new
-       hypothesis, rather than terminating.
-    5. Neither provable within `max_iterations` -> terminate
+    2. Reached + marker present unmodified in >= `required` signals ->
+       hypothesis A proved, `verdict=confirmed`.
+    3. Reached + marker demonstrably NEUTRALIZED in >= `required` signals
+       that actually reported on marker presence (captured, but the marker
+       text is absent/altered, corroborated the SAME multi-signal bar as A
+       rather than a single signal) -> that IS proof of B, `verdict=refuted`.
+    4. Neither provable within `max_iterations` -> terminate
        `inconclusive`, `proved_hypothesis=none`.
 
-    Returns a dict with `route` (`"retry"` | `"switch_hypothesis"` |
-    `"done"`) plus (`done` only) a `TrackResult`-shaped `result` dict —
-    kept as a plain dict rather than constructing `TrackResult` directly so
-    a non-terminal call doesn't need a placeholder verdict.
+    Returns a dict with `route` (`"retry"` | `"done"`) plus (`done` only) a
+    `TrackResult`-shaped `result` dict — kept as a plain dict rather than
+    constructing `TrackResult` directly so a non-terminal call doesn't need
+    a placeholder verdict.
     """
     required = max(3, len(plan.required_signals) or 3)
     marker_signals_present = sum(1 for s in signals if s.get("marker_present"))
+    marker_signals_absent = sum(
+        1 for s in signals if s.get("marker_present") is False
+    )
     marker_signals_seen = sum(1 for s in signals if "marker_present" in s)
 
     if not reached:
@@ -1020,20 +1029,45 @@ def dynamic_evaluate(
         return {"route": "retry"}
 
     if captured_sink_argument is not None and marker_signals_present >= required:
-        return _terminal(VerificationVerdict.CONFIRMED, "A", iteration, reason="")
+        return _terminal(
+            VerificationVerdict.CONFIRMED,
+            "A",
+            iteration,
+            reason=(
+                f"marker observed present in {marker_signals_present}/{marker_signals_seen} "
+                f"signals (>= {required} required); "
+                f"captured_sink_argument={captured_sink_argument!r}"
+            ),
+            captured_sink_argument=captured_sink_argument,
+            signals=signals,
+        )
 
     if (
         captured_sink_argument is not None
-        and marker_signals_seen > 0
+        and marker_signals_absent >= required
         and marker_signals_present == 0
     ):
         # Reached, captured, but the marker is demonstrably ABSENT from
-        # every signal that could show it — clean neutralization, proof of B.
-        return _terminal(VerificationVerdict.REFUTED, "B", iteration, reason="")
+        # AT LEAST `required` independent signals that actually reported on
+        # it (the same multi-signal corroboration bar rule 2 applies to A) —
+        # clean neutralization, positive proof of B. A single signal
+        # reporting absence, alone, is NOT sufficient — that was the old
+        # behavior (`marker_signals_seen > 0`) and is exactly the kind of
+        # "B from a thin absence signal" this bar is meant to rule out.
+        return _terminal(
+            VerificationVerdict.REFUTED,
+            "B",
+            iteration,
+            reason=(
+                f"marker observed absent in {marker_signals_absent}/{marker_signals_seen} "
+                f"signals that reported on it (>= {required} required); "
+                f"captured_sink_argument={captured_sink_argument!r}"
+            ),
+            captured_sink_argument=captured_sink_argument,
+            signals=signals,
+        )
 
     if iteration >= max_iterations:
-        if active_hypothesis == "A":
-            return {"route": "switch_hypothesis", "next_hypothesis": "B"}
         return _terminal(
             VerificationVerdict.INCONCLUSIVE,
             "none",
@@ -1045,9 +1079,23 @@ def dynamic_evaluate(
 
 
 def _terminal(
-    verdict: VerificationVerdict, proved_hypothesis: str, iteration: int, *, reason: str
+    verdict: VerificationVerdict,
+    proved_hypothesis: str,
+    iteration: int,
+    *,
+    reason: str,
+    captured_sink_argument: str | None = None,
+    signals: list[dict] | None = None,
 ) -> dict:
     evidence: dict = {"reason": reason} if reason else {}
+    # A REFUTED/"B" (or CONFIRMED/"A") result must carry what was actually
+    # cited for it — an empty evidence dict left nothing for
+    # `collect_residual_unknowns`/`write_report` to point to when justifying
+    # the verdict (previously only INCONCLUSIVE carried a `reason` at all).
+    if captured_sink_argument is not None:
+        evidence["captured_sink_argument"] = captured_sink_argument
+    if signals is not None:
+        evidence["signals"] = signals
     if verdict == VerificationVerdict.INCONCLUSIVE:
         # HITL's trigger condition (fvvw.graph.run_fvvw, see fvvw.hitl) is a
         # FACT tagged here, not an inference made later from the verdict

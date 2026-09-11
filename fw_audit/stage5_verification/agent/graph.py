@@ -66,7 +66,9 @@ from fw_audit.stage5_verification.agent.prompts import (
 from fw_audit.stage5_verification.tools.joern_tool import build_cpg_async, run_joern_script_async
 
 _RESULT_RE = re.compile(
-    r"^[ \t]*RESULT:[ \t]*(FLOW_FOUND|FLOW_NOT_FOUND|QUERY_ERROR)\b", re.MULTILINE
+    r"^[ \t]*RESULT:[ \t]*"
+    r"(FLOW_FOUND|FLOW_BLOCKED|FLOW_NOT_FOUND|INDETERMINATE|QUERY_ERROR)\b",
+    re.MULTILINE,
 )
 
 
@@ -96,6 +98,11 @@ class VerifierState(TypedDict, total=False):
     evaluation_verdict: EvaluationVerdict
     evaluation_reasoning: str
     evaluation_confidence: str
+    hypothesis_proved: str
+    """"A", "B", or "none" — which hypothesis the LATEST evaluated round
+    positively proved (see `EvaluatorVerdict.hypothesis_proved`). A track may
+    only claim CONFIRMED/REFUTED when this is "A"/"B" — never inferred from
+    an empty flow result alone."""
 
     # ---- conclusion (names UNCHANGED from the old tool-calling graph, so
     # agent.verifier's report-assembly block needed no changes) ----
@@ -113,13 +120,13 @@ class VerifierState(TypedDict, total=False):
 
 
 def extract_result_marker(stdout: str, stderr: str = "") -> str | None:
-    """Parse the `RESULT: FLOW_FOUND|FLOW_NOT_FOUND|QUERY_ERROR` marker line
-    a generated script is instructed to print (see
-    `agent.prompts.GENERATOR_SYSTEM_PROMPT`). Line-anchored (not a bare
-    substring `in` check) so a script that merely quotes the marker text
-    inside a comment or an intermediate diagnostic `println` can't mint a
-    false verdict. Checked in stdout first, then stderr — Joern's JVM
-    occasionally routes script output to stderr instead."""
+    """Parse the `RESULT: FLOW_FOUND|FLOW_BLOCKED|FLOW_NOT_FOUND|
+    INDETERMINATE|QUERY_ERROR` marker line a generated script is instructed
+    to print (see `agent.prompts.GENERATOR_SYSTEM_PROMPT`). Line-anchored
+    (not a bare substring `in` check) so a script that merely quotes the
+    marker text inside a comment or an intermediate diagnostic `println`
+    can't mint a false verdict. Checked in stdout first, then stderr —
+    Joern's JVM occasionally routes script output to stderr instead."""
     match = _RESULT_RE.search(stdout)
     if match:
         return match.group(1)
@@ -130,17 +137,35 @@ def extract_result_marker(stdout: str, stderr: str = "") -> str | None:
 
 
 def final_status(
-    evaluation_verdict: EvaluationVerdict, marker: str | None
+    evaluation_verdict: EvaluationVerdict,
+    marker: str | None,
+    hypothesis_proved: str = "",
 ) -> VerificationVerdict:
     """Mechanical derivation of the final `VerificationVerdict` — no LLM
-    call. Mirrors the ported pipeline's `conclude` node exactly."""
-    if evaluation_verdict == EvaluationVerdict.PASS:
-        if marker == "FLOW_FOUND":
-            return VerificationVerdict.CONFIRMED
-        if marker == "FLOW_NOT_FOUND":
-            return VerificationVerdict.REFUTED
+    call. A hypothesis may only be claimed with POSITIVE proof: CONFIRMED
+    requires `hypothesis_proved == "A"`, REFUTED requires `"B"` — never
+    inferred from an empty flow result alone (see
+    `agent.prompts.EVALUATOR_SYSTEM_PROMPT`'s cardinal rule). When
+    `hypothesis_proved` is absent (the empty-string default), this falls
+    back to the legacy marker-only mapping — the path taken by the
+    operator-injected-script callers (`fvvw.static_track.
+    run_injected_static_script`, `fvvw.hitl.force_verdict_result`) that have
+    no evaluator round to source a hypothesis judgement from; a human
+    vouched for those directly, so the original marker mapping stands."""
+    if evaluation_verdict != EvaluationVerdict.PASS:
+        return VerificationVerdict.ERROR
+    if hypothesis_proved == "A":
+        return VerificationVerdict.CONFIRMED
+    if hypothesis_proved == "B":
+        return VerificationVerdict.REFUTED
+    if hypothesis_proved == "none":
         return VerificationVerdict.INCONCLUSIVE
-    return VerificationVerdict.ERROR
+    # Legacy path — no hypothesis judgement available at all.
+    if marker == "FLOW_FOUND":
+        return VerificationVerdict.CONFIRMED
+    if marker in ("FLOW_BLOCKED", "FLOW_NOT_FOUND"):
+        return VerificationVerdict.REFUTED
+    return VerificationVerdict.INCONCLUSIVE
 
 
 def parse_evaluator_response(raw: object) -> EvaluatorVerdict | None:
@@ -170,11 +195,16 @@ _NEXT_STEPS_BY_STATUS: dict[VerificationVerdict, list[str]] = {
     VerificationVerdict.CONFIRMED: [
         "Confirm dynamically (e.g. QEMU+GDB) before treating this as fully verified.",
     ],
-    VerificationVerdict.REFUTED: [],
+    VerificationVerdict.REFUTED: [
+        "REFUTED requires a positively-proved hypothesis B (a named sanitizer/guard/"
+        "constant, or healthy-engine-confirmed absence) — see evidence for what was cited.",
+    ],
     VerificationVerdict.INCONCLUSIVE: [
-        "The script ran but never printed a RESULT: marker, or the query genuinely "
-        "couldn't settle the question — try a more targeted CPGQL query by hand via "
-        "`fw-verify debug script`.",
+        "Neither hypothesis was positively proved within the iteration budget. Run "
+        "the dynamic (QEMU+GDB) track (`fw-verify run` without `--joern-only`) to "
+        "corroborate — a static negative across an unmodeled propagator (sprintf/"
+        "strcpy/memcpy/...) or a CPG-skipped method is not a refutation. If both "
+        "tracks remain inconclusive, escalate to a human (`--hitl=prompt`).",
     ],
     VerificationVerdict.ERROR: [
         "Inspect the kept workspace (--keep-workspace) and re-run a hand-written "
@@ -324,12 +354,47 @@ def build_verifier_graph(
                 feedback_for_retry="",
             )
 
+        # An unproven round is a RETRY, not a conclusion. The evaluator
+        # returns PASS whenever the script merely executed; that is not the
+        # same as having settled the question, and a round that proved
+        # neither hypothesis is exactly the case where the SCRIPT is the
+        # prime suspect. Reloop through the generator carrying the
+        # evaluator's own reasoning as feedback, reusing the existing
+        # FAIL_RETRY machinery (and its max_iterations cap) rather than
+        # adding a second, parallel budget.
+        if verdict.verdict == EvaluationVerdict.PASS and verdict.hypothesis_proved == "none":
+            verdict = verdict.model_copy(
+                update={
+                    "verdict": EvaluationVerdict.FAIL_RETRY,
+                    "feedback_for_retry": verdict.feedback_for_retry
+                    or (
+                        "Neither hypothesis was positively proved. "
+                        f"{verdict.reasoning} Re-query: print the CHECK-1/2/3 "
+                        "health checks, and if a propagator (sprintf/strcpy/"
+                        "memcpy/...) sits between source and sink, bridge "
+                        "through the intermediate buffer with a two-legged "
+                        "query instead of one composed reachableByFlows."
+                    ),
+                }
+            )
+
         iteration = state.get("iteration", 1)
         max_iter = state.get("max_iterations", max_iterations)
         if verdict.verdict == EvaluationVerdict.FAIL_RETRY and iteration >= max_iter:
+            # A round that RAN and printed a marker but never proved a
+            # hypothesis is INCONCLUSIVE ("queries ran, nothing settled"),
+            # not ERROR ("no evidence obtained at all"). static_track tags
+            # budget_exhausted on INCONCLUSIVE too, so HITL still fires. A
+            # genuinely broken script (no marker ever printed) still lands
+            # on FAIL_STOP -> ERROR.
+            unproven = (
+                verdict.hypothesis_proved == "none" and state.get("result_marker") is not None
+            )
             verdict = verdict.model_copy(
                 update={
-                    "verdict": EvaluationVerdict.FAIL_STOP,
+                    "verdict": (
+                        EvaluationVerdict.PASS if unproven else EvaluationVerdict.FAIL_STOP
+                    ),
                     "reasoning": (
                         f"{verdict.reasoning} [stopped: reached max_iterations={max_iter}]"
                     ),
@@ -351,6 +416,7 @@ def build_verifier_graph(
             "evaluation_verdict": verdict.verdict,
             "evaluation_reasoning": verdict.reasoning,
             "evaluation_confidence": verdict.confidence,
+            "hypothesis_proved": verdict.hypothesis_proved,
             "generator_feedback": verdict.feedback_for_retry,
             "transcript": [tx.evaluator_entry(turn, verdict)],
         }
@@ -363,7 +429,11 @@ def build_verifier_graph(
             confidence = "LOW"
             evidence = cpg_stderr
         else:
-            status = final_status(state["evaluation_verdict"], state.get("result_marker"))
+            status = final_status(
+                state["evaluation_verdict"],
+                state.get("result_marker"),
+                state.get("hypothesis_proved", ""),
+            )
             summary = state.get("evaluation_reasoning", "")
             confidence = state.get("evaluation_confidence", "LOW")
             evidence = (state.get("execution_stdout") or state.get("execution_stderr") or "")[

@@ -88,13 +88,52 @@ def test_generator_prompt_forbids_shell_and_exploit_content():
 def test_evaluator_prompt_covers_both_failure_modes():
     assert "PASS" in EVALUATOR_SYSTEM_PROMPT
     assert "FAIL_RETRY" in EVALUATOR_SYSTEM_PROMPT
-    assert "don't loop" in EVALUATOR_SYSTEM_PROMPT.lower()
 
 
 def test_evaluator_prompt_treats_empty_stdout_as_broken_script():
     lowered = EVALUATOR_SYSTEM_PROMPT.lower()
     assert "empty" in lowered
     assert "forgot" in lowered or "println" in lowered
+
+
+def test_evaluator_prompt_requires_positive_proof_not_absence():
+    # This is the regression test for the reported bug: a Joern query that
+    # merely returns no dataflow (FLOW_NOT_FOUND) must NOT be accepted as an
+    # automatic refutation. The old prompt said the opposite ("don't loop
+    # just because the finding wasn't confirmed") -- that string must be
+    # gone, and the cardinal rule replacing it must be present.
+    assert "don't loop" not in EVALUATOR_SYSTEM_PROMPT.lower()
+    assert "hypothesis_proved" in EVALUATOR_SYSTEM_PROMPT
+    lowered = EVALUATOR_SYSTEM_PROMPT.lower()
+    assert '"a"' in lowered
+    assert '"b"' in lowered
+    assert '"none"' in lowered
+    assert "proves nothing" in lowered or "never record hypothesis b from absence" in lowered
+    assert "sprintf" in lowered  # the concrete propagator class that triggered this
+    assert "skipped" in lowered or "reaching-definitions" in lowered  # CPG-skip cause
+    assert "dynamic" in lowered  # recommends the dynamic track corroborate
+
+
+def test_generator_prompt_requires_positive_proof_and_health_checks():
+    lowered = GENERATOR_SYSTEM_PROMPT.lower()
+    assert "positively prove" in lowered
+    assert "flow_blocked" in lowered
+    assert "indeterminate" in lowered
+    assert "check-1" in lowered and "check-2" in lowered and "check-3" in lowered
+    assert "two-legged" in lowered or "bridge" in lowered
+
+
+def test_generator_prompt_teaches_cpgql_api_pitfalls():
+    # Regression coverage for the 7 real FAIL_RETRY rounds observed on a
+    # live `fw-verify run` -- each of these was a distinct CPGQL API
+    # misconception the generator repeated across consecutive rounds without
+    # ever being taught the correct form.
+    lowered = GENERATOR_SYSTEM_PROMPT.lower()
+    assert "argumentindex" in lowered and "property" in lowered
+    assert ".code" in lowered  # Expression has no .name -- use .code instead
+    assert "reachablebyflows" in lowered
+    assert "traversal" in lowered or "step" in lowered
+    assert "empty" in lowered  # .argument can come back empty on decompiled CPGs
 
 
 def test_render_finding_brief_includes_key_fields():

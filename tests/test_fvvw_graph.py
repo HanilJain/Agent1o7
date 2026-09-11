@@ -179,9 +179,19 @@ def _strategy_plan_json(observable: str = "obs") -> str:
     )
 
 
-def _verdict_json(verdict: str) -> str:
+def _verdict_json(verdict: str, *, hypothesis_proved: str = "A") -> str:
+    # Default "A" matches every FVVW-level test in this file except the
+    # explicit FLOW_NOT_FOUND/REFUTED one, which passes hypothesis_proved="B"
+    # itself -- a verdict may only be CONFIRMED/REFUTED with positive proof
+    # (see agent.graph.final_status), so a bare marker is no longer enough.
     return json.dumps(
-        {"verdict": verdict, "confidence": "HIGH", "reasoning": "r", "feedback_for_retry": ""}
+        {
+            "verdict": verdict,
+            "hypothesis_proved": hypothesis_proved,
+            "confidence": "HIGH",
+            "reasoning": "r",
+            "feedback_for_retry": "",
+        }
     )
 
 
@@ -377,14 +387,16 @@ async def test_run_fvvw_discordant_holds(monkeypatch, fake_executor, tmp_path: P
         monkeypatch,
         strategy_response=_strategy_plan_json(),
         generator_response='println("RESULT: FLOW_NOT_FOUND")',
-        evaluator_response=_verdict_json("PASS"),
+        evaluator_response=_verdict_json("PASS", hypothesis_proved="B"),
     )
     _patch_executors(monkeypatch, fake_executor, script_outputs=["RESULT: FLOW_NOT_FOUND"])
 
     settings = Settings(_env_file=None, FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=2)
     result = await run_fvvw(candidate, db_subfolder=db_subfolder, settings=settings)
 
-    # static track: FLOW_NOT_FOUND -> REFUTED. dynamic track: our fake
+    # static track: FLOW_NOT_FOUND with hypothesis B POSITIVELY proved ->
+    # REFUTED (a bare marker alone is no longer sufficient). dynamic track:
+    # our fake
     # session always reports the marker present -> CONFIRMED. That's a
     # genuine discordant disagreement between the two independent witnesses.
     assert result["static_result"].verdict == VerificationVerdict.REFUTED

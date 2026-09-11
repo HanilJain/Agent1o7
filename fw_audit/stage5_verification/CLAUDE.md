@@ -28,14 +28,58 @@ cross-cutting concerns (Executor abstraction, LLM routing, Settings).
   `tools/joern_tool.py`'s module docstring for the full post-mortem.
 - **The existing Joern pipeline (`agent/`, `tools/joern_tool.py`,
   `driver.py`, `debug.py`, `report_writer.py`, `docker/Dockerfile.joern`,
-  `SandboxExecutor.run()`) is reused UNCHANGED as the static track's
-  building block.** `fvvw/static_track.py` is a thin adapter that renders
-  a strategy-enriched brief and invokes `build_verifier_graph()` verbatim —
-  it never edits the generator/evaluator prompts, the graph, or the tool.
-  Do not "improve" the static track's generate/run/evaluate loop into a
-  template-first design as part of FVVW work; that divergence from the
-  design doc's script-first ideal is accepted deliberately, as the cost of
-  reuse.
+  `SandboxExecutor.run()`) is reused unchanged BY FVVW FEATURE WORK.**
+  `fvvw/static_track.py` is a thin adapter that renders a strategy-enriched
+  brief and invokes `build_verifier_graph()` verbatim. Do not "improve" the
+  static track's generate/run/evaluate loop into a template-first design as
+  part of FVVW work; that divergence from the design doc's script-first
+  ideal is accepted deliberately, as the cost of reuse.
+  **This constraint is scoped to FVVW feature work, not to correctness
+  fixes in the static track's own loop** — those ARE in scope for edits to
+  `agent/graph.py`/`agent/prompts.py`, and must be recorded here. As of the
+  positive-proof fix below, the loop enforces: a verdict of
+  CONFIRMED/REFUTED requires `EvaluatorVerdict.hypothesis_proved` to be
+  `"A"`/`"B"` respectively (see `final_status()`); a round that proves
+  neither (`hypothesis_proved == "none"`) is converted to a retry rather
+  than accepted as a conclusion, reusing the existing `FAIL_RETRY` loop and
+  its `stage5_max_agent_iterations` cap; at that cap, a round that DID print
+  a marker but proved nothing exhausts to `INCONCLUSIVE` (not `ERROR` — see
+  `evaluate_node`'s `unproven` distinction), tagging `budget_exhausted` so
+  HITL still fires. The marker vocabulary grew from three to five:
+  `FLOW_FOUND` (A), `FLOW_BLOCKED` (B, a named sanitizer/guard/constant),
+  `FLOW_NOT_FOUND` (B, the weaker form — only legal once the generator's
+  CHECK-1/2/3 health checks and, where a propagator sits on the path, a
+  two-legged bridging query all corroborate it), `INDETERMINATE` (neither
+  proved, health checks failed), `QUERY_ERROR` (script couldn't run). See
+  `agent/prompts.py`'s `GENERATOR_SYSTEM_PROMPT`/`EVALUATOR_SYSTEM_PROMPT`
+  for the full rationale — a bare empty `reachableByFlows` result must
+  never mint a refutation, since it's equally consistent with a malformed
+  query, an unmodeled propagator (`sprintf`/`strcpy`/`memcpy`/...), or a
+  method the CPG's `ReachingDefPass` silently skipped (watch for "has more
+  than N definitions" / "Skipping" in the CPG build stderr).
+  `fvvw/static_track.py::run_static_track` mirrors this: `proved_hypothesis`
+  is read directly from the evaluator's own judgement
+  (`final_state["hypothesis_proved"]`), never relabelled from `verdict`.
+  The strategy prompt (`fvvw/strategy.py`) requires the SAME positive-proof
+  discipline for hypothesis B — it must name what would have to be observed
+  to prove it (a specific sanitizer/guard/constant), never "the A-observable
+  wasn't seen". The dynamic track's `dynamic_evaluate()`
+  (`fvvw/dynamic_track.py`) applies the identical `>= required` multi-signal
+  corroboration bar to BOTH hypotheses now (previously B could fire off a
+  single absence signal) and no longer threads an `active_hypothesis`
+  switch through the rule engine — that mechanism never actually changed
+  what evidence was gathered, so it was removed rather than kept as a
+  parameter that looked like it did something it didn't; both hypotheses'
+  rules are evaluated identically every round. `fvvw/joint.py` gained
+  `Agreement.NEITHER` (both tracks non-definite — distinct from
+  `ONE_SIDED`, which requires exactly one definite verdict) and a
+  `collect_residual_unknowns` defense-in-depth caveat for any REFUTED
+  result lacking a positively-proved `"B"` (should be structurally
+  impossible now, but flagged rather than silently trusted). `fvvw/hitl.py`
+  gained `neither_proved()` — a THIRD HITL trigger (alongside each track's
+  own `is_budget_exhausted`) that offers the static track for review when
+  BOTH tracks settle on `"none"` without either individually exhausting its
+  budget, via `_run_hitl_for_track`'s now-generalized `trigger` parameter.
 - Command composition for the dynamic track lives entirely in
   `tools/qemu_gdb_tool.py` — the strategy LLM supplies only `DynamicPlan`
   DATA (addresses, guard names/forced values, the payload marker), never a
@@ -219,6 +263,32 @@ ordinary, unattended run.
   the Joern mechanics; `fw-verify debug dynamic` runs ONLY the QEMU+GDB
   track (needs the strategy agent for a `DynamicPlan`, but not the static
   track); `fw-verify debug strategy` emits just the `StrategyPlan`.
+- **`fw-verify debug verify` is the pre-FVVW v1, Joern-only entry point** —
+  it calls `agent.verifier.verify_candidate` directly and imports NOTHING
+  from `fvvw/`. It constructs no `StrategyPlan`, `Hypotheses`, or
+  `TrackResult` — there is no A/B machinery on this path at all, only the
+  hypothesis-proof discipline built directly into `agent/graph.py`'s
+  `final_status`/`evaluate_node` (see the hard-constraints section above).
+  To exercise the strategy agent's hypothesis pair or the full fork-join,
+  use `fw-verify debug strategy` or `fw-verify debug fvvw` instead.
+- A REFUTED verdict on a finding whose `evidence_span` visibly shows the
+  source reaching the sink through `sprintf`/`strcpy`/`memcpy`/similar →
+  suspect a false refutation from the dataflow engine not modeling that
+  call's argument -> output-buffer taint propagation, NOT a genuine
+  absence. Check the attempt's `evaluator_reasoning`/`hypothesis_proved` —
+  a legitimate REFUTED must cite a specific sanitizer/guard/constant or the
+  CHECK-1/2/3 health-check corroboration; if it doesn't, that's a bug, not
+  a correct verdict (see the regression tests guarding this:
+  `tests/test_stage5_graph.py::test_pass_with_flow_not_found_and_hypothesis_none_retries_not_refutes`,
+  `tests/test_fvvw_static_track.py::test_run_static_track_flow_not_found_without_positive_proof_is_not_refuted`).
+- `UnknownHostException`/"Could not determine local host name" stack traces
+  in Joern stdout/stderr are container-hostname log4j noise
+  (`--network=none` containers have no DNS and no `/etc/hosts` entry for
+  their own default hostname) — non-fatal, and both the evaluator prompt
+  and `executors/docker_executor.py::_hostname_flags()` account for it
+  (the latter forces a deterministic, locally-resolvable hostname at the
+  `docker run`/`start()` call sites, so this should no longer appear in new
+  runs at all). Never treat it as a script failure if it does.
 - Unit: `pytest -m "not integration" tests/test_stage5_*.py
   tests/test_fvvw_*.py tests/test_sandbox_executor.py
   tests/test_sandbox_session_executor.py` — no Docker/LLM/QEMU/GDB required

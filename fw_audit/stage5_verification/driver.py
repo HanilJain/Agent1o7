@@ -208,7 +208,10 @@ def _report_as_track_result(report: VerificationReport) -> TrackResult:
     """Adapt a `VerificationReport` into the bare shape `HitlRequest.result`
     needs (`verdict`/`proved_hypothesis`/`iters_used` are all this path's
     prompter reads) — a real `TrackResult`, since `fvvw.hitl`'s helpers
-    already expect one."""
+    already expect one. `report.verdict` is itself hypothesis-gated now
+    (`agent.graph.final_status` requires positive proof for CONFIRMED/
+    REFUTED — see that function's docstring), so re-deriving `proved` from
+    it here is a safe display value, not a source of an unproven "B"."""
     if report.verdict == VerificationVerdict.CONFIRMED:
         proved = "A"
     elif report.verdict == VerificationVerdict.REFUTED:

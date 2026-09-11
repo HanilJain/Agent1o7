@@ -55,12 +55,17 @@ requirement stated as narrowly as the evidence supports — never claim \
 actually establish that.
 
 2. hypotheses: hypothesis A (the finding IS exploitable as claimed) and \
-hypothesis B (the path is constrained/safe — sanitized, unreachable, or \
-guarded), plus ONE decisive_observable: the single fact that, if observed, \
-would prove A, and if observed differently, would prove B. This observable \
-must be independently expressible in BOTH a static (CPGQL) and a dynamic \
-(GDB) sense — restate it in both plans below using the SAME underlying \
-claim, in each track's own vocabulary.
+hypothesis B (the path is constrained/safe), plus ONE decisive_observable: \
+the single fact that, if observed, proves A. Hypothesis B must NAME WHAT \
+WOULD HAVE TO BE OBSERVED TO PROVE IT — the specific sanitizer, bounds \
+check, allow-list, guard, or constant argument that makes the path safe. \
+"The A-observable was not seen" is NOT hypothesis B; that is an unproven \
+round, not a proof of safety. If no positive B-observable can be named from \
+the evidence, say so explicitly in hypotheses.b rather than inventing one — \
+an honest "no B-observable is evident from the finding" is a valid answer. \
+The decisive_observable must be independently expressible in BOTH a static \
+(CPGQL) and a dynamic (GDB) sense — restate it in both plans below using \
+the SAME underlying claim, in each track's own vocabulary.
 
 3. static_plan: target_function (the finding's evidence_span.function_id), \
 source_fields, sink_names, expected_intermediate_calls (named functions the \

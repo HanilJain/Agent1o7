@@ -29,9 +29,9 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
 
@@ -67,6 +67,7 @@ from fw_audit.stage5_verification.fvvw.hitl import (
     build_human_review_record,
     force_verdict_result,
     is_budget_exhausted,
+    neither_proved,
     prompt_for_track,
     terminal_prompter,
 )
@@ -265,7 +266,6 @@ async def run_dynamic_track_only(
     guard_logs: list[dict] = []
     reached: bool = False
     captured: str | None = None
-    active_hypothesis: Literal["A", "B"] = "A"
     iteration = 0
 
     try:
@@ -332,17 +332,12 @@ async def run_dynamic_track_only(
                 captured_sink_argument=captured,
                 signals=signals,
                 plan=plan,
-                active_hypothesis=active_hypothesis,
                 iteration=iteration,
                 max_iterations=settings.stage5_dynamic_max_iterations,
             )
             if outcome["route"] == "done":
                 return outcome["result"], guard_logs, reached, transcript
-            if outcome["route"] == "switch_hypothesis":
-                active_hypothesis = outcome["next_hypothesis"]
-                iteration = 0
-                continue
-            # "retry" — loop again with the same active_hypothesis
+            # "retry" — loop again
 
     except BringupExhausted as exc:
         return (
@@ -378,6 +373,7 @@ async def _run_hitl_for_track(
     dynamic_reached_sink: bool | None,
     guard_logs: list[dict],
     gdb_transcript: str,
+    trigger: Callable[[TrackResult], bool] = is_budget_exhausted,
 ) -> tuple[TrackResult, bool | None, list[dict], str, HumanReviewRecord | None]:
     """Run the HITL prompt loop for ONE track (`"static"` or `"dynamic"`),
     bounded by `Settings.stage5_hitl_max_rounds`. Returns the (possibly
@@ -388,6 +384,14 @@ async def _run_hitl_for_track(
     `skip` (a `skip` leaves the track's own result untouched and produces no
     review record — there was nothing to attribute to a human).
 
+    `trigger` decides whether another round is offered, re-checked against
+    each round's (possibly updated) `result` — defaults to
+    `is_budget_exhausted` (this track's own cap was hit). `run_fvvw`'s
+    "neither track proved anything" branch passes a different trigger
+    (`fvvw.hitl.neither_proved`, closed over the sibling track's fixed
+    snapshot) so a track that never individually exhausted its budget can
+    still be offered for review when BOTH tracks settled on "none".
+
     Each round re-reads the track's own `CommandLog` for the "recent
     commands" context shown at the prompt — cheap (JSONL read-back,
     `CommandLog.read_all()`) and always reflects the LATEST round's activity
@@ -397,7 +401,7 @@ async def _run_hitl_for_track(
     last_decision = None
     round_number = 0
 
-    while is_budget_exhausted(result) and round_number < settings.stage5_hitl_max_rounds:
+    while trigger(result) and round_number < settings.stage5_hitl_max_rounds:
         round_number += 1
         recent_commands = command_log.read_all()[-10:]
         req = HitlRequest(
@@ -644,6 +648,43 @@ async def run_fvvw(
             # visible either way: residual_unknowns (fvvw.joint) carries a
             # caveat for EVERY human_attributed track, not just the last one.
             human_review = dynamic_review or human_review
+        # A third, independent trigger: neither track individually
+        # exhausted its budget, but neither positively proved a hypothesis
+        # either (both settled on "none") — the exact case classify_agreement
+        # now calls Agreement.NEITHER. Without this, two honestly-inconclusive
+        # tracks would sail straight into joint_evaluate with no human ever
+        # seeing them. Only fires when NEITHER budget-exhaustion branch above
+        # already ran (each already offers its own review opportunity), and
+        # prompts the static track — the actionable retry/override/inject
+        # path for exactly the class of failure Phase 0/1 targets (a script
+        # that never proved anything, with iterations still available).
+        if (
+            not is_budget_exhausted(static_result)
+            and not is_budget_exhausted(dynamic_result)
+            and neither_proved(static_result, dynamic_result)
+        ):
+            dynamic_result_snapshot = dynamic_result
+            (
+                static_result,
+                _,
+                _,
+                _,
+                neither_review,
+            ) = await _run_hitl_for_track(
+                candidate=candidate,
+                track="static",
+                result=static_result,
+                plan=plan.static_plan,
+                target=target,
+                deps=deps,
+                settings=settings,
+                prompter=hitl_prompter,
+                dynamic_reached_sink=dynamic_reached_sink,
+                guard_logs=guard_logs,
+                gdb_transcript=gdb_transcript,
+                trigger=lambda r: neither_proved(r, dynamic_result_snapshot),
+            )
+            human_review = neither_review or human_review
 
     # ---- joint_evaluate ---------------------------------------------------
     verdict = joint_evaluate(

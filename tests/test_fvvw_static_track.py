@@ -86,10 +86,17 @@ def _static_plan() -> StaticPlan:
     )
 
 
-def _verdict_json(verdict: str, *, confidence: str = "HIGH", reasoning: str = "ok") -> str:
+def _verdict_json(
+    verdict: str,
+    *,
+    hypothesis_proved: str = "none",
+    confidence: str = "HIGH",
+    reasoning: str = "ok",
+) -> str:
     return json.dumps(
         {
             "verdict": verdict,
+            "hypothesis_proved": hypothesis_proved,
             "confidence": confidence,
             "reasoning": reasoning,
             "feedback_for_retry": "",
@@ -128,7 +135,7 @@ def test_render_static_brief_layers_plan_onto_existing_finding_brief():
 async def test_run_static_track_confirmed_maps_to_hypothesis_a(fake_executor, tmp_path: Path):
     executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_FOUND (1 path(s))"])
     generator = _ScriptedLLM(['println("RESULT: FLOW_FOUND (1 path(s))")'])
-    evaluator = _ScriptedLLM([_verdict_json("PASS", reasoning="found it")])
+    evaluator = _ScriptedLLM([_verdict_json("PASS", hypothesis_proved="A", reasoning="found it")])
 
     result = await run_static_track(
         _candidate(),
@@ -149,7 +156,9 @@ async def test_run_static_track_confirmed_maps_to_hypothesis_a(fake_executor, tm
 async def test_run_static_track_refuted_maps_to_hypothesis_b(fake_executor, tmp_path: Path):
     executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_NOT_FOUND"])
     generator = _ScriptedLLM(['println("RESULT: FLOW_NOT_FOUND")'])
-    evaluator = _ScriptedLLM([_verdict_json("PASS", reasoning="clean not-found")])
+    evaluator = _ScriptedLLM(
+        [_verdict_json("PASS", hypothesis_proved="B", reasoning="located sanitizer")]
+    )
 
     result = await run_static_track(
         _candidate(),
@@ -165,12 +174,26 @@ async def test_run_static_track_refuted_maps_to_hypothesis_b(fake_executor, tmp_
     assert result.proved_hypothesis == "B"
 
 
-async def test_run_static_track_inconclusive_maps_to_no_hypothesis(
+async def test_run_static_track_flow_not_found_without_positive_proof_is_not_refuted(
     fake_executor, tmp_path: Path
 ):
-    executor = _make_executor(fake_executor, script_outputs=["no result marker printed"])
-    generator = _ScriptedLLM(['println("no result marker printed")'])
-    evaluator = _ScriptedLLM([_verdict_json("PASS", reasoning="ran but inconclusive")])
+    # Regression test for the reported bug at the run_static_track/TrackResult
+    # level: a clean FLOW_NOT_FOUND with NOTHING positively proved must never
+    # surface as REFUTED/"B" here either -- it retries once (max_iterations=1
+    # so the retry conversion immediately hits the cap-downgrade and resolves
+    # to INCONCLUSIVE rather than needing a second scripted response).
+    executor = _make_executor(fake_executor, script_outputs=["RESULT: FLOW_NOT_FOUND"])
+    generator = _ScriptedLLM(['println("RESULT: FLOW_NOT_FOUND")'])
+    evaluator = _ScriptedLLM(
+        [
+            _verdict_json(
+                "PASS",
+                hypothesis_proved="none",
+                confidence="LOW",
+                reasoning="empty reachableByFlows across an unmodeled sprintf propagator",
+            )
+        ]
+    )
 
     result = await run_static_track(
         _candidate(),
@@ -179,10 +202,36 @@ async def test_run_static_track_inconclusive_maps_to_no_hypothesis(
         evaluator_llm=evaluator,
         workspace_dir=tmp_path,
         executor=executor,
-        settings=Settings(_env_file=None),
+        settings=Settings(_env_file=None, stage5_max_agent_iterations=1),
     )
 
     assert result.verdict == VerificationVerdict.INCONCLUSIVE
+    assert result.proved_hypothesis == "none"
+    assert result.evidence.get("budget_exhausted") is True
+
+
+async def test_run_static_track_no_marker_at_all_maps_to_error_not_inconclusive(
+    fake_executor, tmp_path: Path
+):
+    executor = _make_executor(fake_executor, script_outputs=["no result marker printed"])
+    generator = _ScriptedLLM(['println("no result marker printed")'])
+    evaluator = _ScriptedLLM(
+        [_verdict_json("PASS", hypothesis_proved="none", reasoning="no marker at all")]
+    )
+
+    result = await run_static_track(
+        _candidate(),
+        _static_plan(),
+        generator_llm=generator,
+        evaluator_llm=evaluator,
+        workspace_dir=tmp_path,
+        executor=executor,
+        settings=Settings(_env_file=None, stage5_max_agent_iterations=1),
+    )
+
+    # No marker at all, at the cap -> broken-script bucket -> ERROR, not
+    # INCONCLUSIVE (see agent.graph.evaluate_node's `unproven` distinction).
+    assert result.verdict == VerificationVerdict.ERROR
     assert result.proved_hypothesis == "none"
 
 

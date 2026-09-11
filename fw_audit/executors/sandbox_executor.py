@@ -54,7 +54,11 @@ from pathlib import Path
 
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.executors.base import ExecutionResult, Executor, SessionHandle
-from fw_audit.executors.docker_executor import CONTAINER_WORKDIR, _host_user_flag
+from fw_audit.executors.docker_executor import (
+    CONTAINER_WORKDIR,
+    _host_user_flag,
+    _hostname_flags,
+)
 from fw_audit.stage1_ingestion.tools.extraction_tools import run_command
 
 
@@ -103,6 +107,7 @@ class SandboxExecutor(Executor):
             f"--cpus={settings.stage5_sandbox_cpus}",
             f"--pids-limit={settings.stage5_sandbox_pids_limit}",
         ]
+        docker_args += _hostname_flags(container_name)
         if settings.docker_run_as_host_user:
             docker_args += _host_user_flag()
 
@@ -192,6 +197,7 @@ class SandboxExecutor(Executor):
             f"--cpus={settings.stage5_sandbox_cpus}",
             f"--pids-limit={settings.stage5_sandbox_pids_limit}",
         ]
+        docker_args += _hostname_flags(container_name)
         if settings.docker_run_as_host_user:
             docker_args += _host_user_flag()
 

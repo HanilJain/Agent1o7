@@ -214,7 +214,11 @@ def test_plan_emulation_unsupported_arch():
 
 
 # ---------------------------------------------------------------------- #
-# dynamic_evaluate — the A/B hypothesis switch
+# dynamic_evaluate — the A/B hypothesis rule engine (SYMMETRIC: no
+# active_hypothesis switch — an earlier version threaded one through here
+# that never actually changed what evidence was gathered; both A and B now
+# require the SAME >= `required` multi-signal corroboration bar, and the
+# terminal REFUTED/CONFIRMED results carry real evidence, not an empty dict)
 # ---------------------------------------------------------------------- #
 
 
@@ -224,7 +228,6 @@ def test_dynamic_evaluate_not_reached_retries_before_cap():
         captured_sink_argument=None,
         signals=[],
         plan=_dynamic_plan(),
-        active_hypothesis="A",
         iteration=1,
         max_iterations=4,
     )
@@ -237,7 +240,6 @@ def test_dynamic_evaluate_not_reached_at_cap_is_inconclusive():
         captured_sink_argument=None,
         signals=[],
         plan=_dynamic_plan(),
-        active_hypothesis="A",
         iteration=4,
         max_iterations=4,
     )
@@ -257,66 +259,73 @@ def test_dynamic_evaluate_confirms_hypothesis_a_with_three_signals():
         captured_sink_argument=";touch /tmp/claim_001_proof;",
         signals=signals,
         plan=_dynamic_plan(),
-        active_hypothesis="A",
         iteration=1,
         max_iterations=4,
     )
     assert result["route"] == "done"
     assert result["result"].verdict == VerificationVerdict.CONFIRMED
     assert result["result"].proved_hypothesis == "A"
+    # The verdict must carry real evidence, not an empty dict.
+    assert result["result"].evidence.get("captured_sink_argument") == ";touch /tmp/claim_001_proof;"
+    assert result["result"].evidence.get("reason")
 
 
-def test_dynamic_evaluate_refutes_on_clean_neutralization():
+def test_dynamic_evaluate_refutes_on_clean_neutralization_with_required_signals():
+    # B now requires the SAME >= `required` (3, the default floor) bar A
+    # does -- a single or double absence signal is NOT sufficient. This is
+    # the regression test for the "B from a thin absence signal" gap: an
+    # earlier version fired REFUTED off `marker_signals_seen > 0`, i.e. just
+    # ONE signal reporting absence.
     signals = [
         {"kind": "sink_argument_capture", "marker_present": False},
         {"kind": "target_self_report", "marker_present": False},
+        {"kind": "filesystem_artifact", "marker_present": False},
     ]
     result = dynamic_evaluate(
         reached=True,
         captured_sink_argument="escaped_and_safe_value",
         signals=signals,
         plan=_dynamic_plan(),
-        active_hypothesis="A",
         iteration=1,
         max_iterations=4,
     )
     assert result["route"] == "done"
     assert result["result"].verdict == VerificationVerdict.REFUTED
     assert result["result"].proved_hypothesis == "B"
+    assert result["result"].evidence.get("captured_sink_argument") == "escaped_and_safe_value"
+    assert result["result"].evidence.get("reason")
 
 
-def test_dynamic_evaluate_switches_hypothesis_when_a_stalls():
-    """Reached, but not enough corroborating signals and not cleanly
-    neutralized either — a genuine stall. At the iteration cap while still
-    testing A, must switch to B rather than terminate."""
+def test_dynamic_evaluate_does_not_refute_on_a_single_absence_signal():
+    # THE regression test: one signal reporting the marker absent, alone,
+    # must NOT refute -- it falls through to retry (below the cap) since
+    # neither hypothesis clears the corroboration bar yet.
+    signals = [{"kind": "sink_argument_capture", "marker_present": False}]
+    result = dynamic_evaluate(
+        reached=True,
+        captured_sink_argument="escaped_and_safe_value",
+        signals=signals,
+        plan=_dynamic_plan(),
+        iteration=1,
+        max_iterations=4,
+    )
+    assert result["route"] == "retry"
+
+
+def test_dynamic_evaluate_terminates_inconclusive_when_neither_clears_the_bar():
     signals = [{"kind": "sink_argument_capture", "marker_present": True}]  # only 1, need 3
     result = dynamic_evaluate(
         reached=True,
         captured_sink_argument="partial",
         signals=signals,
         plan=_dynamic_plan(),
-        active_hypothesis="A",
-        iteration=4,
-        max_iterations=4,
-    )
-    assert result["route"] == "switch_hypothesis"
-    assert result["next_hypothesis"] == "B"
-
-
-def test_dynamic_evaluate_terminates_inconclusive_when_b_also_stalls():
-    signals = [{"kind": "sink_argument_capture", "marker_present": True}]
-    result = dynamic_evaluate(
-        reached=True,
-        captured_sink_argument="partial",
-        signals=signals,
-        plan=_dynamic_plan(),
-        active_hypothesis="B",  # already switched once, still stalling
         iteration=4,
         max_iterations=4,
     )
     assert result["route"] == "done"
     assert result["result"].verdict == VerificationVerdict.INCONCLUSIVE
     assert result["result"].proved_hypothesis == "none"
+    assert result["result"].evidence.get("budget_exhausted") is True
 
 
 def test_dynamic_evaluate_retries_mid_budget_when_stalling():
@@ -326,7 +335,6 @@ def test_dynamic_evaluate_retries_mid_budget_when_stalling():
         captured_sink_argument="partial",
         signals=signals,
         plan=_dynamic_plan(),
-        active_hypothesis="A",
         iteration=2,
         max_iterations=4,
     )
