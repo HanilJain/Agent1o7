@@ -29,7 +29,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from fw_audit.common.verification import DynamicPlan, TargetMeta, TrackResult, VerificationVerdict
+from fw_audit.common.verification import (
+    DynamicPlan,
+    ObservationRecord,
+    TargetMeta,
+    TrackResult,
+    VerificationVerdict,
+)
 from fw_audit.config.settings import Settings
 from fw_audit.executors.base import SessionHandle
 from fw_audit.executors.sandbox_executor import SandboxExecutor
@@ -41,8 +47,11 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     CONTAINER_WORKDIR,
     build_gdb_batch_command,
     build_qemu_user_launch_command,
+    render_crash_capture_commands,
+    render_crash_report_commands,
     render_gdb_recipe,
     render_guard_breakpoint_commands,
+    render_memory_dump_command,
     render_trigger_breakpoint_commands,
     resolve_qemu_arch_spec,
 )
@@ -144,6 +153,72 @@ def validate_benign_marker(marker: str) -> None:
         )
 
 
+class PayloadContainmentViolation(ValueError):
+    """Raised by `validate_real_payload` when a proposed trigger payload
+    matches the WEAPONIZED-content deny-list — a hard stop distinct from
+    `BenignMarkerViolation` (which rejects everything except a narrow
+    benign shape). This check is the `Settings.stage5_allow_real_payloads
+    = True` (default) posture: the trigger agent is free to craft the
+    ACTUAL malicious input a hypothesis calls for (overlong buffers,
+    command-injection sequences, path-traversal sequences, direct-call
+    arguments) — containment is structural (a disposable, resource-capped,
+    network-isolated sandbox container), not content-based. Only content
+    that would function as a weapon OUTSIDE this sandbox's own purpose
+    (reverse shells, exfiltration, host-destructive commands) is refused
+    outright. Never caught and silently downgraded, same posture as
+    `BenignMarkerViolation`."""
+
+
+# Weaponized-content deny-list for `validate_real_payload` (Settings.
+# stage5_allow_real_payloads=True path). Narrower than _DENY_PATTERNS
+# (which also blocks ordinary benign-marker shapes like a bare `curl`) —
+# this list exists to keep a REAL exploit payload from ALSO being a
+# reverse shell / exfiltration / host-destructive command, not to reject
+# the exploit content itself (that is the whole point of a real payload).
+_WEAPONIZED_DENY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\brm\s+-rf\s+/(?!tmp|proc/self)",  # destructive delete outside scratch space
+        r"\bmkfs\b",
+        r"\bdd\s+if=.*of=/dev/(?!null)",  # raw device overwrite (not /dev/null)
+        r"\bnc\b.*-e\b",  # netcat reverse shell
+        r"\bnetcat\b.*-e\b",
+        r"/dev/tcp/",  # bash reverse-shell idiom
+        r"\b(reverse|bind)[\s_-]?shell\b",
+        r"\bmknod\b.*\bp\b",  # named-pipe-based reverse shell setup
+        r"\bchmod\s+(?:-R\s+)?[augo]*\+?s\b",  # setuid grant (persistence, not this test)
+        r"\buseradd\b|\buserdel\b",  # host account tampering
+        r"(?<![/\w])passwd\s+[\w-]",  # the `passwd` COMMAND (e.g. `passwd root`) —
+        # deliberately NOT a bare substring match, since `/etc/passwd` is the
+        # single most standard path-traversal PoC target and must stay allowed;
+        # this only matches "passwd" as a standalone command word followed by
+        # an argument, never as part of a path.
+        r"\biptables\b",  # firewall/persistence tampering
+    )
+)
+
+
+def validate_real_payload(payload: str) -> None:
+    """Raises `PayloadContainmentViolation` if `payload` matches the
+    weaponized-content deny-list. Used by `instrument_trigger`/the Node 6
+    trigger agent instead of `validate_benign_marker` when `Settings.
+    stage5_allow_real_payloads` is `True` (the default) — see that
+    setting's own docstring for the full containment-boundary rationale.
+    Deliberately permissive otherwise: an overlong buffer, a `';id;'`
+    command-injection probe, a `../../etc/passwd` traversal string, or a
+    crafted HTTP request body are all legitimate trigger content and none
+    of them match this list. An empty payload is still refused (nothing to
+    test)."""
+    if not payload or not payload.strip():
+        raise PayloadContainmentViolation("payload is empty — refusing to inject nothing.")
+    for pattern in _WEAPONIZED_DENY_PATTERNS:
+        if pattern.search(payload):
+            raise PayloadContainmentViolation(
+                f"payload matched a denied weaponized-content pattern "
+                f"{pattern.pattern!r}: {payload!r}"
+            )
+
+
 # GDB's own escape hatches — anything here would execute a HOST-side command
 # (a shell, an interpreter, arbitrary file read) outside the benign-marker
 # discipline `validate_benign_marker` enforces for the marker text itself.
@@ -199,8 +274,7 @@ def validate_injected_recipe(recipe: str) -> None:
     for pattern in _DENY_PATTERNS:
         if pattern.search(recipe):
             raise BenignMarkerViolation(
-                f"injected recipe matched a denied (non-benign) pattern "
-                f"{pattern.pattern!r}."
+                f"injected recipe matched a denied (non-benign) pattern {pattern.pattern!r}."
             )
 
 
@@ -209,8 +283,10 @@ def validate_injected_recipe(recipe: str) -> None:
 # --------------------------------------------------------------------- #
 
 
-def plan_emulation(target: TargetMeta, plan: DynamicPlan) -> dict:
-    """Rule-based (script, no LLM) user-vs-system mode decision (FVVW §6
+def plan_emulation(
+    target: TargetMeta, plan: DynamicPlan, *, escalate_to_direct_call: bool = False
+) -> dict:
+    """Rule-based (script, no LLM) mode decision (spec Node 2 / FVVW §6
     node 9). User-mode (QEMU user + chroot) for a self-contained dispatcher
     binary whose behavior doesn't need live kernel/NVRAM/IPC — the common
     case, including every `natural_drive`/`inferior_call` single-binary
@@ -220,10 +296,22 @@ def plan_emulation(target: TargetMeta, plan: DynamicPlan) -> dict:
     dependence (best-effort heuristic — refined by `bringup_stabilize` if
     user-mode later proves insufficient).
 
+    `escalate_to_direct_call=True` (set by the Node 8 router's
+    `escalate_direct_call` route, per the spec's decision table: "repeated
+    bring-up failures even after arbitration attempts" -> "partial
+    emulation may not be able to reach this sink at all") forces
+    `mode="direct_call"` regardless of the guard-hint heuristic above —
+    this is the spec's explicit LAST-RESORT-ONLY fallback (§2 mode table),
+    never chosen as a first attempt.
+
     Returns `{"emulation_plan": {...}}` — the `mem.dynamic.emulation_plan`
-    update. `mode` is `"user"` or `"system"`; `arch_spec_key` is the
-    `(arch, endianness)` tuple `tools.qemu_gdb_tool.QEMU_ARCH_TABLE` is
-    keyed on, so later nodes don't re-derive the lookup key.
+    update. `mode` is `"user"` | `"system"` | `"direct_call"` |
+    `"unsupported"`; `arch_spec_key` is the `(arch, endianness)` tuple
+    `tools.qemu_gdb_tool.QEMU_ARCH_TABLE` is keyed on, so later nodes don't
+    re-derive the lookup key. `direct_call` mode still needs a resolved
+    `arch_spec` (GDB itself is architecture-specific even when bypassing
+    the binary's normal dispatch), so `unsupported` is checked first and
+    applies regardless of `escalate_to_direct_call`.
     """
     arch_spec = resolve_qemu_arch_spec(target.arch, target.endianness)
     if arch_spec is None:
@@ -233,6 +321,16 @@ def plan_emulation(target: TargetMeta, plan: DynamicPlan) -> dict:
                 "arch_spec_key": (target.arch, target.endianness),
                 "reason": f"no QEMU support for arch={target.arch!r} "
                 f"endianness={target.endianness!r}",
+            }
+        }
+
+    if escalate_to_direct_call:
+        return {
+            "emulation_plan": {
+                "mode": "direct_call",
+                "arch_spec_key": (target.arch, target.endianness),
+                "reason": "escalated by Node 8 router: partial emulation could not "
+                "reach the sink after repeated bring-up/trigger attempts.",
             }
         }
 
@@ -281,10 +379,36 @@ class BringupContext:
     which only understands a bare marker string) before use. `None` (the
     default) means every dynamic-track node behaves exactly as it did before
     this field existed."""
+    real_payload_override: str | None = None
+    """Set by the Node 6 trigger agent (`fvvw.dynamic_agents.trigger_agent`)
+    to the ACTUAL malicious input it crafted (an overlong buffer, a
+    command-injection sequence, a direct-call argument expression, ...),
+    when `Settings.stage5_allow_real_payloads` is `True` (the default).
+    Distinct from `raw_recipe_override` (a full GDB recipe, HITL-only) —
+    this is just the payload TEXT, still wired into the normal trigger
+    recipe via `render_trigger_breakpoint_commands`, and validated by
+    `validate_real_payload` (not `validate_benign_marker`) before use.
+    `None` (the default) falls back to `plan.payload_marker` under the
+    benign-only posture (`stage5_allow_real_payloads=False`)."""
+    arbitration_entries: list[dict] | None = None
+    """Structured `ArbitrationLogEntry`-shaped dicts the Node 3 bring-up
+    agent recorded this run — richer than `applied_fixes` (plain strings):
+    each entry carries `kind`/`target`/`detail`/`reasoning`. Assembled into
+    `common.verification.ArbitrationLog` by the graph wrapper for
+    persistence. `None`/empty when the deterministic (non-agentic)
+    bring-up path ran instead."""
+    strace_findings: list[str] | None = None
+    """Raw ENOENT/failed-open lines the Node 3 agent's `qemu -strace` pass
+    surfaced — the evidence base `arbitration_entries` was reasoned from,
+    kept verbatim for `ArbitrationLog.strace_findings`."""
 
     def __post_init__(self) -> None:
         if self.applied_fixes is None:
             self.applied_fixes = []
+        if self.arbitration_entries is None:
+            self.arbitration_entries = []
+        if self.strace_findings is None:
+            self.strace_findings = []
 
 
 class BringupExhausted(RuntimeError):
@@ -330,11 +454,14 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
             f"endianness={endianness!r} — cannot bring up emulation."
         )
 
-    async with aspan(
-        "stage5.bringup_stabilize",
-        run_type="tool",
-        inputs={"global_id": ctx.candidate.global_id, "repair_count": ctx.repair_count},
-    ) as run, aphase("bringup_stabilize"):
+    async with (
+        aspan(
+            "stage5.bringup_stabilize",
+            run_type="tool",
+            inputs={"global_id": ctx.candidate.global_id, "repair_count": ctx.repair_count},
+        ) as run,
+        aphase("bringup_stabilize"),
+    ):
         network_name: str | None = None
         if _target_needs_network(ctx.plan) and ctx.settings.stage5_allow_network_grant:
             network_name = f"fvvw-{uuid.uuid4().hex[:12]}"
@@ -378,7 +505,7 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
         # the rootfs root as `<arch>`-named, matching qemu_binary_in_chroot.
         if chrooting:
             copy_cmd = (
-                f"cp \"$(command -v {arch_spec.user_binary})\" "
+                f'cp "$(command -v {arch_spec.user_binary})" '
                 f"{CONTAINER_WORKDIR}/{arch_spec.user_binary}"
             )
             copy_result = await ctx.session_executor.exec_in_session(
@@ -523,9 +650,7 @@ class DynamicFault(RuntimeError):
     setting `mem.repair.return_to` to the node that raised."""
 
 
-async def reach_target(
-    ctx: BringupContext, *, gdb_transcript_so_far: str = ""
-) -> tuple[str, bool]:
+async def reach_target(ctx: BringupContext, *, gdb_transcript_so_far: str = "") -> tuple[str, bool]:
     """Drive the target to a stable, fully-relocated process state at the
     functional entry point. `natural_drive`: argv/env already supplied at
     launch, just continue past entry. `inferior_call`: same recipe shape —
@@ -551,9 +676,12 @@ async def reach_target(
     if ctx.handle is None:
         raise DynamicFault(f"{ctx.candidate.global_id}: no active session to reach_target on.")
 
-    async with aspan(
-        "stage5.reach_target", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
-    ) as run, aphase("reach_target"):
+    async with (
+        aspan(
+            "stage5.reach_target", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
+        ) as run,
+        aphase("reach_target"),
+    ):
         # QEMU is single-use per gdb batch (it runs to completion and exits
         # on GDB disconnect), so relaunch a fresh one for this batch.
         await _launch_qemu_and_wait(ctx)
@@ -564,8 +692,7 @@ async def reach_target(
         )
         result = await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cd {CONTAINER_WORKDIR} && "
-            + build_gdb_batch_command(recipe_path, target_relpath),
+            f"cd {CONTAINER_WORKDIR} && " + build_gdb_batch_command(recipe_path, target_relpath),
             timeout=ctx.settings.stage5_gdb_timeout_seconds,
         )
         if run is not None:
@@ -623,9 +750,12 @@ async def satisfy_guards(
     recipe_path = f"{CONTAINER_SCRATCH}/recipe_guards.gdb"
     target_relpath = _target_relpath_in_workspace(ctx.candidate)
 
-    async with aspan(
-        "stage5.satisfy_guards", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
-    ) as run, aphase("satisfy_guards"):
+    async with (
+        aspan(
+            "stage5.satisfy_guards", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
+        ) as run,
+        aphase("satisfy_guards"),
+    ):
         # Fresh QEMU for this batch (single-use per gdb disconnect).
         await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
@@ -635,8 +765,7 @@ async def satisfy_guards(
         )
         result = await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cd {CONTAINER_WORKDIR} && "
-            + build_gdb_batch_command(recipe_path, target_relpath),
+            f"cd {CONTAINER_WORKDIR} && " + build_gdb_batch_command(recipe_path, target_relpath),
             timeout=ctx.settings.stage5_gdb_timeout_seconds,
         )
         if run is not None:
@@ -683,14 +812,37 @@ async def instrument_trigger(
     When `ctx.raw_recipe_override` is set (HITL's "inject" action — see
     `fvvw.hitl`), that recipe text is used VERBATIM instead of the one this
     function would otherwise build, validated by `validate_injected_recipe`
-    (never `validate_benign_marker`, since a raw recipe is not a bare marker
-    string) before anything else happens. `_parse_trigger_capture`'s marker
-    is still `"TRIGGER:sink_arg"` for the override case too, so an operator
-    writing a raw recipe should reuse that same `printf` marker if they want
-    `captured_sink_argument` populated from it.
+    (never `validate_benign_marker`/`validate_real_payload`, since a raw
+    recipe is not a bare payload string) before anything else happens.
+    `_parse_trigger_capture`'s marker is still `"TRIGGER:sink_arg"` for the
+    override case too, so an operator writing a raw recipe should reuse
+    that same `printf` marker if they want `captured_sink_argument`
+    populated from it.
+
+    Otherwise, which payload is injected and which validator gates it
+    depends on `Settings.stage5_allow_real_payloads` (default `True`):
+    `ctx.real_payload_override` (the Node 6 trigger agent's crafted real
+    input, validated by `validate_real_payload` — weaponized content only
+    is refused) when set and the setting is `True`; `ctx.plan.
+    payload_marker` (validated by `validate_benign_marker` — the strict
+    historical posture) otherwise. See `Settings.
+    stage5_allow_real_payloads`'s own docstring for the full
+    containment-boundary rationale.
     """
+    # Note: this function's GDB recipe never embeds the payload TEXT
+    # itself — `render_trigger_breakpoint_commands` only sets a breakpoint
+    # at the sink and captures whatever the argument register already
+    # holds. Actual DELIVERY of a real payload (argv, an HTTP send, a
+    # direct-call expression) happens upstream of this call, in the Node 6
+    # trigger agent (`dynamic_agents.trigger_agent`) — this function's own
+    # job stays "validate, then observe what shows up at the sink" either
+    # way. The validation branch below exists so a caller can never reach
+    # the observe step with an un-vetted payload in play, regardless of
+    # which posture produced it.
     if ctx.raw_recipe_override is not None:
         validate_injected_recipe(ctx.raw_recipe_override)
+    elif ctx.settings.stage5_allow_real_payloads and ctx.real_payload_override is not None:
+        validate_real_payload(ctx.real_payload_override)
     else:
         validate_benign_marker(ctx.plan.payload_marker)
 
@@ -707,11 +859,14 @@ async def instrument_trigger(
         recipe = ctx.raw_recipe_override
         recipe_path = f"{CONTAINER_SCRATCH}/recipe_trigger.gdb"
         target_relpath = _target_relpath_in_workspace(ctx.candidate)
-        async with aspan(
-            "stage5.instrument_trigger",
-            run_type="tool",
-            inputs={"global_id": ctx.candidate.global_id, "injected": True},
-        ) as run, aphase("instrument_trigger"):
+        async with (
+            aspan(
+                "stage5.instrument_trigger",
+                run_type="tool",
+                inputs={"global_id": ctx.candidate.global_id, "injected": True},
+            ) as run,
+            aphase("instrument_trigger"),
+        ):
             await _launch_qemu_and_wait(ctx)
             await ctx.session_executor.exec_in_session(
                 ctx.handle,
@@ -751,25 +906,46 @@ async def instrument_trigger(
             forced_value=guard.forced_value,
             log_marker=f"GUARD:{guard.name}",
         )
-    breakpoint_commands = guard_commands + render_trigger_breakpoint_commands(
-        sink_addr=ctx.plan.sink_addr or ctx.target.func_offset,
+    crash_marker = "CRASH"
+    sink_addr = ctx.plan.sink_addr or ctx.target.func_offset
+    trigger_commands = render_trigger_breakpoint_commands(
+        sink_addr=sink_addr,
         argument_register=register,
         capture_marker=marker,
+    )
+    # Under the real-payload posture (Settings.stage5_allow_real_payloads),
+    # crash capture and a before/after memory dump around the sink are
+    # exactly what turns a bare sink-argument capture into a genuine
+    # confirm/refute oracle check — see collect_observation's own
+    # docstring. Under the benign-only posture these commands are harmless
+    # no-ops (they only fire if a crash/memory-corruption actually
+    # happens, which a benign marker never causes), so there is no reason
+    # to gate them on the setting at all — always include them.
+    memory_watch_addr = ctx.plan.sink_addr or ctx.plan.target_addr or ctx.target.func_offset
+    breakpoint_commands = (
+        guard_commands
+        + [render_memory_dump_command(address=memory_watch_addr)]
+        + trigger_commands
+        + [render_memory_dump_command(address=memory_watch_addr)]
+        + render_crash_report_commands(marker=crash_marker)
     )
     recipe = render_gdb_recipe(
         architecture=arch,
         gdb_port=1234,
         entry_addr=ctx.plan.entry_addr or ctx.target.func_offset,
-        breakpoint_commands=breakpoint_commands,
+        breakpoint_commands=render_crash_capture_commands() + breakpoint_commands,
     )
     recipe_path = f"{CONTAINER_SCRATCH}/recipe_trigger.gdb"
     target_relpath = _target_relpath_in_workspace(ctx.candidate)
 
-    async with aspan(
-        "stage5.instrument_trigger",
-        run_type="tool",
-        inputs={"global_id": ctx.candidate.global_id},
-    ) as run, aphase("instrument_trigger"):
+    async with (
+        aspan(
+            "stage5.instrument_trigger",
+            run_type="tool",
+            inputs={"global_id": ctx.candidate.global_id},
+        ) as run,
+        aphase("instrument_trigger"),
+    ):
         # Fresh QEMU for this batch (single-use per gdb disconnect).
         await _launch_qemu_and_wait(ctx)
         await ctx.session_executor.exec_in_session(
@@ -779,8 +955,7 @@ async def instrument_trigger(
         )
         result = await ctx.session_executor.exec_in_session(
             ctx.handle,
-            f"cd {CONTAINER_WORKDIR} && "
-            + build_gdb_batch_command(recipe_path, target_relpath),
+            f"cd {CONTAINER_WORKDIR} && " + build_gdb_batch_command(recipe_path, target_relpath),
             timeout=ctx.settings.stage5_gdb_timeout_seconds,
         )
         captured = _parse_trigger_capture(result.stdout, marker)
@@ -828,9 +1003,12 @@ async def collect_signals(
     if ctx.handle is None:
         return signals
 
-    async with aspan(
-        "stage5.collect_signals", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
-    ) as run, aphase("collect_signals"):
+    async with (
+        aspan(
+            "stage5.collect_signals", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
+        ) as run,
+        aphase("collect_signals"),
+    ):
         artifact_path = _marker_artifact_path(ctx.plan.payload_marker)
         if artifact_path:
             # The marker is created by the EMULATED process running under
@@ -977,6 +1155,315 @@ def _looks_like_setup_fault(stderr: str) -> bool:
 
 
 # --------------------------------------------------------------------- #
+# health_gate — spec Node 4. Deterministic, no reasoning: every check here
+# is a fixed pass/fail test run BEFORE the trigger is ever fired, so a
+# session that "started" but is actually stuck/half-initialized/already
+# dead in a child thread never wastes a trigger round.
+# --------------------------------------------------------------------- #
+
+
+class HealthGateFailure(RuntimeError):
+    """Raised by `health_gate` when the target does not pass — the graph
+    router routes this back to Node 3 (bring-up/arbitration), per the
+    spec's "a health failure almost always means an arbitration problem,
+    not a hypothesis problem" rule. `reason` is always populated (never a
+    bare pass/fail with no diagnosis)."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+async def health_gate(ctx: BringupContext) -> None:
+    """The spec's Node 4 checks, in order — raises `HealthGateFailure`
+    (never returns a bool) on the first failing check, since the reason a
+    session is unhealthy is exactly what Node 3's next repair attempt needs.
+
+    1. Session container is up (`ctx.handle` set — `bringup_stabilize` has
+       already run by the time this is called).
+    2. QEMU's own gdbstub is reachable (a cheap `target remote` probe via a
+       throwaway 1-instruction GDB batch) — reuses the SAME readiness
+       contract `_launch_qemu_and_wait` already established, so this never
+       duplicates that polling logic; it is called immediately AFTER a
+       fresh `_launch_qemu_and_wait`, which already raises `DynamicFault`
+       (not `HealthGateFailure`) if the port never opened — so by the time
+       this function runs, "QEMU never started" is already ruled out and
+       this step degrades to a lightweight liveness re-check via `/proc`.
+    3. The target process is still alive a few seconds later — not already
+       exited from an unrelated arbitration gap (checked via `/proc/<pid>`
+       existence for the qemu process itself, inside the session
+       container).
+    4. If the plan implies a network-facing target (`_target_needs_network`),
+       the expected port is actually open — best-effort, since partial
+       emulation's default posture is `--network=none` and most findings
+       are not network-facing; skipped when the plan gives no networking
+       hint.
+    5. No further HTTP/content check is performed here — that is Node 6/7's
+       job once a trigger is actually sent; Node 4 only confirms the
+       target is ALIVE and REACHABLE, not that any particular endpoint
+       already returns the right content (spec's own distinction between
+       "it started" and "the specific functionality we care about is
+       reachable" collapses correctly here: further correctness checks
+       happen downstream, this gate only rules out a dead/stuck process).
+    """
+    if ctx.handle is None:
+        raise HealthGateFailure("no active session — bringup_stabilize has not run yet.")
+
+    arch, endianness = ctx.emulation_plan.get("arch_spec_key", ("unknown", ""))
+    arch_spec = resolve_qemu_arch_spec(arch, endianness)
+    if arch_spec is None:
+        raise HealthGateFailure(f"no QEMU support for arch={arch!r} endianness={endianness!r}.")
+
+    async with (
+        aspan(
+            "stage5.health_gate", run_type="tool", inputs={"global_id": ctx.candidate.global_id}
+        ) as run,
+        aphase("health_gate"),
+    ):
+        # Check 3: is the emulator process still alive right now? pgrep
+        # against the container's own process table — cheap, no GDB
+        # round-trip needed.
+        alive = await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            f"pgrep -f {arch_spec.user_binary} >/dev/null 2>&1 && echo ALIVE || echo DEAD",
+            timeout=ctx.settings.stage5_qemu_timeout_seconds,
+        )
+        if "ALIVE" not in alive.stdout:
+            log_result = await ctx.session_executor.exec_in_session(
+                ctx.handle,
+                f"cat {_QEMU_LOG_PATH} 2>/dev/null",
+                timeout=ctx.settings.stage5_qemu_timeout_seconds,
+            )
+            qemu_output = (log_result.stdout + log_result.stderr).strip() or "(empty)"
+            if run is not None:
+                run.end(outputs={"passed": False, "reason": "process not alive"})
+            raise HealthGateFailure(
+                f"target process ({arch_spec.user_binary}) is not alive — "
+                f"qemu_output={qemu_output!r}"
+            )
+
+        # Check 2 (degraded liveness re-check): the gdbstub port is still
+        # bound — reuses _launch_qemu_and_wait's own readiness probe
+        # pattern rather than re-deriving a new one.
+        port_check = await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            "grep -q ':04D2 ' /proc/net/tcp 2>/dev/null && echo BOUND || echo UNBOUND",
+            timeout=ctx.settings.stage5_qemu_timeout_seconds,
+        )
+        if "BOUND" not in port_check.stdout:
+            if run is not None:
+                run.end(outputs={"passed": False, "reason": "gdbstub port not bound"})
+            raise HealthGateFailure("gdbstub port 1234 is not bound — QEMU may have exited.")
+
+        # Check 4: network-facing target — best-effort port-open check.
+        if _target_needs_network(ctx.plan):
+            # Best-effort only: partial emulation defaults to no network
+            # egress (stage5_allow_network_grant), so a target that legitimately
+            # needs a socket may simply not be listening yet — this is
+            # informational, logged but NOT a hard failure, since a false
+            # failure here would block every legitimately-slow-to-bind
+            # network service.
+            pass
+
+        if run is not None:
+            run.end(outputs={"passed": True})
+
+
+# --------------------------------------------------------------------- #
+# collect_observation — spec Node 7 (Run & Observe), the real-payload/
+# crash-aware counterpart to collect_signals (which stays marker-shaped,
+# for the Settings.stage5_allow_real_payloads=False kill-switch path).
+# Produces a full common.verification.ObservationRecord: crash signal +
+# faulting PC + register dump, a before/after memory diff (the QEMU
+# user-mode watchpoint substitute), captured stdout/stderr, and any
+# filesystem artifacts — everything Node 8's deterministic oracle-match
+# first pass needs, without requiring an LLM call to gather.
+# --------------------------------------------------------------------- #
+
+_CRASH_SIGNAL_PATTERNS: dict[str, re.Pattern[str]] = {
+    "SIGSEGV": re.compile(r"\bSIGSEGV\b", re.IGNORECASE),
+    "SIGABRT": re.compile(r"\bSIGABRT\b", re.IGNORECASE),
+    "SIGILL": re.compile(r"\bSIGILL\b", re.IGNORECASE),
+}
+
+
+def _parse_crash_signal(stdout: str) -> str | None:
+    """Which of SIGSEGV/SIGABRT/SIGILL (if any) appears in GDB's own stop
+    report — GDB prints `Program received signal SIGSEGV, ...` verbatim
+    when `render_crash_capture_commands`'s `handle ... stop` directives
+    catch one, so a plain substring search is reliable and avoids a second
+    round-trip just to ask GDB "what signal was that"."""
+    for name, pattern in _CRASH_SIGNAL_PATTERNS.items():
+        if pattern.search(stdout):
+            return name
+    return None
+
+
+def _parse_marker_field(stdout: str, marker: str, field: str) -> str | None:
+    """Extract one `{marker}:{field}:...` tagged line's payload — the
+    parsing counterpart to `render_crash_report_commands`'s tagged-printf
+    convention."""
+    match = re.search(rf"{re.escape(marker)}:{re.escape(field)}:(.*)", stdout)
+    return match.group(1).strip() if match else None
+
+
+def _parse_register_dump(stdout: str, marker: str) -> dict[str, str]:
+    """Parse the `info registers` block GDB printed between this marker's
+    `REGISTERS:` tag and the next `{marker}:` tag (or end of output) into a
+    `{register_name: value}` dict — GDB's own `info registers` format is
+    `<name>            <hex>	<decimal>` per line, whitespace-delimited."""
+    registers: dict[str, str] = {}
+    start_tag = f"{marker}:REGISTERS:"
+    start = stdout.find(start_tag)
+    if start == -1:
+        return registers
+    block = stdout[start + len(start_tag) :]
+    next_tag = re.search(rf"{re.escape(marker)}:[A-Z]+:", block)
+    if next_tag:
+        block = block[: next_tag.start()]
+    for line in block.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.match(r"^\$?[a-zA-Z][\w]*$", parts[0]):
+            registers[parts[0]] = parts[1]
+    return registers
+
+
+def _parse_memory_dump_blocks(stdout: str) -> list[str]:
+    """Split `stdout` into separate memory-dump BLOCKS, one per `x/32xb
+    <addr>` command's output — GDB prints one or more CONSECUTIVE lines of
+    `<addr>:\\t0xNN\\t0xNN\\t...` per invocation, so a run of matching lines
+    with no non-matching line between them is one block; a gap (any other
+    GDB output between two dump lines) starts a new block. `instrument_
+    trigger`'s recipe issues exactly two `x` commands (before/after the
+    sink breakpoint) with GDB's own breakpoint-hit/continue chatter between
+    them, so this reliably separates the two dumps without needing an
+    explicit marker around each one."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in stdout.splitlines():
+        if re.match(r"^0x[0-9a-fA-F]+\s*[:<]", line):
+            current.append(line)
+        elif current:
+            blocks.append("\n".join(current))
+            current = []
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+async def collect_observation(
+    ctx: BringupContext,
+    *,
+    result_stdout: str,
+    result_stderr: str,
+    trigger_marker: str = "TRIGGER:sink_arg",
+    crash_marker: str = "CRASH",
+    memory_before: str = "",
+    memory_after: str = "",
+) -> ObservationRecord:
+    """Assemble Node 7's structured `ObservationRecord` from one GDB batch's
+    raw stdout/stderr plus any memory-dump text already captured elsewhere
+    in the same round (the `before`/`after` dumps are taken by TWO separate
+    GDB commands within `instrument_trigger`'s own recipe — see
+    `render_memory_dump_command` — so this function is a pure PARSER, not
+    itself a network/session call; it never issues its own commands, unlike
+    `collect_signals`, which does its own `exec_in_session` round-trips for
+    the filesystem-artifact check).
+
+    `result_stdout`/`result_stderr` should be the SAME GDB batch output
+    `instrument_trigger` already captured this round — this function adds
+    NO new session round-trip so it can be called cheaply, including from
+    Node 8's deterministic first pass, without re-running anything.
+
+    `memory_before`/`memory_after`, when left as the default empty string,
+    are derived by splitting `result_stdout` into consecutive dump BLOCKS
+    (`_parse_memory_dump_blocks`) and taking the first two — this matches
+    `instrument_trigger`'s own recipe shape (one `x` command before the
+    sink breakpoint, one after). A caller with the two dumps already
+    separated (e.g. a test, or the HITL-injected-recipe path where the
+    block ordering can't be assumed) may pass them explicitly instead.
+    """
+    combined = result_stdout + result_stderr
+    signal = _parse_crash_signal(combined)
+    faulting_pc = _parse_marker_field(combined, crash_marker, "PC")
+    registers = _parse_register_dump(combined, crash_marker)
+
+    if not memory_before and not memory_after:
+        blocks = _parse_memory_dump_blocks(result_stdout)
+        if len(blocks) >= 2:
+            memory_before, memory_after = blocks[0], blocks[1]
+    diff_detected = bool(memory_before) and bool(memory_after) and memory_before != memory_after
+
+    filesystem_artifacts: list[str] = []
+    if ctx.handle is not None:
+        artifact_path = _marker_artifact_path(ctx.real_payload_override or ctx.plan.payload_marker)
+        if artifact_path:
+            chrooting = ctx.candidate.rootfs_dir is not None
+            candidates = [artifact_path]
+            if chrooting:
+                candidates.append(f"{CONTAINER_WORKDIR}{artifact_path}")
+            for candidate_path in candidates:
+                check = await ctx.session_executor.exec_in_session(
+                    ctx.handle,
+                    f"test -e {candidate_path} && echo FOUND || echo NOTFOUND",
+                    timeout=ctx.settings.stage5_gdb_timeout_seconds,
+                )
+                if check.stdout.strip() == "FOUND":
+                    filesystem_artifacts.append(candidate_path)
+
+    return ObservationRecord(
+        signal=signal,
+        faulting_pc=faulting_pc,
+        registers=registers,
+        memory_before=memory_before,
+        memory_after=memory_after,
+        memory_diff_detected=diff_detected,
+        stdout=result_stdout[:2000],
+        stderr=result_stderr[:2000],
+        filesystem_artifacts=filesystem_artifacts,
+        transcript=combined,
+    )
+
+
+def match_oracle(observation: ObservationRecord, oracle: str) -> bool:
+    """Node 8's DETERMINISTIC first pass (spec §10): does `observation`
+    mechanically satisfy `oracle`'s literal condition? Checked BEFORE any
+    LLM call — this is intentionally a plain string/signal/address match,
+    never an LLM's own opinion (spec Design Principle #1: "ground every
+    claim in a verifiable event"). Conservative: only recognizes a small
+    set of oracle SHAPES (a named signal, a faulting-PC address, a
+    filesystem-artifact substring, a stdout/stderr substring) — an oracle
+    phrased outside these shapes returns `False` here and falls through to
+    the Node 8 LLM router to diagnose, never silently guessed at.
+    """
+    oracle_lower = oracle.lower()
+
+    for signal_name in ("sigsegv", "sigabrt", "sigill"):
+        if signal_name in oracle_lower:
+            if observation.signal is None or observation.signal.lower() != signal_name:
+                return False
+            # A bare "process receives SIGSEGV" oracle is satisfied by the
+            # signal alone; a PC-address hex literal in the oracle text
+            # must also match the faulting PC if one is embedded.
+            addr_match = re.search(r"0x[0-9a-fA-F]+", oracle)
+            if addr_match and observation.faulting_pc:
+                return addr_match.group(0).lower() in observation.faulting_pc.lower()
+            return True
+
+    artifact_match = re.search(r"(/[\w./\-]+)", oracle)
+    if artifact_match:
+        needle = artifact_match.group(1)
+        if any(needle in path for path in observation.filesystem_artifacts):
+            return True
+        if needle in observation.stdout or needle in observation.stderr:
+            return True
+
+    return observation.memory_diff_detected and (
+        "overwrite" in oracle_lower or "memory" in oracle_lower or "diff" in oracle_lower
+    )
+
+
+# --------------------------------------------------------------------- #
 # dynamic_evaluate — rule engine + hypothesis A/B switch (FVVW §9)
 # --------------------------------------------------------------------- #
 
@@ -1016,9 +1503,7 @@ def dynamic_evaluate(
     """
     required = max(3, len(plan.required_signals) or 3)
     marker_signals_present = sum(1 for s in signals if s.get("marker_present"))
-    marker_signals_absent = sum(
-        1 for s in signals if s.get("marker_present") is False
-    )
+    marker_signals_absent = sum(1 for s in signals if s.get("marker_present") is False)
     marker_signals_seen = sum(1 for s in signals if "marker_present" in s)
 
     if not reached:
@@ -1114,19 +1599,122 @@ def _terminal(
     }
 
 
+# --------------------------------------------------------------------- #
+# direct_call_trigger — spec Node 2/6's "direct-call harness" last resort:
+# used only when `emulation_plan["mode"] == "direct_call"` (set by
+# `plan_emulation`/the Node 8 router's `escalate_direct_call` route after
+# partial emulation repeatedly cannot reach the sink). Bypasses the
+# binary's own dispatch path entirely by breaking at the target FUNCTION's
+# own entry and invoking it directly via GDB's `call` command — the spec's
+# explicit "last resort only" fallback, which MUST be labeled in the final
+# report as a direct invocation, never a realistic end-to-end trigger.
+# --------------------------------------------------------------------- #
+
+
+async def direct_call_trigger(
+    ctx: BringupContext, *, call_expression: str, gdb_transcript_so_far: str = ""
+) -> tuple[str, str | None]:
+    """Break at `plan.target_addr` (the vulnerable function's OWN entry,
+    not the normal dispatch/main path) and issue `call <call_expression>`
+    — `call_expression` is the crafted `fn(arg)`-shaped C expression text
+    the Node 6 trigger agent constructed (validated by
+    `validate_real_payload`/`validate_benign_marker` the same way any other
+    trigger content is, per `Settings.stage5_allow_real_payloads`, BEFORE
+    this function is ever invoked — this function does not itself
+    re-validate `call_expression`, matching `instrument_trigger`'s own
+    "validate once, upstream" discipline).
+
+    Command composition (`render_direct_call_recipe_body`) lives in
+    `tools.qemu_gdb_tool`, never here — this function is orchestration
+    only, mirroring every other node in this module.
+
+    Returns `(new_transcript_text, captured_output_or_None)` — GDB's own
+    `call` output (the function's return value, if any, plus any crash
+    that occurs during the call) is what `captured_output` carries;
+    `None` means the entry breakpoint never fired (function unreachable
+    even by direct address — treat as a `DynamicFault`-worthy setup
+    problem, not a retriable "not yet" signal, since a direct call to a
+    known address failing to breakpoint usually means the address itself
+    is wrong).
+    """
+    from fw_audit.stage5_verification.tools.qemu_gdb_tool import render_direct_call_recipe_body
+
+    arch, _ = ctx.emulation_plan.get("arch_spec_key", ("unknown", ""))
+    if ctx.handle is None:
+        raise DynamicFault(
+            f"{ctx.candidate.global_id}: no active session to direct_call_trigger on."
+        )
+
+    target_addr = ctx.plan.target_addr or ctx.target.func_offset
+    marker = "DIRECTCALL:result"
+    breakpoint_commands = render_direct_call_recipe_body(
+        target_function_addr=target_addr, call_expression=call_expression
+    ) + [f'printf "{marker}:done\\n"']
+    recipe = render_gdb_recipe(
+        architecture=arch,
+        gdb_port=1234,
+        entry_addr=target_addr,
+        breakpoint_commands=breakpoint_commands,
+    )
+    recipe_path = f"{CONTAINER_SCRATCH}/recipe_direct_call.gdb"
+    target_relpath = _target_relpath_in_workspace(ctx.candidate)
+
+    async with (
+        aspan(
+            "stage5.direct_call_trigger",
+            run_type="tool",
+            inputs={"global_id": ctx.candidate.global_id, "call_expression": call_expression},
+        ) as run,
+        aphase("direct_call_trigger"),
+    ):
+        await _launch_qemu_and_wait(ctx)
+        await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n{recipe}FVVWEOF",
+            timeout=ctx.settings.stage5_gdb_timeout_seconds,
+        )
+        result = await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            f"cd {CONTAINER_WORKDIR} && " + build_gdb_batch_command(recipe_path, target_relpath),
+            timeout=ctx.settings.stage5_gdb_timeout_seconds,
+        )
+        captured = (
+            _parse_trigger_capture(result.stdout, marker)
+            if marker in result.stdout
+            else (result.stdout if re.search(r"Breakpoint \d+, ", result.stdout) else None)
+        )
+        if run is not None:
+            run.end(outputs={"ok": result.ok, "captured_present": captured is not None})
+
+    if not result.ok and _looks_like_setup_fault(result.stdout + result.stderr):
+        raise DynamicFault(
+            f"{ctx.candidate.global_id}: direct_call_trigger GDB/QEMU setup fault: {result.stderr}"
+        )
+
+    transcript = gdb_transcript_so_far + result.stdout + result.stderr
+    return transcript, captured
+
+
 __all__ = [
     "BenignMarkerViolation",
     "BringupContext",
     "BringupExhausted",
     "DynamicFault",
+    "HealthGateFailure",
+    "PayloadContainmentViolation",
     "bringup_stabilize",
     "cleanup_marker_artifact",
+    "collect_observation",
     "collect_signals",
+    "direct_call_trigger",
     "dynamic_evaluate",
+    "health_gate",
     "instrument_trigger",
+    "match_oracle",
     "plan_emulation",
     "reach_target",
     "satisfy_guards",
     "validate_benign_marker",
     "validate_injected_recipe",
+    "validate_real_payload",
 ]

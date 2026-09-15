@@ -67,6 +67,17 @@ The decisive_observable must be independently expressible in BOTH a static \
 (CPGQL) and a dynamic (GDB) sense — restate it in both plans below using \
 the SAME underlying claim, in each track's own vocabulary.
 
+Also produce hypotheses.oracle: the EXACT, mechanically-checkable condition \
+that means "confirmed" — e.g. "process receives SIGSEGV with PC pointing \
+inside the strcpy call site", "a file is written to /tmp/<id>_proof \
+containing OVERFLOW_CONFIRMED", "HTTP response contains command output not \
+part of any legitimate response field". This must be a literal, checkable \
+fact — never "the code looks exploitable" or any other subjective \
+judgement. And hypotheses.disconfirm_condition: what result means \
+"false positive" — e.g. "input reaches the sink but is safely \
+bounds-checked before use" or "the path is provably unreachable from any \
+network-facing input".
+
 3. static_plan: target_function (the finding's evidence_span.function_id), \
 source_fields, sink_names, expected_intermediate_calls (named functions the \
 data flow should pass through, from the finding's own data_flow steps), \
@@ -83,12 +94,26 @@ leave sink_addr empty if it cannot be inferred), guards (translate the \
 finding's security_condition/data_flow PROSE into a structured list of \
 {name, addr, forced_value} — addr may be empty if unresolved, but name and \
 forced_value must always be filled from the prose), argv_template, \
-payload_marker (a BENIGN distinguishing marker only — e.g. \
-';touch /tmp/<claim_id>_proof;' — NEVER a functional exploit, reverse \
-shell, exfiltration command, or destructive operation; this is verification \
-infrastructure, not an exploit), required_signals (list at least 3 \
-independent signals, e.g. sink_argument_capture, target_self_report, \
-filesystem_artifact), and decisive_observable restated in GDB/runtime terms.
+trigger_shape (roughly how the trigger should reach the sink: \
+"network_http" for an HTTP/CGI/UPnP/SOAP endpoint, "cli_argv" for a \
+CLI-argument-facing binary, or "direct_call" only if the finding's own \
+evidence gives no realistic front-door path), preconditions (anything that \
+must be true before the sink is reachable, e.g. "must be authenticated", \
+"NVRAM key X must be set" — from the finding's own evidence, never \
+invented), oracle (dynamic_plan's own restatement of hypotheses.oracle in \
+GDB/runtime terms — a crash signal name, a captured register/memory value, \
+a filesystem artifact path, or specific stdout/stderr content), \
+disconfirm_condition (dynamic_plan's own restatement of \
+hypotheses.disconfirm_condition), payload_marker (ONLY used as a fallback \
+when this run's containment posture is benign-only — see below; when real \
+payloads are allowed, leave this as a short informational label, e.g. \
+"overflow probe for <claim_id>", since the actual payload construction is \
+a separate agent's job downstream), required_signals (list at least 3 \
+independent signals appropriate to the vuln class — e.g. \
+["crash_signal", "faulting_pc", "memory_diff"] for a memory-corruption bug, \
+or ["sink_argument_capture", "target_self_report", "filesystem_artifact"] \
+for a marker-based check), and decisive_observable restated in GDB/runtime \
+terms.
 
 5. static_runnable / dynamic_runnable: false ONLY for hard infeasibility \
 (e.g. no source available for a CPG; the target architecture has no QEMU \
@@ -97,19 +122,35 @@ both to true unless the supplied facts clearly rule one out.
 
 # HARD RULES
 
-- The payload_marker MUST be benign — refuse to name a real exploit, \
-reverse shell, credential exfiltration, or destructive command. A marker \
-like a harmless touch/echo of a unique string is correct; anything that \
-could function as an actual attack is not.
+- This run's containment posture is stated explicitly in the brief below \
+("payload posture: real payloads allowed" or "payload posture: \
+benign-only"). Under "benign-only", payload_marker MUST be a benign, \
+scoped filesystem side-effect only (e.g. ';touch /tmp/<claim_id>_proof;') \
+— never a functional exploit, reverse shell, exfiltration command, or \
+destructive operation. Under "real payloads allowed" (the default), the \
+oracle/disconfirm_condition you specify is what actually matters — a \
+downstream trigger agent crafts the concrete payload from your \
+oracle/trigger_shape/preconditions, inside a disposable, network-isolated \
+sandbox container; you do not construct the payload text yourself here, \
+only the CONDITIONS that would prove or disprove the hypothesis.
+- Regardless of posture: never specify a reverse shell, host credential \
+exfiltration, or a command intended to persist/escape the sandbox — that \
+is refused at execution time regardless of what you write here, but do not \
+plan around needing one; every genuine memory-safety/injection/traversal \
+bug is provable without it.
 - static_plan.decisive_observable, dynamic_plan.decisive_observable, and \
 hypotheses.decisive_observable must all describe the SAME underlying fact, \
-just phrased for each track/purpose.
+just phrased for each track/purpose. Likewise hypotheses.oracle/\
+dynamic_plan.oracle must describe the same confirming condition, and \
+hypotheses.disconfirm_condition/dynamic_plan.disconfirm_condition the same \
+disconfirming condition.
 - Never invent facts the finding/target data doesn't support — an unknown \
 addr/offset is an empty string, not a guess.
 
 Return ONLY a single JSON object (no markdown fences, no commentary, no \
 <think> reasoning in your final answer) matching this shape exactly:
 {"threat_model": {...}, "hypotheses": {"a": "...", "b": "...", \
+"oracle": "...", "disconfirm_condition": "...", \
 "decisive_observable": "..."}, "static_plan": {"target_function": "...", \
 "source_fields": [...], "sink_names": [...], \
 "expected_intermediate_calls": [...], "sanitizer_patterns": [...], \
@@ -117,24 +158,36 @@ Return ONLY a single JSON object (no markdown fences, no commentary, no \
 "dynamic_plan": {"reach_strategy": "...", "entry_addr": "...", \
 "target_addr": "...", "sink_addr": "...", "guards": [{"name": "...", \
 "addr": "...", "forced_value": "..."}], "argv_template": [...], \
-"payload_marker": "...", "required_signals": [...], \
-"decisive_observable": "..."}, "static_runnable": true, \
-"dynamic_runnable": true}
+"trigger_shape": "...", "preconditions": [...], "oracle": "...", \
+"disconfirm_condition": "...", "payload_marker": "...", \
+"required_signals": [...], "decisive_observable": "..."}, \
+"static_runnable": true, "dynamic_runnable": true}
 """
 
 
-def render_strategy_brief(candidate: VerificationCandidate, target: TargetMeta) -> str:
+def render_strategy_brief(
+    candidate: VerificationCandidate, target: TargetMeta, *, settings: Settings
+) -> str:
     """Renders the finding + `mem.target` facts into the plain-text brief
     the strategy agent reasons over — layers `TargetMeta` on top of the
     SAME finding fields `agent.prompts.render_finding_brief` already
     renders for the static track, without importing that function (keeping
     this module's prompt fully independent of the existing generator/
     evaluator prompt module, per this project's "don't touch Joern" reuse
-    discipline)."""
+    discipline). Also states this run's containment posture
+    (`Settings.stage5_allow_real_payloads`) explicitly, so the strategy
+    agent knows whether payload_marker must stay benign-only (see the
+    system prompt's HARD RULES) or is a fallback-only field this run."""
     finding = candidate.finding
+    posture = (
+        "real payloads allowed"
+        if settings.stage5_allow_real_payloads
+        else "benign-only (payload_marker must be a scoped touch/echo/mkdir side effect)"
+    )
     lines = [
         f"global_id: {candidate.global_id}",
         f"bin_id: {candidate.bin_id}",
+        f"payload posture: {posture}",
         "",
         f"## Finding: {finding.title}",
         f"category: {finding.category}",
@@ -197,7 +250,20 @@ def validate_decisive_observable(plan: StrategyPlan) -> bool:
         plan.static_plan.decisive_observable.strip(),
         plan.dynamic_plan.decisive_observable.strip(),
     )
-    return all(observables)
+    # oracle/disconfirm_condition are the Node 8 deterministic first pass's
+    # ground truth (match_oracle) — an empty oracle would mean every round
+    # falls straight through to the LLM router with nothing to check
+    # mechanically first, defeating spec Design Principle #1 ("ground every
+    # claim in a verifiable event, not the LLM's opinion"). Same "non-empty
+    # in every place it must appear" looseness as decisive_observable
+    # above — disconfirm_condition is checked too since an empty one would
+    # leave hypothesis B with no positive proof condition either.
+    oracles = (plan.hypotheses.oracle.strip(), plan.dynamic_plan.oracle.strip())
+    disconfirms = (
+        plan.hypotheses.disconfirm_condition.strip(),
+        plan.dynamic_plan.disconfirm_condition.strip(),
+    )
+    return all(observables) and all(oracles) and all(disconfirms)
 
 
 def parse_strategy_response(raw: object) -> StrategyPlan | None:
@@ -233,7 +299,7 @@ async def strategy_agent(
     candidate (both tracks need `mem.plan` before they can start), unlike
     `characterize_target`'s narrower "target mismatch" failure.
     """
-    brief = render_strategy_brief(candidate, target)
+    brief = render_strategy_brief(candidate, target, settings=settings)
     messages = build_strategy_messages(brief=brief, system_prompt=system_prompt)
 
     last_raw = ""
@@ -254,10 +320,14 @@ async def strategy_agent(
         if attempt < max_regenerate_attempts:
             nudge = (
                 "Your previous response either did not parse as the required JSON "
-                "object, or its hypotheses/static_plan/dynamic_plan decisive_observable "
-                "values did not consistently restate the same underlying claim. Return "
-                "ONLY the corrected JSON object this time, with all three "
-                "decisive_observable fields describing the same fact."
+                "object, or one of hypotheses/static_plan/dynamic_plan's "
+                "decisive_observable/oracle/disconfirm_condition fields was empty or did "
+                "not consistently restate the same underlying claim. Return ONLY the "
+                "corrected JSON object this time, with decisive_observable describing the "
+                "same fact everywhere it appears, and hypotheses.oracle/dynamic_plan.oracle "
+                "(and hypotheses.disconfirm_condition/dynamic_plan.disconfirm_condition) "
+                "both filled in with the exact, mechanically-checkable confirm/disconfirm "
+                "conditions — never left empty."
             )
             messages = [*messages, HumanMessage(content=nudge)]
 

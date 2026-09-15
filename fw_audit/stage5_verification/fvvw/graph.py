@@ -1,8 +1,10 @@
 """`fvvw.graph` — the top-level fork-join `StateGraph(FVVWState)` (FVVW v3
 §5/§10): `ingest -> characterize -> strategy`, forking into the static
 track (the existing Joern pipeline, reused via `fvvw.static_track`) and the
-dynamic track (`fvvw.dynamic_track`) running concurrently, joining at
-`await_both_tracks`, then `joint_evaluate -> write_report -> END`.
+dynamic track (the compiled 9-node agentic `StateGraph` from
+`fvvw.dynamic_graph.build_dynamic_graph`, wrapped by `run_dynamic_track_only`
+below) running concurrently, joining at `await_both_tracks`, then
+`joint_evaluate -> write_report -> END`.
 
 Track isolation (no static-track node reads `dynamic_*`, no dynamic-track
 node reads `static_result`) is enforced by construction: each track is
@@ -13,16 +15,13 @@ every closure here reads only from the specific fields of `state` its own
 docstring names, mirroring `agent.graph.build_verifier_graph`'s node-closure
 shape rather than importing `state` wholesale.
 
-Repair back-edges (`reach_target`/`satisfy_guards`/`instrument_trigger` ->
-`bringup_stabilize` on a `DynamicFault`) are implemented as in-node retry
-loops bounded by `Settings.stage5_bringup_max_repairs`
-(`fvvw.dynamic_track.BringupExhausted` raised past that budget) rather than
-LangGraph conditional edges back to a `bringup_stabilize` NODE — this
-keeps `BringupContext`'s mutable session/launch state naturally scoped to
-one dynamic-track node closure instead of round-tripping it through graph
-state on every repair, while still matching the FVVW §5 diagram's dotted
-"any dynamic node -> bringup_stabilize -> resume that node" behavior
-exactly from the outside.
+Repair back-edges inside the dynamic track (Node 4/5/6 -> Node 3 bring-up
+on a fault, per the spec's §10 decision table) are real LangGraph
+conditional edges inside `fvvw.dynamic_graph.build_dynamic_graph` itself —
+see that module's docstring for why looping back through a graph edge
+still keeps `BringupContext`'s mutable session/launch state naturally
+scoped to ONE long-lived context object shared by every node closure,
+rather than round-tripping a `SessionHandle` through graph state.
 """
 
 from __future__ import annotations
@@ -40,6 +39,7 @@ from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings
 from fw_audit.executors.base import Executor
 from fw_audit.executors.sandbox_executor import SandboxExecutor
+from fw_audit.observability import run_config
 from fw_audit.stage5_verification import layout
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.cmdlog import CommandLog, LoggingSessionExecutor
@@ -47,18 +47,10 @@ from fw_audit.stage5_verification.errors import (
     Stage5InputError,
     VerifierModelUnavailableError,
 )
+from fw_audit.stage5_verification.fvvw.dynamic_graph import DynamicGraphDeps, build_dynamic_graph
 from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BringupContext,
-    BringupExhausted,
-    DynamicFault,
-    bringup_stabilize,
-    cleanup_marker_artifact,
-    collect_signals,
-    dynamic_evaluate,
-    instrument_trigger,
     plan_emulation,
-    reach_target,
-    satisfy_guards,
 )
 from fw_audit.stage5_verification.fvvw.hitl import (
     HitlAction,
@@ -135,6 +127,9 @@ class FVVWDeps:
     static_generator_llm: BaseChatModel
     static_evaluator_llm: BaseChatModel
     report_llm: BaseChatModel
+    bringup_llm: BaseChatModel
+    trigger_llm: BaseChatModel
+    dynamic_evaluator_llm: BaseChatModel
     static_executor: Executor
     crosscheck_executor: Executor
     dynamic_session_executor: SandboxExecutor
@@ -151,8 +146,10 @@ async def resolve_fvvw_deps(
     """Resolve every LLM role + executor the fork-join needs for one
     candidate, up front — mirrors `agent.verifier.verify_candidate`'s own
     "resolve everything before any tool invocation" order, extended to the
-    two new roles and the two new executor kinds. Raises
-    `VerifierModelUnavailableError` if any of the four LLM roles can't be
+    five new roles (the dynamic track's 9-node agentic rewrite added
+    STAGE5_BRINGUP_AGENT/STAGE5_TRIGGER_AGENT/STAGE5_DYNAMIC_EVALUATOR on
+    top of the pre-existing two) and the two new executor kinds. Raises
+    `VerifierModelUnavailableError` if any of the seven LLM roles can't be
     resolved — a fork-join run needs all of them, not just the static
     track's two.
 
@@ -170,6 +167,11 @@ async def resolve_fvvw_deps(
             AgentRole.STAGE5_RESULT_EVALUATOR, settings=settings
         )
         report_llm = get_llm_for_agent(AgentRole.STAGE5_REPORT_WRITER, settings=settings)
+        bringup_llm = get_llm_for_agent(AgentRole.STAGE5_BRINGUP_AGENT, settings=settings)
+        trigger_llm = get_llm_for_agent(AgentRole.STAGE5_TRIGGER_AGENT, settings=settings)
+        dynamic_evaluator_llm = get_llm_for_agent(
+            AgentRole.STAGE5_DYNAMIC_EVALUATOR, settings=settings
+        )
     except (ImportError, ValueError) as exc:
         raise VerifierModelUnavailableError(str(exc)) from exc
 
@@ -201,6 +203,9 @@ async def resolve_fvvw_deps(
         static_generator_llm=static_generator_llm,
         static_evaluator_llm=static_evaluator_llm,
         report_llm=report_llm,
+        bringup_llm=bringup_llm,
+        trigger_llm=trigger_llm,
+        dynamic_evaluator_llm=dynamic_evaluator_llm,
         static_executor=joern_executor(settings),
         crosscheck_executor=verification_executor(settings),
         dynamic_session_executor=dynamic_session_executor,
@@ -219,12 +224,17 @@ async def run_dynamic_track_only(
     deps: FVVWDeps,
     settings_override: Settings | None = None,
     raw_recipe_override: str | None = None,
-) -> tuple[TrackResult, list[dict], bool | None, str]:
-    """The dynamic track's full sequence, run as one function rather than
-    discrete LangGraph nodes (see this module's docstring for why) —
-    still internally shaped as the seven FVVW nodes in order, with the
-    bring-up repair loop and the hypothesis A/B switch exactly as
-    `fvvw.dynamic_track` implements them.
+) -> tuple[TrackResult, list[dict], bool | None, str, dict]:
+    """The dynamic track's full run: compiles and `ainvoke`s the 9-node
+    agentic `StateGraph` (`fvvw.dynamic_graph.build_dynamic_graph` — spec
+    Nodes 2-8; Node 1 is the shared `strategy_agent` upstream, Node 9 stays
+    downstream in `joint_evaluate`/`write_report`), a thin wrapper exactly
+    as this module's docstring describes. Bring-up/arbitration (Node 3) and
+    trigger crafting (Node 6) are agentic loops driving the persistent QEMU
+    session themselves; Node 8 loops the graph back to Node 3/5/6 via real
+    conditional edges instead of this function's own retry `while` loops
+    (see `dynamic_graph`'s module docstring for why that still keeps
+    `BringupContext`'s mutable session state naturally scoped).
 
     `settings_override`, when given, is used instead of `deps.settings` for
     this run only — HITL's "retry with more iterations" action
@@ -234,9 +244,15 @@ async def run_dynamic_track_only(
     so `instrument_trigger` runs it verbatim instead of the plan-derived
     recipe — HITL's "inject" action.
 
-    Returns `(TrackResult, guard_logs, dynamic_reached_sink,
-    gdb_transcript)` — the extra values `joint_evaluate`/`fvvw.report` need
-    beyond the bare `TrackResult`.
+    Returns `(TrackResult, guard_logs, dynamic_reached_sink, gdb_transcript,
+    dynamic_extras)` — the extra values `joint_evaluate`/`fvvw.report`/the
+    persisted `FVVWReport` need beyond the bare `TrackResult`, unpacked from
+    the graph's terminal state. `dynamic_extras` is a plain dict
+    (`{"arbitration_log", "observation", "iteration_history",
+    "emulation_mode"}`) — spec Node 9's required contents #3/#4/#6/#7 — kept
+    as a bag rather than growing the positional tuple further, since it is
+    purely additive bookkeeping no existing caller needs to unpack by
+    position.
     """
     settings = settings_override or deps.settings
     emulation = plan_emulation(target, plan)["emulation_plan"]
@@ -250,6 +266,7 @@ async def run_dynamic_track_only(
             [],
             None,
             "",
+            {"emulation_mode": emulation["mode"]},
         )
 
     ctx = BringupContext(
@@ -262,102 +279,101 @@ async def run_dynamic_track_only(
         raw_recipe_override=raw_recipe_override,
     )
 
-    transcript = ""
-    guard_logs: list[dict] = []
-    reached: bool = False
-    captured: str | None = None
-    iteration = 0
+    graph_deps = DynamicGraphDeps(
+        settings=settings,
+        bringup_llm=deps.bringup_llm,
+        trigger_llm=deps.trigger_llm,
+        dynamic_evaluator_llm=deps.dynamic_evaluator_llm,
+        session_executor=deps.dynamic_session_executor,
+    )
 
+    compiled = build_dynamic_graph(
+        ctx=ctx,
+        deps=graph_deps,
+        candidate=candidate,
+        target=target,
+        plan=plan,
+        vuln_class=candidate.finding.category,
+        sink_expression=candidate.finding.sink.expression,
+    )
+
+    timed_out = False
     try:
-        # bringup_stabilize's own readiness probe (QEMU gdbstub never
-        # opened its port) raises DynamicFault, not BringupExhausted — that
-        # fault is retriable via the same repair-budget mechanism every
-        # other dynamic-track fault uses, not fatal on the first attempt.
-        # Retry it here the same way the in-loop DynamicFault handler below
-        # does; bringup_stabilize itself is what ends the branch by raising
-        # BringupExhausted once ctx.repair_count exceeds
-        # stage5_bringup_max_repairs, so this loop is bounded by that, not
-        # by anything new here.
-        while True:
-            try:
-                await bringup_stabilize(ctx)
-                break
-            except DynamicFault:
-                continue
-
-        # Best-effort: remove any stale marker artifact left behind by an
-        # earlier run against the same rootfs — otherwise the
-        # filesystem_artifact signal in collect_signals would report FOUND
-        # unconditionally, regardless of whether THIS run's sink is ever
-        # reached. See cleanup_marker_artifact's own docstring.
-        await cleanup_marker_artifact(ctx)
-
-        while True:
-            iteration += 1
-            try:
-                transcript, reached = await reach_target(ctx, gdb_transcript_so_far=transcript)
-                if reached:
-                    transcript, guard_logs = await satisfy_guards(
-                        ctx, gdb_transcript_so_far=transcript
-                    )
-                    transcript, captured = await instrument_trigger(
-                        ctx, gdb_transcript_so_far=transcript
-                    )
-                    signals = await collect_signals(ctx, captured_sink_argument=captured)
-                else:
-                    signals = []
-            except DynamicFault:
-                # bringup_stabilize's own readiness probe can ALSO raise
-                # DynamicFault (staging failure, gdbstub-never-opened
-                # timeout) — that fault must not escape this handler
-                # uncaught (it did before this fix: raised from inside an
-                # `except DynamicFault:` block, it was not re-caught here,
-                # so it propagated all the way out of run_dynamic_track_only
-                # into the driver's blanket `except Exception`, recording
-                # the candidate as "failed" with a message that looked
-                # nothing like a QEMU problem). Retry bring-up itself the
-                # same bounded way the pre-loop stand-up does — bounded by
-                # bringup_stabilize's own repair_count check, which raises
-                # BringupExhausted (caught below) once the budget is spent.
-                while True:
-                    try:
-                        await bringup_stabilize(ctx)
-                        break
-                    except DynamicFault:
-                        continue
-                continue
-
-            outcome = dynamic_evaluate(
-                reached=reached,
-                captured_sink_argument=captured,
-                signals=signals,
-                plan=plan,
-                iteration=iteration,
-                max_iterations=settings.stage5_dynamic_max_iterations,
+        try:
+            final_state = await asyncio.wait_for(
+                compiled.ainvoke(
+                    {},
+                    config=run_config(
+                        run_name="stage5.dynamic_track",
+                        metadata={"global_id": candidate.global_id},
+                        settings=settings,
+                    ),
+                ),
+                timeout=settings.stage5_dynamic_wall_clock_seconds,
             )
-            if outcome["route"] == "done":
-                return outcome["result"], guard_logs, reached, transcript
-            # "retry" — loop again
-
-    except BringupExhausted as exc:
-        return (
-            TrackResult(
-                verdict=VerificationVerdict.ERROR,
-                proved_hypothesis="none",
-                # budget_exhausted tagged here too (not just INCONCLUSIVE in
-                # dynamic_evaluate._terminal) — a BringupExhausted ERROR is
-                # ALSO a budget-exhaustion outcome per the HITL trigger
-                # condition (fvvw.hitl): "a track exhausted its own budget
-                # and returned a non-decisive verdict".
-                evidence={"reason": f"not_run: {exc}", "budget_exhausted": True},
-            ),
-            guard_logs,
-            None,
-            transcript,
-        )
+        except TimeoutError:
+            # The spec's Node 8 "mandatory: hard maximum number of loop
+            # iterations AND a wall-clock time budget" requirement — the
+            # per-round iteration cutoff (dynamic_graph._run_evaluate_route)
+            # bounds how many ROUNDS run, this bounds the WHOLE graph
+            # invocation's real elapsed time regardless of round count (a
+            # single slow QEMU/GDB round could otherwise blow past any
+            # reasonable wall-clock even within the iteration budget).
+            # ainvoke's own asyncio.Task is cancelled by wait_for on
+            # timeout — no partial FVVWState survives to unpack here, so
+            # this is a fixed INCONCLUSIVE/budget_exhausted result, not a
+            # richer one built from graph state.
+            timed_out = True
+            final_state = {}
     finally:
         if ctx.handle is not None:
             await deps.dynamic_session_executor.stop(ctx.handle)
+
+    result = final_state.get("dynamic_result")
+    if timed_out:
+        result = TrackResult(
+            verdict=VerificationVerdict.INCONCLUSIVE,
+            proved_hypothesis="none",
+            evidence={
+                "reason": f"dynamic graph exceeded its "
+                f"stage5_dynamic_wall_clock_seconds="
+                f"{settings.stage5_dynamic_wall_clock_seconds}s wall-clock budget.",
+                "budget_exhausted": True,
+            },
+        )
+    elif result is None:
+        # Every terminal route (`_run_bringup`'s exhaustion early-exit,
+        # `_run_evaluate_route`'s confirmed/refuted/inconclusive cases) sets
+        # `dynamic_result` before the graph reaches END — reaching here
+        # means the graph ended some other way (e.g. the recursion-limit
+        # safety net LangGraph itself enforces). Surface it as ERROR rather
+        # than let a bare KeyError/AttributeError propagate into the
+        # driver's blanket exception handler with no diagnosis.
+        result = TrackResult(
+            verdict=VerificationVerdict.ERROR,
+            proved_hypothesis="none",
+            evidence={
+                "reason": "dynamic graph reached its end state without a terminal "
+                "dynamic_result — likely the LangGraph recursion-limit safety net.",
+                "budget_exhausted": True,
+            },
+        )
+
+    guard_logs = final_state.get("signals") or []
+    gdb_transcript = final_state.get("gdb_transcript") or ""
+    observation = final_state.get("observation")
+    dynamic_reached_sink = (
+        observation.faulting_pc is not None or bool(observation.filesystem_artifacts)
+        if observation is not None
+        else None
+    )
+    dynamic_extras = {
+        "arbitration_log": final_state.get("arbitration_log"),
+        "observation": observation,
+        "iteration_history": final_state.get("iteration_history") or [],
+        "emulation_mode": ctx.emulation_plan.get("mode", ""),
+    }
+    return result, guard_logs, dynamic_reached_sink, gdb_transcript, dynamic_extras
 
 
 async def _run_hitl_for_track(
@@ -373,16 +389,18 @@ async def _run_hitl_for_track(
     dynamic_reached_sink: bool | None,
     guard_logs: list[dict],
     gdb_transcript: str,
+    dynamic_extras: dict | None = None,
     trigger: Callable[[TrackResult], bool] = is_budget_exhausted,
-) -> tuple[TrackResult, bool | None, list[dict], str, HumanReviewRecord | None]:
+) -> tuple[TrackResult, bool | None, list[dict], str, dict, HumanReviewRecord | None]:
     """Run the HITL prompt loop for ONE track (`"static"` or `"dynamic"`),
     bounded by `Settings.stage5_hitl_max_rounds`. Returns the (possibly
     updated) `TrackResult` plus the dynamic-track extras that can also
     change on a retry/inject round (`dynamic_reached_sink`, `guard_logs`,
-    `gdb_transcript` — unchanged/passed through for the static track), and a
-    `HumanReviewRecord` if the operator's LAST action was anything but
-    `skip` (a `skip` leaves the track's own result untouched and produces no
-    review record — there was nothing to attribute to a human).
+    `gdb_transcript`, `dynamic_extras` — unchanged/passed through for the
+    static track), and a `HumanReviewRecord` if the operator's LAST action
+    was anything but `skip` (a `skip` leaves the track's own result
+    untouched and produces no review record — there was nothing to
+    attribute to a human).
 
     `trigger` decides whether another round is offered, re-checked against
     each round's (possibly updated) `result` — defaults to
@@ -498,6 +516,7 @@ async def _run_hitl_for_track(
                 guard_logs,
                 dynamic_reached_sink,
                 gdb_transcript,
+                dynamic_extras,
             ) = await run_dynamic_track_only(
                 candidate,
                 dynamic_plan,
@@ -512,7 +531,7 @@ async def _run_hitl_for_track(
         review = build_human_review_record(
             track=track, decision=last_decision, rounds=max(round_number, 1)
         )
-    return result, dynamic_reached_sink, guard_logs, gdb_transcript, review
+    return result, dynamic_reached_sink, guard_logs, gdb_transcript, dynamic_extras or {}, review
 
 
 async def run_fvvw(
@@ -531,9 +550,12 @@ async def run_fvvw(
     Returns a plain dict with `target`, `plan`, `static_result`,
     `dynamic_result`, `agreement`, `mechanism_confidence`,
     `reachability_confidence`, `residual_unknowns`, `guard_logs`,
-    `dynamic_gdb_transcript`, `crosscheck_evidence`, `human_review` —
-    everything `fvvw.report.write_report` and the persisted `FVVWReport`
-    need.
+    `dynamic_gdb_transcript`, `crosscheck_evidence`, `human_review`,
+    `arbitration_log`, `observation`, `iteration_history`,
+    `emulation_mode` — everything `fvvw.report.write_report` and the
+    persisted `FVVWReport` need (the last four are the dynamic track's
+    Node 9 spec contents #3/#4/#6/#7, unpacked from `run_dynamic_track_
+    only`'s `dynamic_extras` bag).
 
     When `Settings.stage5_hitl_mode == "prompt"`, a track whose terminal
     result is tagged `budget_exhausted` (see `fvvw.hitl`'s trigger
@@ -592,7 +614,13 @@ async def run_fvvw(
     # ---- await_both_tracks: the hard barrier ----------------------------
     static_result = await static_task
     crosscheck_result = await crosscheck_task
-    dynamic_result, guard_logs, dynamic_reached_sink, gdb_transcript = await dynamic_task
+    (
+        dynamic_result,
+        guard_logs,
+        dynamic_reached_sink,
+        gdb_transcript,
+        dynamic_extras,
+    ) = await dynamic_task
 
     # ---- HITL: offer intervention on any track that exhausted its budget,
     # AFTER the barrier (both tracks' results are in hand) and BEFORE
@@ -603,6 +631,7 @@ async def run_fvvw(
         if is_budget_exhausted(static_result):
             (
                 static_result,
+                _,
                 _,
                 _,
                 _,
@@ -619,6 +648,7 @@ async def run_fvvw(
                 dynamic_reached_sink=dynamic_reached_sink,
                 guard_logs=guard_logs,
                 gdb_transcript=gdb_transcript,
+                dynamic_extras=dynamic_extras,
             )
             human_review = static_review or human_review
         if is_budget_exhausted(dynamic_result):
@@ -627,6 +657,7 @@ async def run_fvvw(
                 dynamic_reached_sink,
                 guard_logs,
                 gdb_transcript,
+                dynamic_extras,
                 dynamic_review,
             ) = await _run_hitl_for_track(
                 candidate=candidate,
@@ -640,6 +671,7 @@ async def run_fvvw(
                 dynamic_reached_sink=dynamic_reached_sink,
                 guard_logs=guard_logs,
                 gdb_transcript=gdb_transcript,
+                dynamic_extras=dynamic_extras,
             )
             # A candidate rarely needs BOTH tracks reviewed in one run; if it
             # does, the dynamic track's review record is what's persisted —
@@ -669,6 +701,7 @@ async def run_fvvw(
                 _,
                 _,
                 _,
+                _,
                 neither_review,
             ) = await _run_hitl_for_track(
                 candidate=candidate,
@@ -682,6 +715,7 @@ async def run_fvvw(
                 dynamic_reached_sink=dynamic_reached_sink,
                 guard_logs=guard_logs,
                 gdb_transcript=gdb_transcript,
+                dynamic_extras=dynamic_extras,
                 trigger=lambda r: neither_proved(r, dynamic_result_snapshot),
             )
             human_review = neither_review or human_review
@@ -709,6 +743,10 @@ async def run_fvvw(
         "crosscheck_evidence": crosscheck_result.to_evidence_dict(),
         "human_review": human_review,
         "deps": deps,
+        "arbitration_log": dynamic_extras.get("arbitration_log"),
+        "observation": dynamic_extras.get("observation"),
+        "iteration_history": dynamic_extras.get("iteration_history") or [],
+        "emulation_mode": dynamic_extras.get("emulation_mode", ""),
     }
 
 

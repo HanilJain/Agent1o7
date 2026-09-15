@@ -167,6 +167,13 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
         )
         if path is not None
     }
+    report_kwargs: dict = {}
+    arbitration_log = outcome.get("arbitration_log")
+    if arbitration_log is not None:
+        report_kwargs["arbitration_log"] = arbitration_log
+    observation = outcome.get("observation")
+    if observation is not None:
+        report_kwargs["observation"] = observation
     report = FVVWReport(
         global_id=candidate.global_id,
         bin_id=candidate.bin_id,
@@ -182,8 +189,11 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
         crosscheck_evidence=outcome["crosscheck_evidence"],
         command_log_paths=command_log_paths,
         human_review=outcome.get("human_review"),
+        emulation_mode=outcome.get("emulation_mode", ""),
+        iteration_history=outcome.get("iteration_history") or [],
         started_at=started_at,
         finished_at=datetime.now(UTC),
+        **report_kwargs,
     )
 
     fvvw_dir_ = layout.fvvw_dir(ctx.stage5_dir)

@@ -245,9 +245,7 @@ def build_gdb_batch_command(recipe_relpath: str, target_relpath: str) -> str:
     `SandboxExecutor.exec_in_session()` against the SAME running session
     container QEMU was started in — never `run()`, since the emulated
     process must stay alive between these calls."""
-    return (
-        f"{gdb_binary()} -batch -x {shlex.quote(recipe_relpath)} {shlex.quote(target_relpath)}"
-    )
+    return f"{gdb_binary()} -batch -x {shlex.quote(recipe_relpath)} {shlex.quote(target_relpath)}"
 
 
 def normalize_hex_addr(addr: str) -> str:
@@ -327,18 +325,130 @@ def render_trigger_breakpoint_commands(
     ]
 
 
+def build_qemu_strace_command(
+    *,
+    arch_spec: QemuArchSpec,
+    target_relpath: str,
+    argv: list[str] | None = None,
+    rootfs_relpath: str | None = None,
+    qemu_binary_in_chroot: str | None = None,
+) -> str:
+    """Assemble a ONE-SHOT (no `-g`/gdbstub, runs to completion or a short
+    timeout) `qemu-<arch> -strace` invocation — the Node 3 (Bring-Up &
+    Arbitration) agent's discovery tool, per the spec's "strace -f -e
+    trace=open,openat,stat,access,readlink" step. qemu-user-static ships
+    `-strace` as a built-in flag (no separate `strace` package needed in
+    the image — confirmed against `docker/Dockerfile.verification`), so
+    this reuses the exact chroot/env-fix/binary-selection logic
+    `build_qemu_user_launch_command` already established rather than
+    re-deriving it, just without the `-g <port>` flag (no debugger attaches
+    to a discovery run) and with `-strace` prepended to the QEMU flags.
+    Caller redirects stderr (where `-strace` writes) to a log file and
+    greps it for `ENOENT`/failed-open lines — see `dynamic_agents.
+    bringup_agent`'s discovery step."""
+    if rootfs_relpath and not qemu_binary_in_chroot:
+        raise ValueError(
+            "qemu_binary_in_chroot is required when rootfs_relpath is set — see "
+            "build_qemu_user_launch_command's identical requirement."
+        )
+    parts: list[str] = []
+    if rootfs_relpath:
+        parts += ["chroot", shlex.quote(rootfs_relpath)]
+    for key, value in arch_spec.cpu_probe_env.items():
+        parts.append(f"{key}={shlex.quote(value)}")
+    parts.append(shlex.quote(qemu_binary_in_chroot) if rootfs_relpath else arch_spec.user_binary)
+    parts.append("-strace")
+    if rootfs_relpath:
+        parts += ["-L", "/"]
+    parts.append(shlex.quote(target_relpath))
+    if argv:
+        parts += [shlex.quote(a) for a in argv]
+    return " ".join(parts)
+
+
+def render_memory_dump_command(*, address: str, length_bytes: int = 32) -> str:
+    """One GDB `x` command dumping `length_bytes` of hex from `address` —
+    the Node 5/7 substitute for a hardware watchpoint (QEMU user-mode
+    emulation does not support watchpoints; see this module's and
+    `dynamic_track`'s docstrings). Called twice per risky operation (before
+    and after) so the caller can diff the two dumps — `ObservationRecord.
+    memory_before`/`memory_after`/`memory_diff_detected`."""
+    return f"x/{length_bytes}xb {normalize_hex_addr(address)}"
+
+
+def render_crash_capture_commands() -> list[str]:
+    """GDB commands ensuring SIGSEGV/SIGABRT/SIGILL are caught and reported
+    rather than silently passed through to the target (spec Node 5: "make
+    sure GDB is set to stop and report on SIGSEGV, SIGABRT, and SIGILL"),
+    plus the register/backtrace/PC dump to capture at the moment of a stop
+    — issued once at the START of a recipe (before `continue`), so any
+    breakpoint OR crash encountered later in the same batch is caught by
+    the same handler."""
+    return [
+        "handle SIGSEGV stop print nopass",
+        "handle SIGABRT stop print nopass",
+        "handle SIGILL stop print nopass",
+    ]
+
+
+def render_crash_report_commands(*, marker: str) -> list[str]:
+    """The commands to run ONCE a crash/breakpoint stop has occurred —
+    prints the faulting PC, a full register dump, and a backtrace, each
+    tagged with `marker` so the caller can parse them back out of GDB's
+    combined stdout (same tagged-printf convention
+    `render_guard_breakpoint_commands`/`render_trigger_breakpoint_commands`
+    already use)."""
+    return [
+        f'printf "{marker}:PC:%p\\n", $pc',
+        f"echo {marker}:REGISTERS:\\n",
+        "info registers",
+        f"echo {marker}:BACKTRACE:\\n",
+        "bt",
+    ]
+
+
+def render_direct_call_recipe_body(
+    *,
+    target_function_addr: str,
+    call_expression: str,
+) -> list[str]:
+    """The Node 6 direct-call-harness recipe body (last-resort emulation
+    mode): break at the target function's own entry (so the process is
+    halted with a valid stack/registers to call FROM), then issue GDB's
+    `call` command with the crafted argument — bypassing whatever broken or
+    unreachable normal dispatch path made partial emulation insufficient.
+    `call_expression` is the full `fn(arg1, arg2, ...)` text the trigger
+    agent constructed; composition of the C-expression TEXT itself is the
+    agent's job (data), this function only wires it into the recipe shape
+    (mirrors `tools/joern_tool.py`'s "the LLM supplies script BODY, this
+    module supplies the command line" split). The caller (`fvvw.
+    dynamic_track`'s direct-call path) MUST clearly label any result from
+    this recipe as a direct invocation, not a realistic end-to-end
+    trigger — see `common.verification.FVVWReport.emulation_mode`."""
+    return [
+        f"break *{normalize_hex_addr(target_function_addr)}",
+        "continue",
+        f"call {call_expression}",
+    ]
+
+
 __all__ = [
     "CONTAINER_SCRATCH",
     "CONTAINER_WORKDIR",
     "QEMU_ARCH_TABLE",
     "QemuArchSpec",
     "build_gdb_batch_command",
+    "build_qemu_strace_command",
     "build_qemu_system_launch_command",
     "build_qemu_user_launch_command",
     "gdb_binary",
     "normalize_hex_addr",
+    "render_crash_capture_commands",
+    "render_crash_report_commands",
+    "render_direct_call_recipe_body",
     "render_gdb_recipe",
     "render_guard_breakpoint_commands",
+    "render_memory_dump_command",
     "render_trigger_breakpoint_commands",
     "resolve_qemu_arch_spec",
 ]

@@ -163,6 +163,40 @@ class AgentRole(str, Enum):
     section from the completed STM — professional narrative composition,
     genuinely open-ended. Overridable via `FWA_STAGE5_REPORT_MODEL`,
     falling back to `stage5_verifier_model`."""
+    STAGE5_BRINGUP_AGENT = "stage5_bringup_agent"
+    """The dynamic track's Node 3 (Bring-Up & Arbitration) role
+    (`stage5_verification.fvvw.dynamic_agents.bringup_agent`): given a
+    binary's `qemu -strace` output plus `readelf`/`strings`/`file`
+    inspection results, decides what dummy files/dirs/device nodes/env
+    overrides/LD_PRELOAD shims to create so the target stops bailing out on
+    a missing-environment error unrelated to the real hypothesis being
+    tested. Runs a bounded tool-calling loop (plain JSON action/observation,
+    not native `bind_tools` — same local-model-reliability discipline as
+    `STAGE5_STRATEGY_AGENT`) against the persistent session container.
+    Overridable via `FWA_STAGE5_BRINGUP_MODEL`, falling back to
+    `stage5_verifier_model`."""
+    STAGE5_TRIGGER_AGENT = "stage5_trigger_agent"
+    """The dynamic track's Node 6 (Trigger / PoC) role
+    (`stage5_verification.fvvw.dynamic_agents.trigger_agent`): crafts and
+    delivers the actual input that should drive execution to the sink —
+    an HTTP request, a CLI argv, an overlong buffer, a command-injection
+    sequence, a path-traversal sequence, or (as a last resort) a direct GDB
+    `call` invocation — from `DynamicPlan.trigger_shape`/`oracle`/
+    `preconditions`. Genuinely creative construction tailored to the
+    specific vulnerability class, per finding — not a fixed template.
+    Overridable via `FWA_STAGE5_TRIGGER_MODEL`, falling back to
+    `stage5_verifier_model`."""
+    STAGE5_DYNAMIC_EVALUATOR = "stage5_dynamic_evaluator"
+    """The dynamic track's Node 8 (Evaluator + Router) LLM role
+    (`stage5_verification.fvvw.dynamic_agents.route_observation`): runs
+    AFTER a deterministic oracle-string/signal match already checked the
+    round's `ObservationRecord` against `DynamicPlan.oracle` — this role is
+    invoked only when that literal match is inconclusive, to diagnose WHY
+    (wrong sink location? input never reached the code path? environment
+    fault vs. real bug signal?) and choose a `common.verification.
+    RouteDecision.route` per the spec's §10 decision table. Overridable via
+    `FWA_STAGE5_DYNAMIC_EVALUATOR_MODEL`, falling back to
+    `stage5_verifier_model`."""
     STAGE3B_CLAIM_EXTRACTOR = "stage3b_claim_extractor"
     """Stage 3b's only LLM role (`stage3b_claims.agent.converter`): given
     one claim-shaped block of PDF report TEXT (never the whole document —
@@ -226,6 +260,16 @@ ROLE_TO_TIER: dict[AgentRole, ModelTier] = {
     # override either independently.
     AgentRole.STAGE5_STRATEGY_AGENT: ModelTier.HIGH_REASONING,
     AgentRole.STAGE5_REPORT_WRITER: ModelTier.HIGH_REASONING,
+    # The dynamic track's three agentic-loop roles (bring-up/arbitration,
+    # trigger crafting, and the post-oracle-match router/diagnostician) get
+    # the same HIGH_REASONING default — each requires genuine reasoning
+    # over tool output (strace lines, ELF facts, crash signals), not
+    # template filling. `FWA_STAGE5_BRINGUP_MODEL`/`FWA_STAGE5_TRIGGER_MODEL`/
+    # `FWA_STAGE5_DYNAMIC_EVALUATOR_MODEL` (falling back to
+    # `FWA_STAGE5_VERIFIER_MODEL`) override any of the three independently.
+    AgentRole.STAGE5_BRINGUP_AGENT: ModelTier.HIGH_REASONING,
+    AgentRole.STAGE5_TRIGGER_AGENT: ModelTier.HIGH_REASONING,
+    AgentRole.STAGE5_DYNAMIC_EVALUATOR: ModelTier.HIGH_REASONING,
     # Stage 3b is deliberately the ONE exception to this table's
     # HIGH_REASONING-by-default pattern: it transcribes what a PDF report
     # already states into a narrow schema, not open-ended reasoning over
@@ -297,6 +341,12 @@ _ROLE_OVERRIDE_SETTINGS_FIELD: dict[AgentRole, tuple[str, ...]] = {
     AgentRole.STAGE5_RESULT_EVALUATOR: ("stage5_evaluator_model", "stage5_verifier_model"),
     AgentRole.STAGE5_STRATEGY_AGENT: ("stage5_strategy_model", "stage5_verifier_model"),
     AgentRole.STAGE5_REPORT_WRITER: ("stage5_report_model", "stage5_verifier_model"),
+    AgentRole.STAGE5_BRINGUP_AGENT: ("stage5_bringup_model", "stage5_verifier_model"),
+    AgentRole.STAGE5_TRIGGER_AGENT: ("stage5_trigger_model", "stage5_verifier_model"),
+    AgentRole.STAGE5_DYNAMIC_EVALUATOR: (
+        "stage5_dynamic_evaluator_model",
+        "stage5_verifier_model",
+    ),
     AgentRole.STAGE3B_CLAIM_EXTRACTOR: ("stage3b_extractor_model",),
 }
 

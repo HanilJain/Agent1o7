@@ -102,6 +102,80 @@ def test_run_subcommand_dynamic_max_iterations_flag_parses():
     assert args.dynamic_max_iterations == 8
 
 
+def test_run_subcommand_dynamic_wall_clock_defaults_to_none():
+    args = _parse_args(["run", "--db-subfolder", "x"])
+    assert args.dynamic_wall_clock is None
+
+
+def test_run_subcommand_dynamic_wall_clock_flag_parses():
+    args = _parse_args(["run", "--db-subfolder", "x", "--dynamic-wall-clock", "900"])
+    assert args.dynamic_wall_clock == 900
+
+
+def test_run_subcommand_benign_only_defaults_to_false():
+    args = _parse_args(["run", "--db-subfolder", "x"])
+    assert args.benign_only is False
+
+
+def test_run_subcommand_benign_only_flag_sets_true():
+    args = _parse_args(["run", "--db-subfolder", "x", "--benign-only"])
+    assert args.benign_only is True
+
+
+def test_cmd_run_dynamic_wall_clock_overrides_settings(monkeypatch, tmp_path):
+    """--dynamic-wall-clock must reach Settings.stage5_dynamic_wall_clock_seconds
+    for the actual run — bypassing the field's own ge=60 validator via
+    model_copy, same as every other --dynamic-*/--max-iterations override."""
+    from datetime import UTC, datetime
+
+    from fw_audit.common.verification import VerificationRunSummary
+    from fw_audit.stage5_verification import runner as runner_mod
+
+    captured_settings = {}
+
+    async def fake_run_fvvw_queue(*, db_subfolder, settings, only_global_ids, run_id, **kw):
+        captured_settings["settings"] = settings
+        return VerificationRunSummary(
+            status="completed", db_subfolder=str(db_subfolder), started_at=datetime.now(UTC)
+        )
+
+    monkeypatch.setattr(runner_mod, "run_fvvw_queue", fake_run_fvvw_queue)
+
+    args = runner_mod._parse_args(
+        ["run", "--db-subfolder", str(tmp_path), "--dynamic-wall-clock", "900"]
+    )
+    rc = runner_mod._cmd_run(args)
+
+    assert rc == 0
+    assert captured_settings["settings"].stage5_dynamic_wall_clock_seconds == 900
+
+
+def test_cmd_run_benign_only_flips_kill_switch(monkeypatch, tmp_path):
+    """--benign-only must flip Settings.stage5_allow_real_payloads to False
+    for the actual run — restoring the original benign-marker-only
+    invariant on request, without touching the default (True) posture."""
+    from datetime import UTC, datetime
+
+    from fw_audit.common.verification import VerificationRunSummary
+    from fw_audit.stage5_verification import runner as runner_mod
+
+    captured_settings = {}
+
+    async def fake_run_fvvw_queue(*, db_subfolder, settings, only_global_ids, run_id, **kw):
+        captured_settings["settings"] = settings
+        return VerificationRunSummary(
+            status="completed", db_subfolder=str(db_subfolder), started_at=datetime.now(UTC)
+        )
+
+    monkeypatch.setattr(runner_mod, "run_fvvw_queue", fake_run_fvvw_queue)
+
+    args = runner_mod._parse_args(["run", "--db-subfolder", str(tmp_path), "--benign-only"])
+    rc = runner_mod._cmd_run(args)
+
+    assert rc == 0
+    assert captured_settings["settings"].stage5_allow_real_payloads is False
+
+
 def test_run_subcommand_no_command_log_defaults_to_false():
     args = _parse_args(["run", "--db-subfolder", "x"])
     assert args.no_command_log is False

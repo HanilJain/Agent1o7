@@ -2,13 +2,26 @@
 
 Read this file first for Stage 5 work. Stage 5 verifies one Stage 3
 finding **two independent ways** — the original **Joern static track**
-(unchanged since v1) and a new **QEMU+GDB dynamic track** — under one
+(unchanged since v1) and a **QEMU+GDB dynamic track** — under one
 LLM-authored strategy plan, reconciled by a deterministic **joint
 evaluator** into a two-axis verdict (mechanism confidence × reachability
 confidence) plus an LLM-composed disclosure report. `fw-verify run` drives
 this fork-join **by default**; `--joern-only` routes to the original
 static-only pipeline, byte-for-byte unchanged. Root `CLAUDE.md` covers only
 cross-cutting concerns (Executor abstraction, LLM routing, Settings).
+
+**The dynamic track is a compiled 9-node agentic `StateGraph`** (spec
+Nodes 1-9; Node 1 is the shared `strategy_agent` upstream, Node 9 stays
+downstream in `joint_evaluate`/`write_report` — Nodes 2-8 are the compiled
+graph itself, `fvvw/dynamic_graph.py::build_dynamic_graph`). Bring-up
+(Node 3) and trigger crafting (Node 6) are **agentic tool-calling loops**
+(`fvvw/dynamic_agents.py`) driving the persistent QEMU+GDB session
+themselves via a bounded JSON-action ReAct cycle; Node 8 (Evaluator +
+Router) runs a deterministic oracle-match first pass, falling through to
+an LLM router only when that doesn't settle the round, and its
+`RouteDecision` drives REAL conditional loop-back edges (Node 4/5/6 → Node
+3) instead of the old in-function retry loops. See "The 9 nodes" section
+below for the full node table and the architecture rationale.
 
 ## Hard constraints — never violate
 
@@ -63,14 +76,20 @@ cross-cutting concerns (Executor abstraction, LLM routing, Settings).
   The strategy prompt (`fvvw/strategy.py`) requires the SAME positive-proof
   discipline for hypothesis B — it must name what would have to be observed
   to prove it (a specific sanitizer/guard/constant), never "the A-observable
-  wasn't seen". The dynamic track's `dynamic_evaluate()`
-  (`fvvw/dynamic_track.py`) applies the identical `>= required` multi-signal
-  corroboration bar to BOTH hypotheses now (previously B could fire off a
-  single absence signal) and no longer threads an `active_hypothesis`
-  switch through the rule engine — that mechanism never actually changed
-  what evidence was gathered, so it was removed rather than kept as a
-  parameter that looked like it did something it didn't; both hypotheses'
-  rules are evaluated identically every round. `fvvw/joint.py` gained
+  wasn't seen". The dynamic track's (pre-9-node-rewrite) `dynamic_evaluate()`
+  (`fvvw/dynamic_track.py` — UNUSED by `dynamic_graph.py`'s Node 8, see
+  "The 9 nodes" above; kept only for any code still calling it directly)
+  applied the identical `>= required` multi-signal corroboration bar to
+  BOTH hypotheses (previously B could fire off a single absence signal)
+  and no longer threaded an `active_hypothesis` switch through the rule
+  engine — that mechanism never actually changed what evidence was
+  gathered, so it was removed rather than kept as a parameter that looked
+  like it did something it didn't; both hypotheses' rules were evaluated
+  identically every round. Node 8's CURRENT equivalent discipline lives in
+  `dynamic_graph._build_track_result`'s `_TERMINAL_ROUTES` mapping (route
+  → verdict + `proved_hypothesis`) and `dynamic_track.match_oracle`'s
+  deterministic-first-pass gate — same positive-proof spirit, different
+  mechanism. `fvvw/joint.py` gained
   `Agreement.NEITHER` (both tracks non-definite — distinct from
   `ONE_SIDED`, which requires exactly one definite verdict) and a
   `collect_residual_unknowns` defense-in-depth caveat for any REFUTED
@@ -84,12 +103,27 @@ cross-cutting concerns (Executor abstraction, LLM routing, Settings).
   `tools/qemu_gdb_tool.py` — the strategy LLM supplies only `DynamicPlan`
   DATA (addresses, guard names/forced values, the payload marker), never a
   shell command line.
-- **Benign-marker-only, hard-enforced.** `fvvw.dynamic_track.
-  validate_benign_marker()` rejects any `payload_marker` that isn't a
-  scoped `touch`/`echo`/`mkdir -p` side effect — checked BEFORE
-  `instrument_trigger` issues any command. Never weaken this validator to
-  accommodate a "more realistic" payload; the dynamic track produces
-  verification infrastructure, never an exploit.
+- **Containment is structural, not content-based — the safety boundary
+  the dynamic track actually enforces.** `Settings.
+  stage5_allow_real_payloads` (default `True`) governs which validator
+  `instrument_trigger`/the Node 6 trigger agent runs on a proposed
+  payload: `True` (default) — the trigger agent may craft and deliver the
+  ACTUAL malicious input a hypothesis calls for (overlong buffers,
+  command-injection sequences, path-traversal sequences), checked by
+  `validate_real_payload`, which HARD-blocks only weaponized content
+  (reverse shells, exfiltration, destructive host commands — see
+  `dynamic_track.py`'s deny-list), not "realistic" content in general.
+  `False` (`--benign-only` / `FWA_STAGE5_ALLOW_REAL_PAYLOADS=false`)
+  restores the ORIGINAL v1 invariant — `validate_benign_marker()` rejects
+  any `payload_marker` that isn't a scoped `touch`/`echo`/`mkdir -p` side
+  effect. Either way, containment comes from the SANDBOX, not the payload
+  content: every dynamic-track run happens inside a disposable,
+  `stage5_sandbox_*`-resource-capped, `--network=none` (unless
+  `stage5_allow_network_grant`) container — see `docker/Dockerfile.
+  verification`. Never weaken `validate_real_payload`'s deny-list or
+  `validate_benign_marker` to accommodate a payload that needs MORE than
+  what's already allowed; widen the sandbox's containment instead if a
+  legitimate test needs it.
 - `SandboxExecutor.run()` (Joern's one-shot call) is **not modified** by
   the dynamic track's session capability (`start()`/`exec_in_session()`/
   `stop()`, added alongside it) — see `executors/sandbox_executor.py`'s
@@ -108,8 +142,62 @@ cross-cutting concerns (Executor abstraction, LLM routing, Settings).
   reason; don't relax that.
 - **An operator-injected raw GDB recipe (HITL's "inject" action) gets its
   OWN gate**, `dynamic_track.validate_injected_recipe()` — never
-  `validate_benign_marker` (which only understands a bare marker string).
-  Never weaken it to accommodate a "more capable" recipe.
+  `validate_benign_marker`/`validate_real_payload` (which only understand
+  payload TEXT, not a full recipe). The GDB-escape-hatch check inside it
+  (`shell`/`!`/`pipe`/`python`/`define`/`source`/`dump` — host-execution
+  prevention, a container-INTEGRITY concern) is enforced UNCONDITIONALLY,
+  regardless of `stage5_allow_real_payloads`. Never weaken it to
+  accommodate a "more capable" recipe.
+- **The dynamic graph's node bodies never write graph state with a live
+  object** (a `SessionHandle`, a `BaseChatModel`) — only DATA
+  (`TrackResult`, `ArbitrationLog`, `ObservationRecord`, `RouteDecision`,
+  strings, dicts). Every node closure captures the SAME long-lived
+  `BringupContext` (built once per `build_dynamic_graph()` call) to carry
+  the mutable session/launch state instead — a loop-back edge re-enters a
+  node, which mutates that shared `ctx`, so `ctx.handle` never round-trips
+  through `FVVWState` as a value. See `fvvw/dynamic_graph.py`'s module
+  docstring.
+- **Node 8's terminal routes (`confirmed`/`refuted`/`inconclusive`) are the
+  ONLY place a `TrackResult` gets constructed for the dynamic track** —
+  `dynamic_graph._build_track_result()`, fed by `_TERMINAL_ROUTES`. A
+  `RouteDecision` itself carries no verdict, only a routing instruction —
+  never read `decision.route` as a stand-in for a `VerificationVerdict`
+  anywhere else.
+- **`Settings.stage5_dynamic_wall_clock_seconds` bounds the WHOLE dynamic
+  graph invocation's real elapsed time**, independent of
+  `stage5_dynamic_max_iterations`' round count — enforced via
+  `asyncio.wait_for` around `compiled.ainvoke(...)` in
+  `fvvw.graph.run_dynamic_track_only`, not inside the graph itself (no
+  partial `FVVWState` survives a timeout — a fixed INCONCLUSIVE/
+  `budget_exhausted` `TrackResult` is synthesized instead). Never remove
+  this wrapper; a stuck agentic loop (bring-up or trigger) must still
+  terminate the candidate rather than hang the whole worker pool.
+
+## The 9 nodes (dynamic track)
+
+| # | Node | Type | Function(s) |
+|---|---|---|---|
+| 1 | Hypothesis + Oracle | LLM | `fvvw.strategy.strategy_agent` — shared with the static track; emits `Hypotheses.oracle`/`.disconfirm_condition` + `DynamicPlan.oracle`/`.disconfirm_condition` alongside the existing `decisive_observable` triple. `validate_decisive_observable` requires all of them non-empty. |
+| 2 | Plan Emulation | Deterministic | `dynamic_track.plan_emulation` — `emulation_mode` incl. `direct_call` (the Node 8 router's `escalate_direct_call` route forces it via `plan_emulation_escalate_node`). |
+| 3 | Bring-Up & Arbitration | **LLM agent + tools** | `dynamic_agents.bringup_agent` (a bounded JSON-action loop: `run_strace_discovery`/`inspect_binary`/`create_dummy_file`/`create_dummy_dir`/`create_device_node`/`force_env_var`/`relaunch_and_check`/`done`) driving `ctx.session_executor.exec_in_session` directly, THEN the deterministic `dynamic_track.bringup_stabilize`/`_launch_qemu_and_wait` underneath it. `dynamic_graph._run_bringup` retries a bare `DynamicFault` from `bringup_stabilize` itself in a bounded loop (bounded by `bringup_stabilize`'s own `repair_count` check) — this must never escape uncaught (see "Fixed bugs" below). |
+| 4 | Health Gate | Deterministic | `dynamic_track.health_gate`/`HealthGateFailure` — `pgrep` liveness + a SECOND `/proc/net/tcp` gdbstub-rebind probe (distinct from `_launch_qemu_and_wait`'s own readiness probe). Failure routes back to Node 3 via `route_after_bringup`/`route_after_health_gate`. |
+| 5 | GDB Attach & Instrument | Deterministic | `dynamic_track.reach_target` (reused). Stripped-symbol → address agent fallback is NOT implemented in this revision (`reach_target` already resolves its entry address from `Settings`-independent facts supplied upstream) — flagged in `dynamic_graph.py`'s module docstring as a future extension point, not silently omitted. |
+| 6 | Trigger / PoC | **LLM agent** | `dynamic_agents.trigger_agent` (`craft_payload`/`apply_precondition`/`deliver_via_argv`/`deliver_via_network`/`deliver_via_direct_call`/`observe_result`/`done`) when `stage5_allow_real_payloads`, else the deterministic `instrument_trigger` (benign-marker) path — both live in `dynamic_graph._run_trigger`. Every crafted payload is validated (`validate_real_payload`/`validate_benign_marker`) BEFORE delivery; a rejection is reported back to the LLM as feedback, not silently downgraded. |
+| 7 | Run & Observe | Deterministic | `dynamic_track.collect_observation` (benign path) or `TriggerAgentResult.observation` (agentic path — the trigger agent calls `collect_observation` itself as part of `observe_result`) → `common.verification.ObservationRecord` (signal/faulting_pc/registers/memory diff/stdout/stderr/filesystem_artifacts). |
+| 8 | Evaluator + Router | **Deterministic first pass + LLM** | `dynamic_graph._run_evaluate_route`: `dynamic_track.match_oracle` (deterministic oracle-string match) first: HIT → `confirmed` with no LLM call. Else a hard `dynamic_iteration >= stage5_dynamic_max_iterations` cutoff → `inconclusive`, ALSO with no LLM call (never trust the router alone to stop looping). Else `dynamic_agents.route_observation` (the LLM router) diagnoses and picks one of the spec's seven routes. `_build_track_result` converts a terminal route into the actual `TrackResult`. |
+| 9 | Report | Deterministic assembly | Outside this graph — `fvvw.graph.run_fvvw` assembles `common.verification.FVVWReport` (`arbitration_log`/`observation`/`iteration_history`/`emulation_mode` — Node 9's required contents #3/#4/#6/#7) from `run_dynamic_track_only`'s `dynamic_extras` bag; `fvvw.report.write_report` composes the disclosure Markdown, unchanged. |
+
+`fvvw/dynamic_graph.py::build_dynamic_graph` compiles Nodes 2-8 into one
+`StateGraph(FVVWState)` per candidate (closure-based factory, mirroring
+`agent.graph.build_verifier_graph`'s shape). `fvvw.graph.
+run_dynamic_track_only` is the thin wrapper: builds `BringupContext` +
+`DynamicGraphDeps`, compiles, `ainvoke`s (wrapped in the wall-clock
+`asyncio.wait_for`), unpacks the terminal `FVVWState` into the same
+`(TrackResult, guard_logs, dynamic_reached_sink, gdb_transcript,
+dynamic_extras)` 5-tuple every caller (`fvvw.graph.run_fvvw`'s fork,
+HITL's dynamic-track retry, `fvvw.debug.debug_dynamic`) already expects —
+the fork-join, `joint_evaluate`, HITL, and both drivers are otherwise
+UNTOUCHED by the rewrite.
 
 ## Files
 
@@ -144,13 +232,16 @@ tool-calling — both are plain text in/text out, for local-model reliability.
 | `fvvw/strategy.py` | `strategy_agent()` — one LLM pass producing `StrategyPlan` (threat model, hypothesis A/B pair, `StaticPlan`, `DynamicPlan`) as plain-text JSON, parsed via the EXISTING `agent.cleaning.clean_json_payload`. `validate_decisive_observable()` is the deterministic post-check. |
 | `fvvw/static_track.py` | `run_static_track()` — renders a strategy-enriched brief (`render_static_brief`, layered on top of the existing `agent.prompts.render_finding_brief`) and invokes `build_verifier_graph()` **unmodified**; maps the terminal state into a `TrackResult`. |
 | `tools/crosscheck_tool.py` | `static_crosscheck()` — disassembles the REAL ELF (`objdump -d -C`) and confirms/refutes `StaticPlan.expected_intermediate_calls`/`.sanitizer_patterns` against it — an independent signal from the decompiled-C-based Joern track. |
-| `tools/qemu_gdb_tool.py` | Owns every `qemu-*`/`gdb-multiarch` command: the full arch table (`QEMU_ARCH_TABLE` — arm/armeb/aarch64/mips/mipsel/mips64/mips64el/ppc/ppc64, user+system binaries, per-arch argument registers, CPU-probe env fixes), launch-command assembly, the GDB batch-recipe renderer. |
-| `fvvw/dynamic_track.py` | The seven dynamic-track functions: `plan_emulation`, `bringup_stabilize`/`BringupContext`/`BringupExhausted` (session stand-up + repair), `reach_target`/`satisfy_guards`/`instrument_trigger`/`collect_signals` (drive the GDB session via `exec_in_session`), `dynamic_evaluate` (the hypothesis A/B rule engine). `validate_benign_marker`/`BenignMarkerViolation` — the hard safety invariant. |
+| `tools/qemu_gdb_tool.py` | Owns every `qemu-*`/`gdb-multiarch` command: the full arch table (`QEMU_ARCH_TABLE` — arm/armeb/aarch64/mips/mipsel/mips64/mips64el/ppc/ppc64, user+system binaries, per-arch argument registers, CPU-probe env fixes), launch-command assembly, the GDB batch-recipe renderer, plus the 9-node rewrite's new builders: `build_qemu_strace_command` (Node 3's `-strace` discovery), memory-dump (`x/32xb` before/after) and crash-capture (`handle SIGSEGV/SIGABRT/SIGILL stop`, `info registers`, `bt`, `$pc`) recipe bodies, `render_direct_call_recipe_body` (the `direct_call` emulation-mode harness). |
+| `fvvw/dynamic_track.py` | The dynamic track's reusable node bodies/helpers, now consumed by `fvvw/dynamic_graph.py` rather than called in a hand-written sequence: `plan_emulation` (Node 2, incl. `direct_call`), `bringup_stabilize`/`BringupContext`/`BringupExhausted`/`_launch_qemu_and_wait` (Node 3's deterministic underlayer), `health_gate`/`HealthGateFailure` (Node 4), `reach_target` (Node 5), `satisfy_guards`/`instrument_trigger` (Node 6's benign-marker path), `collect_observation`/`collect_signals` (Node 7), `match_oracle` (Node 8's deterministic first pass). `validate_benign_marker`/`BenignMarkerViolation` (the benign-only posture) and `validate_real_payload`/`PayloadContainmentViolation` (the default real-payload posture, deny-list-only) — both gated by `Settings.stage5_allow_real_payloads`. `validate_injected_recipe` — HITL-inject's own, unconditional GDB-escape-hatch gate. `direct_call_trigger` — the GDB `call` harness (spec's explicit last resort). The pre-rewrite `dynamic_evaluate()` rule engine is UNUSED by the graph (kept only for any code still calling it directly) — Node 8's verdict now comes from `dynamic_graph._build_track_result`. |
+| `fvvw/dynamic_agents.py` | The three agentic tool-calling loops: `bringup_agent` (Node 3), `trigger_agent` (Node 6), `route_observation` (Node 8's LLM router, called only when the deterministic first pass doesn't settle a round). Each is a bounded JSON-action ReAct loop (`_parse_action` via the SAME `agent.cleaning.clean_json_payload` discipline) whose dispatcher `await`s `ctx.session_executor.exec_in_session` directly — the "QEMU/GDB session driven async by the agents that need it" requirement. Command composition still lives entirely in `tools/qemu_gdb_tool.py`; these loops only call into it and into `dynamic_track.py`'s node functions. |
+| `fvvw/dynamic_prompts.py` | System prompts + the JSON action/observation contract for all four dynamic-track LLM roles (bring-up, trigger, router) — mirrors `fvvw/strategy.py`'s prompt+render shape. `render_bringup_brief`/`render_trigger_brief`/`render_router_brief`. |
+| `fvvw/dynamic_graph.py` | `build_dynamic_graph()` — the compiled `StateGraph(FVVWState)` for Nodes 2-8 (see "The 9 nodes" above for the full mapping). `DynamicGraphDeps` (the three new LLMs + session executor, narrower than `fvvw.graph.FVVWDeps`). `route_after_bringup`/`_health_gate`/`_gdb_attach`/`_trigger`/`_evaluate` — the pure conditional-edge functions implementing the spec's §10 decision table. `_build_track_result`/`_TERMINAL_ROUTES` — the ONLY place a dynamic-track `TrackResult` is constructed. |
 | `fvvw/joint.py` | `joint_evaluate()` — the only function reading both `TrackResult`s. `classify_agreement`/`classify_mechanism_confidence`/`classify_reachability_confidence`/`collect_residual_unknowns`. |
-| `fvvw/graph.py` | `run_fvvw()` — the actual fork-join: `characterize → strategy → fork(static_track, static_crosscheck, run_dynamic_track_only running concurrently) → await both → joint_evaluate`. `resolve_checkpointer()`, `FVVWDeps`/`resolve_fvvw_deps()`. |
+| `fvvw/graph.py` | `run_fvvw()` — the actual fork-join: `characterize → strategy → fork(static_track, static_crosscheck, run_dynamic_track_only running concurrently) → await both → joint_evaluate`. `resolve_checkpointer()`, `FVVWDeps`/`resolve_fvvw_deps()` (now resolves SEVEN LLM roles — the original four plus `bringup_llm`/`trigger_llm`/`dynamic_evaluator_llm`). `run_dynamic_track_only()` — compiles + `ainvoke`s `dynamic_graph.build_dynamic_graph()` under a `stage5_dynamic_wall_clock_seconds` timeout, unpacking the terminal `FVVWState` into the `(TrackResult, guard_logs, dynamic_reached_sink, gdb_transcript, dynamic_extras)` tuple every caller expects. |
 | `fvvw/report.py` | `write_report()` — one LLM call composing the seven-layer disclosure document + reconciliation section, with every raw tool output (Joern attempts, GDB transcript) quoted verbatim. |
 | `fvvw/driver.py` | `run_fvvw_queue()` — a SEPARATE worker-pool queue (not an extension of `driver.py`) persisting `FVVWReport` JSON + disclosure Markdown to `stage5/fvvw/reports/`. |
-| `fvvw/debug.py` | `debug_strategy` (strategy only), `debug_dynamic` (dynamic track ONLY — the per-track debug path), `debug_fvvw` (full fork-join, dry run). |
+| `fvvw/debug.py` | `debug_strategy` (strategy only), `debug_dynamic` (dynamic track ONLY — the per-track debug path; `DebugDynamicResult` now also surfaces `arbitration_log`/`observation`/`iteration_history` for inspection, never persisted), `debug_fvvw` (full fork-join, dry run). |
 | `tools/verification_sandbox.py` | `verification_executor()`/`verification_session_executor()` — resolve an `Executor`/session-capable `SandboxExecutor` pointed at `stage5_verification_image` (a SEPARATE image from Joern's). |
 | `cmdlog.py` | `CommandLog` — per-track, append-only JSONL of every command either track executes plus its full result, written to `stage5/fvvw/logs/<gid>.<static\|dynamic>.jsonl`. `LoggingSessionExecutor` wraps the dynamic session executor by COMPOSITION; `JsonlRecordingList` intercepts the static track's `cpg_build_holder`/`attempts` lists with zero edits to `agent/graph.py`. Always on by default (`Settings.stage5_command_log`), unlike LangSmith — the point is a diagnosable run with no `--trace`. |
 | `fvvw/hitl.py` | Human-in-the-loop: `HitlAction`/`HitlDecision`/`HitlRequest`, `Prompter` (an injectable callable — `terminal_prompter` for real use, a scripted fake in tests), `is_budget_exhausted()` (the trigger — reads the `evidence["budget_exhausted"]` fact tagged by the producing track), `force_verdict_result()`, `build_human_review_record()`. Hooked into `fvvw.graph.run_fvvw` AFTER the fork-join barrier, never inside a track. |
@@ -179,6 +270,10 @@ fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report
 # own budget without a decisive verdict; forces stage5_workers=1
 fw-verify run --db-subfolder data/db/<stem> --hitl=prompt \
     --max-iterations 10 --dynamic-max-iterations 8 --no-command-log
+
+# Dynamic-track containment/budget overrides
+fw-verify run --db-subfolder data/db/<stem> --benign-only              # restore the v1 benign-marker-only invariant
+fw-verify run --db-subfolder data/db/<stem> --dynamic-wall-clock 900   # override stage5_dynamic_wall_clock_seconds (min 60)
 
 # --claims: verify Stage 3b's externally-sourced PDF report claims instead
 # of Stage 3's own findings — reads stage3b/findings/ instead of
@@ -222,11 +317,26 @@ ordinary, unattended run.
   (`run_type="tool"` spans: `stage5.build_cpg`, `stage5.run_joern_script`,
   `stage5.characterize_target`, `stage5.static_crosscheck`,
   `stage5.bringup_stabilize`, `stage5.reach_target`, `stage5.satisfy_guards`,
-  `stage5.instrument_trigger`, `stage5.collect_signals`), plus
-  `run_config()`-tagged LLM runs (`stage5.strategy_agent`,
-  `stage5.generate_script`, `stage5.evaluate`, `stage5.fvvw.write_report`).
-  Root run: `stage5.fvvw.candidate` (fork-join) or `stage5.candidate`
-  (`--joern-only`). See root `CLAUDE.md`'s Observability section.
+  `stage5.instrument_trigger`, `stage5.collect_signals`, `stage5.health_gate`),
+  plus `run_config()`-tagged LLM runs: `stage5.strategy_agent`,
+  `stage5.generate_script`, `stage5.evaluate`, `stage5.fvvw.write_report`,
+  and the 9-node rewrite's three new agentic roles —
+  `stage5.bringup_agent` (Node 3), `stage5.trigger_agent` (Node 6),
+  `stage5.dynamic_evaluate` (Node 8's LLM router, `route_observation` —
+  note this run_name is SHARED with the pre-rewrite `dynamic_evaluate`
+  rule engine's conceptual role, but is now the LLM call, not a
+  deterministic function). `run_dynamic_track_only`'s own `ainvoke` is
+  tagged `stage5.dynamic_track`; the dynamic graph's individual nodes are
+  auto-traced by LangGraph's native instrumentation under it with no
+  manual span needed (`bringup`/`health_gate`/`gdb_attach`/`trigger`/
+  `evaluate_route`/`plan_emulation`/`plan_emulation_escalate` node names).
+  `cmdlog`'s `aphase()` tags (same names as the graph nodes, plus
+  `bringup_agent`/`trigger_agent` for the two agentic loops specifically)
+  are a SEPARATE mechanism — the `node` field in `fvvw/logs/<gid>.
+  dynamic.jsonl`, not a LangSmith span; both exist independently (see
+  Command Log below). Root run: `stage5.fvvw.candidate` (fork-join) or
+  `stage5.candidate` (`--joern-only`). See root `CLAUDE.md`'s Observability
+  section.
 - `docker build -f docker/Dockerfile.joern -t fw-audit-joern:latest .` —
   the static track's image, unchanged.
 - `docker build -f docker/Dockerfile.verification -t
@@ -245,17 +355,30 @@ ordinary, unattended run.
   finding's `evidence_span.function_id` doesn't resolve against the real
   binary's `DecompiledBinary.functions` table — the claim itself is wrong,
   not a tooling failure.
-- `BenignMarkerViolation` from `instrument_trigger`/`dynamic_evaluate` →
-  the strategy agent produced a `payload_marker` that failed the benign-only
-  check — this is a hard stop, never worked around by loosening the
-  validator; investigate why the strategy prompt produced it.
+- `BenignMarkerViolation` (only reachable with `--benign-only`/
+  `stage5_allow_real_payloads=False`) → the trigger agent/strategy plan
+  produced a `payload_marker` that failed the benign-only check — a hard
+  stop, never worked around by loosening the validator.
+  `PayloadContainmentViolation` (the DEFAULT real-payload posture) → the
+  Node 6 trigger agent proposed weaponized content (reverse shell,
+  exfiltration, destructive host command) that matched `validate_real_
+  payload`'s deny-list — the agent sees this as a rejection and gets a
+  chance to propose a different payload within its own step budget; it is
+  NOT necessarily a hard stop for the candidate the way `BenignMarkerViolation`
+  is. `dynamic_track.validate_injected_recipe`'s GDB-escape-hatch check
+  (HITL's "inject" action only) is a separate, ALWAYS-enforced gate — see
+  the hard constraints section above.
 - `SandboxUnavailableError` → Docker unreachable, or a candidate's `bin_id`
   never resolved a `normalized_joern_c` path.
 - `VerifierModelUnavailableError` → no usable credential for one of the
-  FOUR Stage 5 roles now (`STAGE5_SCRIPT_GENERATOR`, `STAGE5_RESULT_EVALUATOR`,
-  `STAGE5_STRATEGY_AGENT`, `STAGE5_REPORT_WRITER`); set `ANTHROPIC_API_KEY`
-  or `FWA_STAGE5_VERIFIER_MODEL=ollama:qwen3:32b` (the shared fallback
-  covers all four unless overridden individually).
+  SEVEN Stage 5 roles now (`STAGE5_SCRIPT_GENERATOR`, `STAGE5_RESULT_EVALUATOR`,
+  `STAGE5_STRATEGY_AGENT`, `STAGE5_REPORT_WRITER`, plus the dynamic
+  track's `STAGE5_BRINGUP_AGENT`, `STAGE5_TRIGGER_AGENT`,
+  `STAGE5_DYNAMIC_EVALUATOR`); set `ANTHROPIC_API_KEY` or
+  `FWA_STAGE5_VERIFIER_MODEL=ollama:qwen3:32b` (the shared fallback covers
+  all seven unless overridden individually via each role's own
+  `FWA_STAGE5_BRINGUP_MODEL`/`FWA_STAGE5_TRIGGER_MODEL`/
+  `FWA_STAGE5_DYNAMIC_EVALUATOR_MODEL`).
 - `Status: no_targets` with 0 candidates → check each finding's `decision`
   field (`grep -o '"decision": *"[A-Z_]*"' stage3/findings/*.json`); only
   `ESCALATE` is verified by default — pass `--decisions` to widen it.
@@ -335,6 +458,33 @@ ordinary, unattended run.
   reach/guards/trigger) used to escape `run_dynamic_track_only` uncaught —
   it's now retried like every other dynamic-track fault. All four were
   plausible root causes of "always inconclusive" on real firmware.
+- **9-node rewrite regression, same bug class as the one above:** when
+  `dynamic_track.bringup_stabilize`/`_launch_qemu_and_wait`'s own bare
+  `DynamicFault` (a staging failure, or its readiness-probe timeout) was
+  first ported into `dynamic_graph._run_bringup`, it was left uncaught —
+  the agentic `bringup_agent` call was wrapped in a `try/except
+  DynamicFault`, but the SUBSEQUENT `bringup_stabilize` call underneath it
+  was not, so the same fault class escaped the graph node entirely and
+  crashed the whole `ainvoke`. Fixed the same way as the original bug: a
+  bounded retry loop around `bringup_stabilize` inside `_run_bringup`,
+  bounded by `bringup_stabilize`'s own `repair_count` check (raises
+  `BringupExhausted`, which IS caught). Regression test:
+  `tests/test_fvvw_graph.py::test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself`
+  (reused unchanged from the pre-rewrite suite — it caught this on the
+  first run against the rewritten graph).
+- **The new graph's terminal routes originally never constructed a
+  `TrackResult` at all** — `RouteDecision` (Node 8's own output) carries
+  only a routing instruction (`route`/`diagnosis`/`confidence`), never a
+  verdict. `dynamic_graph._build_track_result`/`_TERMINAL_ROUTES` is what
+  closes that gap, called from `_run_evaluate_route` whenever the decision
+  is `confirmed`/`refuted`/`inconclusive`. Similarly, `bringup ->
+  health_gate` was originally an UNCONDITIONAL edge — once bring-up
+  exhausted its OWN repair budget (`_bringup_exhausted=True`, with a
+  terminal `dynamic_result` already set), the graph still proceeded into
+  `health_gate` anyway, which fails against a session that never started
+  and loops back to `bringup`, repeatedly overwriting the already-terminal
+  result rather than ending immediately — `route_after_bringup` makes this
+  a conditional edge (`__end__` when exhausted) instead.
 
 ## Adding a feature here
 
@@ -342,14 +492,40 @@ ordinary, unattended run.
   `agent/graph.py` — and per the hard constraint above, don't touch
   `agent/graph.py`/`agent/prompts.py` for FVVW work at all.
 - New DYNAMIC-track command composition goes in `tools/qemu_gdb_tool.py`,
-  never inline in `fvvw/dynamic_track.py`'s node functions.
+  never inline in `fvvw/dynamic_track.py`'s node functions or
+  `fvvw/dynamic_agents.py`'s tool dispatchers.
 - New report fields go in `common/verification.py` (not `common/findings.py`
   or `common/taint.py`).
 - A new repair case for `bringup_stabilize` goes in
   `fvvw/dynamic_track.py`'s `bringup_stabilize()`/`BringupContext` — write
   the fix to `ctx.applied_fixes` so a retry within the same run reuses it.
+  A new AGENTIC bring-up tool (something the LLM can choose to do, not a
+  fixed deterministic repair) goes in `fvvw/dynamic_agents.py`'s
+  `_dispatch_bringup_tool` instead, plus a description of it in
+  `fvvw/dynamic_prompts.py`'s `BRINGUP_AGENT_SYSTEM_PROMPT` so the LLM
+  actually knows the tool exists.
 - A new arch for the dynamic track is one `QEMU_ARCH_TABLE` entry in
   `tools/qemu_gdb_tool.py`, not a new `if`/`elif` branch anywhere.
+- A new Node 8 route (beyond the spec's existing seven) needs: a new
+  `Literal` value on `common.verification.RouteDecision.route`, a new
+  entry in `dynamic_graph._TERMINAL_ROUTES` if it's a terminal
+  disposition (with the `(VerificationVerdict, proved_hypothesis)` pair
+  `_build_track_result` should stamp) or a new `_ROUTE_TO_NODE`/
+  conditional-edge mapping if it's a repair route, and a description of
+  when to choose it in `dynamic_prompts.py`'s `DYNAMIC_ROUTER_SYSTEM_PROMPT`.
+  Never let a new route bypass the hard iteration-budget cutoff in
+  `_run_evaluate_route` (checked BEFORE the LLM router is even called).
+- A new agentic loop (a fourth `dynamic_agents.py`-shaped role, beyond
+  bring-up/trigger/router) needs: an `AgentRole` in `config/llm_config.py`
+  (`ROLE_TO_TIER` + `_ROLE_OVERRIDE_SETTINGS_FIELD`), a `Settings` model
+  override field, resolution in `fvvw.graph.resolve_fvvw_deps` and a new
+  field on `DynamicGraphDeps`, a system prompt in `dynamic_prompts.py`, and
+  a bounded JSON-action loop in `dynamic_agents.py` following `bringup_
+  agent`/`trigger_agent`'s exact shape (`_parse_action`, a step budget, a
+  dispatcher that `await`s `ctx.session_executor.exec_in_session`, every
+  `.ainvoke` call passing `config=run_config(run_name="stage5.<role>", ...)`).
+  Document its new LangSmith span/spec-node mapping in "The 9 nodes" table
+  above.
 - A new dynamic-track command that should be logged needs no explicit
   `cmdlog` call at the site that issues it — `LoggingSessionExecutor`
   (wrapping `deps.dynamic_session_executor`) captures every

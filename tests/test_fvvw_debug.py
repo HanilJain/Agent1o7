@@ -49,11 +49,58 @@ class _ScriptedLLM:
         return AIMessage(content=self._responses.pop(0))
 
 
+class _CyclingScriptedLLM:
+    """Like `_ScriptedLLM` but wraps around instead of raising once
+    exhausted — used for the dynamic track's agentic roles (bringup/
+    trigger/router), which this module's tests don't assert exact call
+    counts for. See `tests/test_fvvw_graph.py`'s identical helper for the
+    full rationale."""
+
+    def __init__(self, responses: list) -> None:
+        self._responses = list(responses)
+        self.calls: list = []
+
+    async def ainvoke(self, messages, config=None):
+        self.calls.append(messages)
+        item = self._responses[(len(self.calls) - 1) % len(self._responses)]
+        return AIMessage(content=item)
+
+
+def _bringup_done_json() -> str:
+    return json.dumps(
+        {"tool": "done", "args": {"launch_recipe_ready": True, "summary": "session looks ready"}}
+    )
+
+
+def _trigger_craft_observe_done_jsons() -> list:
+    return [
+        json.dumps({"tool": "craft_payload", "args": {"payload": ";touch /tmp/claim_001_proof;"}}),
+        json.dumps({"tool": "observe_result", "args": {}}),
+        json.dumps({"tool": "done", "args": {"summary": "delivered and observed"}}),
+    ] * 4
+
+
+def _router_inconclusive_json() -> str:
+    return json.dumps(
+        {"route": "inconclusive", "diagnosis": "router fallback", "confidence": "LOW"}
+    )
+
+
 class _FakeSessionExecutor:
     async def start(self, *, image=None, files=None, network=None):
         return SessionHandle(container_name="fake-session", workspace_dir=files)
 
     async def exec_in_session(self, handle, command, *, timeout=None):
+        if "pgrep" in command:
+            # health_gate's (Node 4) liveness check.
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            # health_gate's (Node 4) gdbstub-rebind check.
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
         return ExecutionResult(command=command, returncode=0, stdout="", stderr="", timed_out=False)
 
     async def stop(self, handle):
@@ -131,11 +178,22 @@ def _write_stage2_summary(db_subfolder: Path, bin_id: str, *, rootfs: Path) -> N
     source_path.write_text("int main(){return 0;}\n", encoding="utf-8")
 
 
-def _strategy_plan_json(observable: str = "obs") -> str:
+def _strategy_plan_json(
+    observable: str = "obs",
+    *,
+    oracle: str = "a file is written to /tmp/claim_001_proof containing OVERFLOW_CONFIRMED",
+    disconfirm_condition: str = "the path is provably unreachable from any attacker input",
+) -> str:
     return json.dumps(
         {
             "threat_model": {},
-            "hypotheses": {"a": "A", "b": "B", "decisive_observable": observable},
+            "hypotheses": {
+                "a": "A",
+                "b": "B",
+                "decisive_observable": observable,
+                "oracle": oracle,
+                "disconfirm_condition": disconfirm_condition,
+            },
             "static_plan": {
                 "target_function": "FUN_1",
                 "expected_intermediate_calls": [],
@@ -153,6 +211,8 @@ def _strategy_plan_json(observable: str = "obs") -> str:
                 "payload_marker": ";touch /tmp/claim_001_proof;",
                 "required_signals": ["a", "b", "c"],
                 "decisive_observable": observable,
+                "oracle": oracle,
+                "disconfirm_condition": disconfirm_condition,
             },
             "static_runnable": True,
             "dynamic_runnable": True,
@@ -197,11 +257,27 @@ async def test_debug_strategy_raises_on_missing_global_id(tmp_path: Path):
 
 
 async def test_debug_dynamic_runs_only_dynamic_track(monkeypatch, tmp_path: Path):
+    from fw_audit.config.llm_config import AgentRole
+
     db_subfolder, _rootfs = _setup(tmp_path)
     strategy_llm = _ScriptedLLM([_strategy_plan_json()])
+    roles = {
+        AgentRole.STAGE5_STRATEGY_AGENT: strategy_llm,
+        # resolve_fvvw_deps resolves all seven roles up front even for a
+        # dynamic-track-only debug run (a fork-join run needs all of them
+        # in the general case) — the static-track/report roles are never
+        # actually invoked by debug_dynamic, so a trivial always-empty
+        # fake is enough for them.
+        AgentRole.STAGE5_SCRIPT_GENERATOR: _ScriptedLLM([]),
+        AgentRole.STAGE5_RESULT_EVALUATOR: _ScriptedLLM([]),
+        AgentRole.STAGE5_REPORT_WRITER: _ScriptedLLM([]),
+        AgentRole.STAGE5_BRINGUP_AGENT: _CyclingScriptedLLM([_bringup_done_json()]),
+        AgentRole.STAGE5_TRIGGER_AGENT: _CyclingScriptedLLM(_trigger_craft_observe_done_jsons()),
+        AgentRole.STAGE5_DYNAMIC_EVALUATOR: _CyclingScriptedLLM([_router_inconclusive_json()]),
+    }
 
     def fake_get_llm_for_agent(role, *, settings=None):
-        return strategy_llm
+        return roles[role]
 
     monkeypatch.setattr(
         "fw_audit.stage5_verification.fvvw.graph.get_llm_for_agent", fake_get_llm_for_agent

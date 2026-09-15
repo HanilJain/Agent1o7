@@ -47,6 +47,29 @@ class _ScriptedLLM:
         return AIMessage(content=item)
 
 
+class _CyclingScriptedLLM:
+    """Like `_ScriptedLLM` but wraps around instead of raising once its
+    list is exhausted — used for the three new agentic roles (bringup/
+    trigger/router), which can legitimately be invoked an unbounded number
+    of times across dynamic-track repair loops AND across multiple whole
+    `run_dynamic_track_only` invocations in the SAME test (each HITL retry
+    round rebuilds the dynamic graph but reuses the same monkeypatched LLM
+    instance) — unlike the static track's generator/evaluator, which this
+    module's tests assert exact call counts for and so keep the
+    exhausting `_ScriptedLLM` behavior deliberately."""
+
+    def __init__(self, responses: list) -> None:
+        self._responses = list(responses)
+        self.calls: list = []
+
+    async def ainvoke(self, messages, config=None):
+        self.calls.append(messages)
+        item = self._responses[(len(self.calls) - 1) % len(self._responses)]
+        if isinstance(item, Exception):
+            raise item
+        return AIMessage(content=item)
+
+
 class _FakeSessionExecutor:
     def __init__(self, on_exec=None) -> None:
         self.exec_calls: list[str] = []
@@ -57,6 +80,22 @@ class _FakeSessionExecutor:
 
     async def exec_in_session(self, handle, command, *, timeout=None):
         self.exec_calls.append(command)
+        if "pgrep" in command:
+            # health_gate's (Node 4) liveness check — must report ALIVE or
+            # every dynamic-track run loops back to bring-up forever instead
+            # of ever reaching gdb_attach/trigger/evaluate_route.
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            # health_gate's (Node 4) SECOND check — the gdbstub port re-bind
+            # probe (distinct from _launch_qemu_and_wait's own readiness
+            # probe, which matches on 'exit 0'/'exit 1' instead of echoing
+            # BOUND/UNBOUND) — must also report BOUND or health_gate fails
+            # right after pgrep passes.
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
         if "gdb-multiarch" in command and "recipe_reach" in command:
             return ExecutionResult(
                 command=command,
@@ -150,11 +189,22 @@ def _candidate(
     )
 
 
-def _strategy_plan_json(observable: str = "obs") -> str:
+def _strategy_plan_json(
+    observable: str = "obs",
+    *,
+    oracle: str = "a file is written to /tmp/claim_001_proof containing OVERFLOW_CONFIRMED",
+    disconfirm_condition: str = "the path is provably unreachable from any attacker input",
+) -> str:
     return json.dumps(
         {
             "threat_model": {},
-            "hypotheses": {"a": "A", "b": "B", "decisive_observable": observable},
+            "hypotheses": {
+                "a": "A",
+                "b": "B",
+                "decisive_observable": observable,
+                "oracle": oracle,
+                "disconfirm_condition": disconfirm_condition,
+            },
             "static_plan": {
                 "target_function": "FUN_1",
                 "expected_intermediate_calls": [],
@@ -172,6 +222,8 @@ def _strategy_plan_json(observable: str = "obs") -> str:
                 "payload_marker": ";touch /tmp/claim_001_proof;",
                 "required_signals": ["a", "b", "c"],
                 "decisive_observable": observable,
+                "oracle": oracle,
+                "disconfirm_condition": disconfirm_condition,
             },
             "static_runnable": True,
             "dynamic_runnable": True,
@@ -195,8 +247,46 @@ def _verdict_json(verdict: str, *, hypothesis_proved: str = "A") -> str:
     )
 
 
+def _bringup_done_json(*, ready: bool = True) -> str:
+    return json.dumps(
+        {"tool": "done", "args": {"launch_recipe_ready": ready, "summary": "session looks ready"}}
+    )
+
+
+def _trigger_craft_observe_done_jsons(*, payload: str = ";touch /tmp/claim_001_proof;") -> list:
+    # craft_payload -> observe_result (drives instrument_trigger against the
+    # SAME _FakeSessionExecutor recipe_trigger branch the old deterministic
+    # path used) -> done. Repeated a few times over so a test that loops
+    # the dynamic graph back through Node 6 more than once (a repair
+    # round-trip) doesn't exhaust the scripted list.
+    one_round = [
+        json.dumps({"tool": "craft_payload", "args": {"payload": payload}}),
+        json.dumps({"tool": "observe_result", "args": {}}),
+        json.dumps({"tool": "done", "args": {"summary": "delivered and observed"}}),
+    ]
+    return one_round * 4
+
+
+def _router_inconclusive_json() -> str:
+    return json.dumps(
+        {
+            "route": "inconclusive",
+            "diagnosis": "router fallback — deterministic oracle match already decided this "
+            "round in every test that reaches here",
+            "confidence": "LOW",
+        }
+    )
+
+
 def _patch_llm_roles(
-    monkeypatch, *, strategy_response: str, generator_response, evaluator_response
+    monkeypatch,
+    *,
+    strategy_response: str,
+    generator_response,
+    evaluator_response,
+    bringup_responses: list | None = None,
+    trigger_responses: list | None = None,
+    router_responses: list | None = None,
 ):
     from fw_audit.config.llm_config import AgentRole
 
@@ -205,6 +295,17 @@ def _patch_llm_roles(
         AgentRole.STAGE5_SCRIPT_GENERATOR: _ScriptedLLM([generator_response]),
         AgentRole.STAGE5_RESULT_EVALUATOR: _ScriptedLLM([evaluator_response]),
         AgentRole.STAGE5_REPORT_WRITER: _ScriptedLLM(["# report"]),
+        AgentRole.STAGE5_BRINGUP_AGENT: _CyclingScriptedLLM(
+            bringup_responses if bringup_responses is not None else [_bringup_done_json()]
+        ),
+        AgentRole.STAGE5_TRIGGER_AGENT: _CyclingScriptedLLM(
+            trigger_responses
+            if trigger_responses is not None
+            else _trigger_craft_observe_done_jsons()
+        ),
+        AgentRole.STAGE5_DYNAMIC_EVALUATOR: _CyclingScriptedLLM(
+            router_responses if router_responses is not None else [_router_inconclusive_json()]
+        ),
     }
 
     def fake_get_llm_for_agent(role, *, settings=None):
@@ -405,6 +506,71 @@ async def test_run_fvvw_discordant_holds(monkeypatch, fake_executor, tmp_path: P
     assert result["mechanism_confidence"] == MechanismConfidence.DISCORDANT_HOLD
 
 
+async def test_run_dynamic_track_only_enforces_wall_clock_budget(monkeypatch, tmp_path: Path):
+    """Settings.stage5_dynamic_wall_clock_seconds bounds the WHOLE dynamic
+    graph invocation's real elapsed time, independent of the per-round
+    iteration cutoff — a session whose commands simply never return must
+    still terminate INCONCLUSIVE/budget_exhausted rather than hang the
+    candidate forever."""
+    import asyncio
+    import dataclasses
+
+    from fw_audit.stage5_verification.fvvw.graph import (
+        resolve_fvvw_deps,
+        run_dynamic_track_only,
+    )
+    from fw_audit.stage5_verification.fvvw.strategy import parse_strategy_response
+    from fw_audit.stage5_verification.tools.characterize_tool import characterize_target
+
+    class _HangingSessionExecutor:
+        async def start(self, *, image=None, files=None, network=None):
+            return SessionHandle(container_name="fake-session", workspace_dir=files)
+
+        async def exec_in_session(self, handle, command, *, timeout=None):
+            await asyncio.sleep(60)  # far longer than the 1s wall-clock budget below
+            raise AssertionError("unreachable — the wall-clock timeout must fire first")
+
+        async def stop(self, handle):
+            pass
+
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+    settings = Settings(_env_file=None)
+    # stage5_dynamic_wall_clock_seconds has a ge=60 validator (too slow for
+    # a unit test to actually wait out) — set it directly post-construction
+    # rather than via the env var, which would need >=60 to validate.
+    settings.stage5_dynamic_wall_clock_seconds = 1
+    deps = await resolve_fvvw_deps(
+        db_subfolder=db_subfolder, candidate=candidate, settings=settings
+    )
+    deps = dataclasses.replace(deps, dynamic_session_executor=_HangingSessionExecutor())
+
+    plan = parse_strategy_response(_strategy_plan_json())
+    target = await characterize_target(candidate)
+
+    result, _guard_logs, _reached_sink, _transcript, extras = await run_dynamic_track_only(
+        candidate, plan.dynamic_plan, target, deps=deps
+    )
+    assert result.verdict == VerificationVerdict.INCONCLUSIVE
+    assert result.evidence["budget_exhausted"] is True
+    assert "wall_clock" in result.evidence["reason"] or "wall-clock" in result.evidence["reason"]
+
+
 async def test_run_fvvw_raises_stage5_input_error_without_source_path(tmp_path: Path):
     from fw_audit.stage5_verification.errors import Stage5InputError
 
@@ -517,17 +683,33 @@ async def test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself(
 
 
 class _NeverReachesSessionExecutor(_FakeSessionExecutor):
-    """Every GDB batch reports NO breakpoint hit — dynamic_evaluate can
-    never confirm/refute, so it exhausts stage5_dynamic_max_iterations and
-    terminates INCONCLUSIVE with evidence["budget_exhausted"]=True (see
-    fvvw.dynamic_track._terminal). This is what lets these tests trigger
-    the HITL hook deterministically without depending on iteration timing."""
+    """Every GDB batch reports NO breakpoint hit — the dynamic graph's
+    Node 8 (`evaluate_route`) can never confirm/refute, so it exhausts
+    `stage5_dynamic_max_iterations` and terminates INCONCLUSIVE with
+    evidence["budget_exhausted"]=True (see `dynamic_graph._build_track_
+    result`). This is what lets these tests trigger the HITL hook
+    deterministically without depending on iteration timing.
+
+    Reports the emulated process as ALIVE for `health_gate`'s `pgrep`
+    check (Node 4) — otherwise Node 4 would fail every round for a reason
+    unrelated to what this fake is modeling ("breakpoint never fires"),
+    looping back to bring-up instead of ever reaching gdb_attach/evaluate_
+    route and exhausting the BRING-UP budget (ERROR) instead of the
+    DYNAMIC-ITERATION budget (INCONCLUSIVE) these tests assert on."""
 
     async def exec_in_session(self, handle, command, *, timeout=None):
         self.exec_calls.append(command)
         if command.startswith("test -e"):
             return ExecutionResult(
                 command=command, returncode=0, stdout="NOTFOUND\n", stderr="", timed_out=False
+            )
+        if "pgrep" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
             )
         return ExecutionResult(command=command, returncode=0, stdout="", stderr="", timed_out=False)
 

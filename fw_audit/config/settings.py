@@ -627,6 +627,25 @@ class Settings(BaseSettings):
     """Per-role override for `AgentRole.STAGE5_REPORT_WRITER` — falls back
     to `stage5_verifier_model`. Composes the final disclosure Markdown
     (`stage5_verification.fvvw.report`)."""
+    stage5_bringup_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_BRINGUP_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_BRINGUP_AGENT` — falls back
+    to `stage5_verifier_model`. The dynamic track's Node 3 agentic
+    bring-up/arbitration loop (`stage5_verification.fvvw.dynamic_agents`)."""
+    stage5_trigger_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_TRIGGER_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_TRIGGER_AGENT` — falls back
+    to `stage5_verifier_model`. The dynamic track's Node 6 agentic
+    trigger/PoC-crafting loop."""
+    stage5_dynamic_evaluator_model: str | None = Field(
+        default=None, validation_alias="FWA_STAGE5_DYNAMIC_EVALUATOR_MODEL"
+    )
+    """Per-role override for `AgentRole.STAGE5_DYNAMIC_EVALUATOR` — falls
+    back to `stage5_verifier_model`. The dynamic track's Node 8 router,
+    invoked only when the deterministic oracle-match first pass doesn't
+    settle the round."""
     stage5_checkpoint_backend: str = Field(
         default="memory", validation_alias="FWA_STAGE5_CHECKPOINT_BACKEND"
     )
@@ -696,6 +715,48 @@ class Settings(BaseSettings):
     whole point is a diagnosable run with no `--trace`/LangSmith account.
     Set `False` only to suppress the extra disk writes (e.g. a constrained
     CI runner); it never affects a verdict either way."""
+    stage5_allow_real_payloads: bool = Field(
+        default=True, validation_alias="FWA_STAGE5_ALLOW_REAL_PAYLOADS"
+    )
+    """Governs which validator `instrument_trigger`/the Node 6 trigger agent
+    runs on a proposed payload. `True` (the default): the trigger agent may
+    craft and deliver the ACTUAL malicious input a hypothesis calls for
+    (overlong strings, command-injection sequences, path-traversal
+    sequences) — `validate_real_payload` is checked instead of the old
+    benign-marker-only gate, HARD-blocking only weaponized content
+    (reverse shells, exfiltration, destructive host commands — see
+    `fvvw.dynamic_track`'s deny-list) while allowing everything needed to
+    actually exercise a sink. Containment is structural, not content-based:
+    every dynamic-track run happens inside a disposable,
+    `stage5_sandbox_*`-capped, `--network=none` (unless
+    `stage5_allow_network_grant`) sandbox container. Set `False` to restore
+    the original benign-marker-only invariant (`validate_benign_marker`) —
+    a kill-switch requiring no code change, e.g. for a deployment that
+    wants the stricter historical posture. `validate_injected_recipe`'s
+    GDB-escape-hatch check (host-execution prevention, a container-
+    integrity concern independent of payload content) is ALWAYS enforced
+    on an operator-injected raw recipe regardless of this setting."""
+    stage5_dynamic_wall_clock_seconds: int = Field(
+        default=1800, ge=60, validation_alias="FWA_STAGE5_DYNAMIC_WALL_CLOCK_SECONDS"
+    )
+    """Hard wall-clock budget for the WHOLE dynamic-track graph run (Nodes
+    2-8, across every loop-back), independent of
+    `stage5_dynamic_max_iterations`'s iteration count — the spec's Node 8
+    "mandatory: hard maximum number of loop iterations AND a wall-clock
+    time budget" requirement. Exceeding either ends the run `inconclusive`
+    with full iteration history, never hangs indefinitely."""
+    stage5_bringup_agent_max_steps: int = Field(
+        default=8, ge=1, validation_alias="FWA_STAGE5_BRINGUP_AGENT_MAX_STEPS"
+    )
+    """Cap on the Node 3 bring-up/arbitration agent's own tool-calling
+    steps within ONE invocation (strace pass, inspect, fix, repeat) —
+    distinct from `stage5_bringup_max_repairs`, which bounds how many times
+    the graph re-enters Node 3 after a later-node fault."""
+    stage5_trigger_agent_max_steps: int = Field(
+        default=6, ge=1, validation_alias="FWA_STAGE5_TRIGGER_AGENT_MAX_STEPS"
+    )
+    """Cap on the Node 6 trigger agent's own tool-calling steps within ONE
+    invocation (craft payload, deliver, observe, refine)."""
 
     # ---- Stage 5 FVVW v3: human-in-the-loop on inconclusive tracks --------
     stage5_hitl_mode: str = Field(default="off", validation_alias="FWA_STAGE5_HITL_MODE")

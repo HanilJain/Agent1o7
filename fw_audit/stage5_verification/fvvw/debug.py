@@ -17,10 +17,18 @@ Wired into `runner.py debug {strategy,dynamic,fvvw}`.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
-from fw_audit.common.verification import StrategyPlan, TargetMeta, TrackResult
+from fw_audit.common.verification import (
+    ArbitrationLog,
+    ObservationRecord,
+    RouteDecision,
+    StrategyPlan,
+    TargetMeta,
+    TrackResult,
+)
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
@@ -76,6 +84,16 @@ class DebugDynamicResult:
     result: TrackResult
     gdb_transcript: str
     guard_logs: list[dict]
+    arbitration_log: ArbitrationLog | None = None
+    """Node 3's full structured bring-up/arbitration record — surfaced here
+    (not persisted, per this module's "never write to stage5/fvvw/reports/"
+    discipline) so `fw-verify debug dynamic` can inspect exactly which
+    dummy files/env-fixes the bring-up agent applied this run."""
+    observation: ObservationRecord | None = None
+    """Node 7's final structured capture for the round that produced
+    `result`."""
+    iteration_history: list[RouteDecision] = dataclasses.field(default_factory=list)
+    """Every `RouteDecision` Node 8 emitted this run, in order."""
 
 
 async def debug_dynamic(
@@ -101,7 +119,7 @@ async def debug_dynamic(
     target = await characterize_target(candidate)
     plan = await strategy_agent(candidate, target, llm=deps.strategy_llm, settings=settings)
 
-    result, guard_logs, _reached, transcript = await run_dynamic_track_only(
+    result, guard_logs, _reached, transcript, dynamic_extras = await run_dynamic_track_only(
         candidate, plan.dynamic_plan, target, deps=deps
     )
     return DebugDynamicResult(
@@ -111,6 +129,9 @@ async def debug_dynamic(
         result=result,
         gdb_transcript=transcript,
         guard_logs=guard_logs,
+        arbitration_log=dynamic_extras.get("arbitration_log"),
+        observation=dynamic_extras.get("observation"),
+        iteration_history=dynamic_extras.get("iteration_history") or [],
     )
 
 

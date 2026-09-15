@@ -25,8 +25,11 @@ from typing import Annotated, TypedDict
 from fw_audit.common.findings import Finding
 from fw_audit.common.verification import (
     Agreement,
+    ArbitrationLog,
     MechanismConfidence,
+    ObservationRecord,
     ReachabilityConfidence,
+    RouteDecision,
     StrategyPlan,
     TargetMeta,
     TrackResult,
@@ -68,6 +71,26 @@ class FVVWState(TypedDict, total=False):
     emulation_plan: dict
     gdb_transcript: str
     signals: Annotated[list[dict], operator.add]
+    arbitration_log: ArbitrationLog
+    """Node 3's structured record of every dummy file/stub/env-fix applied
+    this run — see `common.verification.ArbitrationLog`."""
+    observation: ObservationRecord
+    """Node 7's latest structured capture (signal/registers/memory-diff/
+    artifacts) — overwritten each loop-back, not accumulated, since only
+    the MOST RECENT round's observation is what Node 8 evaluates next."""
+    route: RouteDecision | None
+    """Node 8's most recent routing decision — read by the compiled
+    graph's conditional edges to pick the next node. `None` before Node 8
+    has run at all."""
+    iteration_history: Annotated[list[RouteDecision], operator.add]
+    """Every `RouteDecision` Node 8 has emitted so far this run, in order
+    — the full loop-back history persisted into `FVVWReport.
+    iteration_history` (spec Node 9, required content #7)."""
+    dynamic_iteration: int
+    """Loop-back counter for the whole dynamic graph — compared against
+    `Settings.stage5_dynamic_max_iterations` by the graph's router, the
+    same iteration-budget role `dynamic_evaluate`'s own `iteration`
+    parameter played before this rewrite."""
 
     # ---- mem.repair.* — bringup_stabilize -----------------------------------
     repair_return_to: str
@@ -112,6 +135,11 @@ DYNAMIC_TRACK_WRITABLE_KEYS: tuple[str, ...] = (
     "emulation_plan",
     "gdb_transcript",
     "signals",
+    "arbitration_log",
+    "observation",
+    "route",
+    "iteration_history",
+    "dynamic_iteration",
     "repair_return_to",
     "repair_applied_fixes",
     "repair_quirks_discovered",

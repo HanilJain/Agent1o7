@@ -91,7 +91,12 @@ def _target() -> TargetMeta:
     )
 
 
-def _valid_plan_json(observable: str = "metacharacter present unmodified in the sink arg") -> str:
+def _valid_plan_json(
+    observable: str = "metacharacter present unmodified in the sink arg",
+    *,
+    oracle: str = "a file is written to /tmp/claim_001_proof containing OVERFLOW_CONFIRMED",
+    disconfirm_condition: str = "argv[1] is escaped via escapeshellarg before reaching system()",
+) -> str:
     return json.dumps(
         {
             "threat_model": {"trust_boundary": "argv[1]", "access_requirement": "local_shell"},
@@ -99,6 +104,8 @@ def _valid_plan_json(observable: str = "metacharacter present unmodified in the 
                 "a": "attacker-controlled argv[1] reaches system() unsanitized",
                 "b": "the value is always escaped first",
                 "decisive_observable": observable,
+                "oracle": oracle,
+                "disconfirm_condition": disconfirm_condition,
             },
             "static_plan": {
                 "target_function": "FUN_00026938",
@@ -123,6 +130,8 @@ def _valid_plan_json(observable: str = "metacharacter present unmodified in the 
                     "filesystem_artifact",
                 ],
                 "decisive_observable": observable,
+                "oracle": oracle,
+                "disconfirm_condition": disconfirm_condition,
             },
             "static_runnable": True,
             "dynamic_runnable": True,
@@ -136,7 +145,7 @@ def _valid_plan_json(observable: str = "metacharacter present unmodified in the 
 
 
 def test_render_strategy_brief_includes_finding_and_target_facts():
-    brief = render_strategy_brief(_candidate(), _target())
+    brief = render_strategy_brief(_candidate(), _target(), settings=Settings(_env_file=None))
     assert "candidate_001" in brief or "vulnbin#0000::candidate_001" in brief
     assert "argv[1] reaches system()" in brief
     assert "arch: arm" in brief

@@ -29,8 +29,12 @@ from fw_audit.common.schemas import (
 )
 from fw_audit.common.verification import (
     Agreement,
+    ArbitrationLog,
+    ArbitrationLogEntry,
     MechanismConfidence,
+    ObservationRecord,
     ReachabilityConfidence,
+    RouteDecision,
     TrackResult,
     VerificationVerdict,
 )
@@ -129,6 +133,19 @@ def _fake_outcome(tmp_path: Path, *, agreement=Agreement.CONCORDANT_CONFIRM) -> 
         "dynamic_gdb_transcript": "",
         "crosscheck_evidence": {},
         "deps": _FakeDeps(tmp_path),
+        # Node 9 spec contents #3/#4/#6/#7 — previously computed by the
+        # dynamic graph but dropped before reaching FVVWReport; must now
+        # persist (see test_run_fvvw_queue_persists_dynamic_graph_fields).
+        "arbitration_log": ArbitrationLog(
+            entries=[ArbitrationLogEntry(kind="dummy_file", target="/etc/config/wireless")],
+            strace_findings=["ENOENT /etc/config/wireless"],
+            launch_recipe="qemu-arm -g 1234 ...",
+        ),
+        "observation": ObservationRecord(signal="SIGSEGV", faulting_pc="0x00012345"),
+        "iteration_history": [
+            RouteDecision(route="confirmed", diagnosis="oracle match", confidence="HIGH")
+        ],
+        "emulation_mode": "user",
     }
 
 
@@ -213,6 +230,35 @@ async def test_run_fvvw_queue_end_to_end_persists_json_and_markdown(tmp_path, mo
 
     # Must NOT touch the static-only path's own summary file.
     assert not layout.stage5_summary_path(stage5_dir_).is_file()
+
+
+async def test_run_fvvw_queue_persists_dynamic_graph_fields(tmp_path, monkeypatch):
+    """arbitration_log/observation/iteration_history/emulation_mode —
+    the dynamic graph's Node 9 spec contents #3/#4/#6/#7 — must reach the
+    persisted FVVWReport JSON, not just live in run_fvvw's in-memory
+    outcome dict."""
+    db_subfolder = tmp_path / "db" / "fw"
+    _write_findings(db_subfolder, "bin", ["c1"])
+    _write_stage2_summary(db_subfolder, "bin")
+    _patch_fvvw(monkeypatch, tmp_path)
+
+    await fvvw_driver.run_fvvw_queue(
+        db_subfolder=db_subfolder, settings=Settings(_env_file=None)
+    )
+
+    stage5_dir_ = layout.stage5_dir(db_subfolder)
+    fvvw_dir_ = layout.fvvw_dir(stage5_dir_)
+    reports_dir_ = layout.fvvw_reports_dir(fvvw_dir_)
+    json_path = reports_dir_ / layout.fvvw_report_json_filename("bin#0000::c1")
+    report_data = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert report_data["arbitration_log"]["entries"][0]["kind"] == "dummy_file"
+    assert report_data["arbitration_log"]["entries"][0]["target"] == "/etc/config/wireless"
+    assert report_data["observation"]["signal"] == "SIGSEGV"
+    assert report_data["observation"]["faulting_pc"] == "0x00012345"
+    assert len(report_data["iteration_history"]) == 1
+    assert report_data["iteration_history"][0]["route"] == "confirmed"
+    assert report_data["emulation_mode"] == "user"
 
 
 async def test_run_fvvw_queue_persists_command_log_paths_when_enabled(tmp_path, monkeypatch):

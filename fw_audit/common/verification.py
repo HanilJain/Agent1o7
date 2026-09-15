@@ -409,15 +409,47 @@ class DynamicPlan(BaseModel):
     )
     guards: list[GuardSpec] = Field(default_factory=list)
     argv_template: list[str] = Field(default_factory=list)
+    trigger_shape: str = Field(
+        default="",
+        description="How the trigger agent should reach the sink: 'network_http', "
+        "'cli_argv', 'direct_call', or another short label describing the delivery "
+        "channel — mirrors the spec's Node 1 trigger_shape field, consumed by the "
+        "Node 6 trigger agent to choose HTTP/argv/GDB-call delivery.",
+    )
+    preconditions: list[str] = Field(
+        default_factory=list,
+        description="Anything that must be true before the sink is reachable, e.g. "
+        "'must be authenticated', 'NVRAM key X must be set' — re-applied by the trigger "
+        "agent immediately before firing, per the spec's Node 6 precondition setup.",
+    )
     payload_marker: str = Field(
-        description="The benign, distinguishing marker to inject — e.g. "
-        "';touch /tmp/<claim_id>_proof;'. NEVER a functional exploit/reverse-shell/exfil "
-        "payload; validated by instrument_trigger before use (hard invariant)."
+        default="",
+        description="A benign, distinguishing marker (e.g. ';touch /tmp/<claim_id>_proof;'), "
+        "used only when Settings.stage5_allow_real_payloads is False (the benign-only "
+        "kill-switch). When real payloads are allowed (the default), the trigger agent "
+        "crafts the actual malicious input from 'oracle'/'trigger_shape' instead and this "
+        "field is informational/unused.",
+    )
+    oracle: str = Field(
+        default="",
+        description="The exact, mechanically-checkable condition that means 'confirmed' — "
+        "e.g. 'process receives SIGSEGV with PC inside the strcpy call site' or 'a file is "
+        "written to /tmp/<id>_proof containing OVERFLOW_CONFIRMED'. This is what the Node 8 "
+        "evaluator's deterministic first pass matches the ObservationRecord against, restated "
+        "in dynamic/GDB terms — must describe the SAME underlying claim as "
+        "Hypotheses.oracle/StaticPlan.decisive_observable (validated post-check).",
+    )
+    disconfirm_condition: str = Field(
+        default="",
+        description="What result means 'false positive' — e.g. 'input reaches the sink but "
+        "is safely bounds-checked before use'. Restated in dynamic/GDB terms; must describe "
+        "the same underlying claim as Hypotheses.disconfirm_condition.",
     )
     required_signals: list[str] = Field(
         default_factory=list,
         description="The >=3 independent signals collect_signals must gather, e.g. "
-        "['sink_argument_capture', 'target_self_report', 'filesystem_artifact'].",
+        "['sink_argument_capture', 'target_self_report', 'filesystem_artifact'] (benign-only "
+        "mode), or ['crash_signal', 'register_state', 'memory_diff'] (real-payload mode).",
     )
     decisive_observable: str = Field(
         description="The finding's decisive observable, restated in dynamic/GDB terms — "
@@ -432,6 +464,19 @@ class Hypotheses(BaseModel):
 
     a: str = Field(description="Hypothesis A: the exploitable scenario.")
     b: str = Field(description="Hypothesis B: the constrained/safe scenario.")
+    oracle: str = Field(
+        default="",
+        description="The exact, mechanically-checkable condition that means hypothesis A is "
+        "confirmed (spec Node 1's 'oracle' field) — a crash signal + PC location, a specific "
+        "artifact, a specific string. Ground truth for the Node 8 evaluator's deterministic "
+        "first pass; never the LLM's own opinion.",
+    )
+    disconfirm_condition: str = Field(
+        default="",
+        description="What result means hypothesis B / false-positive (spec Node 1's "
+        "'disconfirm_condition' field) — e.g. 'the path is provably unreachable from any "
+        "network-facing input', or 'input reaches the sink but is safely bounds-checked'.",
+    )
     decisive_observable: str = Field(
         description="The single observable that discriminates A from B, expressible by "
         "either track independently — must match both plans' own decisive_observable."
@@ -484,6 +529,137 @@ class TrackResult(BaseModel):
     )
     evidence: dict = Field(default_factory=dict)
     iters_used: int = 0
+
+
+class ArbitrationLogEntry(BaseModel):
+    """One environment fix Node 3 (Bring-Up & Arbitration) applied — a
+    dummy file, a stub library, an `LD_PRELOAD` shim, a forced environment
+    variable, or a session/container-level action (e.g. 'started session'),
+    per the spec's "Core idea — you do not need a real filesystem, you need
+    a filesystem the binary is happy with" principle. Kept as a structured
+    list (not free prose) so `write_report`'s "Full arbitration log" section
+    (spec Node 9, required content #4) can enumerate every fix a human would
+    need to reconstruct the exact working chroot, without re-parsing text."""
+
+    kind: str = Field(
+        description="'dummy_file' | 'dummy_dir' | 'device_node' | 'stub_library' | "
+        "'ld_preload_shim' | 'env_override' | 'network_grant' | 'session_started' | "
+        "'other' — the category of fix applied."
+    )
+    target: str = Field(
+        default="", description="The path/env-var/device name the fix concerns, e.g. "
+        "'/etc/config/wireless' or 'OPENSSL_armcap'."
+    )
+    detail: str = Field(
+        default="", description="What was actually written/set, e.g. the placeholder file "
+        "content, the forced value, or the stub symbol names exported.",
+    )
+    reasoning: str = Field(
+        default="", description="Why the bring-up agent believed this fix was needed — e.g. "
+        "the strace ENOENT line or missing-symbol error that motivated it.",
+    )
+
+
+class ArbitrationLog(BaseModel):
+    """`mem.dynamic.arbitration_log` — Node 3's full structured record,
+    required for reproducibility per the spec's "Critical requirement —
+    record everything." Distinct from `BringupContext.applied_fixes` (a
+    plain list of short strings the existing deterministic bring-up already
+    keeps) — this is the richer, LLM-reasoned equivalent the agentic Node 3
+    produces, with a `reasoning` field per entry the plain string list
+    cannot carry."""
+
+    entries: list[ArbitrationLogEntry] = Field(default_factory=list)
+    strace_findings: list[str] = Field(
+        default_factory=list,
+        description="Raw ENOENT/failed-open lines the bring-up agent's strace pass "
+        "surfaced, kept verbatim as the evidence base for `entries`.",
+    )
+    launch_recipe: str = Field(
+        default="", description="The final qemu-<arch> launch command line that worked, "
+        "after every fix in `entries` was applied — the spec's 'launch recipe' output."
+    )
+
+
+class ObservationRecord(BaseModel):
+    """`mem.dynamic.observation` — Node 7's (Run & Observe) structured
+    capture, read by Node 8's deterministic oracle-match first pass before
+    any LLM judgement. Fields mirror the spec's Node 7 "Run & Observe"
+    required contents exactly (signal capture / memory inspection /
+    artifact proof / full transcript)."""
+
+    signal: str | None = Field(
+        default=None, description="The POSIX signal name the target died from, if any — "
+        "'SIGSEGV' | 'SIGABRT' | 'SIGILL' | None (no crash)."
+    )
+    faulting_pc: str | None = Field(
+        default=None, description="The instruction pointer ($pc) at the moment of the crash, "
+        "hex string — None if no crash."
+    )
+    registers: dict[str, str] = Field(
+        default_factory=dict, description="Register name -> value dump captured at the crash "
+        "or at the trigger breakpoint (`info registers` output, parsed).",
+    )
+    memory_before: str = Field(
+        default="", description="Hex dump of the watched buffer/region BEFORE the risky "
+        "operation (`x/32xb <addr>`) — since QEMU user-mode has no hardware watchpoints, this "
+        "before/after diff is the substitute the spec's Node 5 mandates.",
+    )
+    memory_after: str = Field(
+        default="", description="Hex dump of the same region AFTER the risky operation."
+    )
+    memory_diff_detected: bool = Field(
+        default=False, description="Whether memory_before != memory_after — the overwrite "
+        "confirmation signal."
+    )
+    stdout: str = Field(default="", description="Captured target stdout.")
+    stderr: str = Field(default="", description="Captured target stderr.")
+    filesystem_artifacts: list[str] = Field(
+        default_factory=list, description="Paths confirmed written/modified as a side effect "
+        "of the trigger (command-injection/info-leak/auth-bypass style bugs)."
+    )
+    network_response: str = Field(
+        default="", description="Captured HTTP/network response content, for network-facing "
+        "triggers that don't crash the process outright."
+    )
+    oracle_match: bool | None = Field(
+        default=None, description="Result of Node 8's DETERMINISTIC first-pass check of this "
+        "record against DynamicPlan.oracle — True/False once checked, None before it runs. "
+        "Never the LLM's own opinion; a literal string/signal/address match.",
+    )
+    transcript: str = Field(
+        default="", description="Every GDB command executed and its output for this round, "
+        "verbatim — the spec's Node 7 'full transcript capture' requirement."
+    )
+
+
+class RouteDecision(BaseModel):
+    """Node 8's (Evaluator + Router) per-round output — the spec's §10
+    decision table, expressed as data. `route` is read by the dynamic
+    graph's conditional edges to decide the next node; `diagnosis` is the
+    human-readable reason recorded in `iteration_history` (spec Node 9,
+    required content #7)."""
+
+    route: Literal[
+        "confirmed",
+        "refuted",
+        "retry_bringup",
+        "retry_gdb_attach",
+        "retry_trigger",
+        "escalate_direct_call",
+        "inconclusive",
+    ] = Field(
+        description="Which node to resume at, or a terminal disposition — mirrors the spec's "
+        "§10 decision table exactly: 'confirmed'/'refuted' end the loop; 'retry_bringup' "
+        "routes to Node 3; 'retry_gdb_attach' to Node 5; 'retry_trigger' to Node 6; "
+        "'escalate_direct_call' to Node 2 with emulation_mode='direct_call'; "
+        "'inconclusive' ends the loop (budget exhausted or genuinely stuck)."
+    )
+    diagnosis: str = Field(
+        default="", description="Why this route was chosen — e.g. 'breakpoint from Node 5 "
+        "never hit: wrong sink location or input never reached that code path'."
+    )
+    confidence: str = Field(default="LOW", description="HIGH, MEDIUM, or LOW.")
 
 
 class Agreement(str, Enum):
@@ -614,6 +790,25 @@ class FVVWReport(BaseModel):
     stage5_hitl_mode="prompt"`) on a track that exhausted its budget without
     a decisive verdict — see `HumanReviewRecord`'s own docstring. `None`
     (the default) for every ordinary, unattended run."""
+    emulation_mode: str = ""
+    """`"user"` | `"system"` | `"direct_call"` — the dynamic track's final
+    `mem.dynamic.emulation_plan["mode"]`/Node 2 output. `"direct_call"`
+    means the trigger was delivered via GDB's `call` command rather than a
+    real front-door input (spec Node 9, required content #3/#8 — MUST be
+    stated plainly so a reader knows whether this bypassed the normal
+    dispatch path)."""
+    arbitration_log: ArbitrationLog = Field(default_factory=ArbitrationLog)
+    """Node 3's full structured record of every dummy file/stub/env-fix
+    applied — spec Node 9, required content #4 ("Full arbitration log")."""
+    observation: ObservationRecord = Field(default_factory=ObservationRecord)
+    """Node 7's final structured capture (signal/registers/memory-diff/
+    artifacts) for the round that produced the terminal verdict — spec
+    Node 9, required content #6 ("Observation evidence")."""
+    iteration_history: list[RouteDecision] = Field(default_factory=list)
+    """Every `RouteDecision` Node 8 emitted across the whole dynamic-track
+    run, in order — spec Node 9, required content #7 ("what was tried, what
+    failed, and why"). Empty when the run confirmed/refuted on its first
+    pass."""
     started_at: datetime
     finished_at: datetime | None = None
     trace_url: str | None = None

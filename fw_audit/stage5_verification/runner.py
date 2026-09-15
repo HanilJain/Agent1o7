@@ -203,6 +203,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the dynamic track's stage5_dynamic_max_iterations for this run.",
     )
     run.add_argument(
+        "--dynamic-wall-clock",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Override stage5_dynamic_wall_clock_seconds — the hard real-elapsed-time "
+        "budget for the WHOLE dynamic-track graph invocation (Nodes 2-8, across every "
+        "loop-back), independent of --dynamic-max-iterations' round count. Minimum 60. "
+        "Exceeding it ends the dynamic track INCONCLUSIVE/budget_exhausted rather than "
+        "hanging the candidate indefinitely.",
+    )
+    run.add_argument(
+        "--benign-only",
+        action="store_true",
+        help="Flip the stage5_allow_real_payloads kill-switch OFF for this run — the Node 6 "
+        "trigger agent crafts only a benign, distinguishing marker (e.g. "
+        "';touch /tmp/<id>_proof;') instead of the actual malicious input a hypothesis "
+        "calls for, restoring the original benign-marker-only invariant "
+        "(validate_benign_marker). Default: real payloads ARE allowed (Settings."
+        "stage5_allow_real_payloads=True) inside the disposable, network-isolated sandbox.",
+    )
+    run.add_argument(
         "--no-command-log",
         action="store_true",
         help="Disable stage5/fvvw/logs/<gid>.<track>.jsonl command logging for this run "
@@ -321,6 +342,10 @@ def _cmd_run(
         updates["stage5_max_agent_iterations"] = args.max_iterations
     if getattr(args, "dynamic_max_iterations", None) is not None:
         updates["stage5_dynamic_max_iterations"] = args.dynamic_max_iterations
+    if getattr(args, "dynamic_wall_clock", None) is not None:
+        updates["stage5_dynamic_wall_clock_seconds"] = args.dynamic_wall_clock
+    if getattr(args, "benign_only", False):
+        updates["stage5_allow_real_payloads"] = False
     if getattr(args, "no_command_log", False):
         updates["stage5_command_log"] = False
     if getattr(args, "hitl", None) is not None:

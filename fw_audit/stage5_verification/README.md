@@ -11,9 +11,9 @@ anything, rather than reasoning over static text alone.
 
 `fw-verify run` drives the full fork-join **by default**.
 `fw-verify run --joern-only` reaches the original static-only pipeline
-(build/run/evaluate against Joern, nothing else) exactly as it behaved
-before FVVW v3 — that pipeline is reused **completely unmodified** as the
-fork-join's static-track building block.
+(build/run/evaluate against Joern, nothing else) as the fork-join's
+static-track building block — reused unmodified by FVVW feature work, with
+one correctness exception (see "What changed from v1" below).
 
 ## What it does
 
@@ -38,23 +38,38 @@ fork-join's static-track building block.
   disassembles the real ELF to confirm/refute the static plan's expected
   calls and sanitizer patterns — a signal from the real binary, not the
   decompiled C the Joern track works from.
-- **`tools/qemu_gdb_tool.py`** + **`fvvw/dynamic_track.py`**: the QEMU+GDB
-  dynamic track. `plan_emulation` picks user- vs system-mode; `bringup_
-  stabilize` starts (and repairs) a session container running the target
-  under QEMU; `reach_target`/`satisfy_guards`/`instrument_trigger`/
-  `collect_signals` drive a shared GDB session to reach the claimed
-  vulnerable path, force each guard (logging its real default value
-  first), inject a validated BENIGN marker at the sink, and gather ≥3
-  independent corroborating signals; `dynamic_evaluate` is a deterministic
-  rule engine implementing the hypothesis A/B switch — keep testing A;
-  if it stalls, switch to proving B; terminate the moment either is
-  proved.
+- **`tools/qemu_gdb_tool.py`** + **`fvvw/dynamic_track.py`** +
+  **`fvvw/dynamic_agents.py`** + **`fvvw/dynamic_graph.py`** +
+  **`fvvw/dynamic_prompts.py`**: the QEMU+GDB dynamic track — a compiled
+  **9-node agentic `StateGraph`** (Node 1 is the shared strategy agent
+  above; Nodes 2-8 are `fvvw/dynamic_graph.py::build_dynamic_graph()`; Node
+  9 is `joint_evaluate`/`write_report` below). `plan_emulation` picks
+  user-/system-/direct-call-mode; `bringup_agent` (Node 3, an LLM agent) and
+  `trigger_agent` (Node 6, an LLM agent) drive the live QEMU+GDB session
+  themselves via a bounded JSON-action tool-calling loop — discovering
+  missing files via `strace`, creating dummy fixes, then crafting and
+  delivering the actual payload — with `bringup_stabilize`/`reach_target`/
+  `satisfy_guards`/`instrument_trigger`/`collect_observation`
+  (`fvvw/dynamic_track.py`) doing the deterministic legwork underneath
+  them; `health_gate` (Node 4) is a deterministic liveness check between
+  the two. Node 8 (`_run_evaluate_route`) tries a deterministic oracle-match
+  first, and only calls an LLM router (`route_observation`) when that's
+  ambiguous — its decision drives real conditional loop-back edges (retry
+  bring-up/GDB-attach/trigger, or escalate to a direct-call harness) instead
+  of a fixed retry count. `Settings.stage5_allow_real_payloads` (default
+  `True`) governs whether the trigger agent crafts the actual malicious
+  input (containment comes from the disposable, network-isolated sandbox,
+  not the payload content) or falls back to the original benign-marker-only
+  posture (`--benign-only`). `Settings.stage5_dynamic_wall_clock_seconds`
+  bounds the whole graph invocation's real elapsed time, independent of its
+  iteration count.
 - **`fvvw/joint.py`**: `joint_evaluate()` — the ONE function that reads
   both tracks' results — classifies their agreement
-  (concordant/discordant/one-sided), the mechanism-confidence axis (a
-  `discordant` disagreement NEVER auto-resolves to trusting one track), and
-  the reachability-confidence axis (a forced guard caps this and never
-  raises it).
+  (concordant/discordant/one-sided/**neither**, when NEITHER track reached a
+  definite verdict), the mechanism-confidence axis (a `discordant`
+  disagreement NEVER auto-resolves to trusting one track), and the
+  reachability-confidence axis (a forced guard caps this and never raises
+  it).
 - **`fvvw/graph.py`**: `run_fvvw()` wires it all together — characterize →
   strategy → fork the static and dynamic tracks (running concurrently) →
   await both → `joint_evaluate`.
@@ -69,13 +84,15 @@ fork-join's static-track building block.
   (unlike LangSmith, not gated by `--trace`) so a failed run stays
   diagnosable from disk alone.
 - **`fvvw/hitl.py`**: human-in-the-loop — when a track exhausts its own
-  iteration/repair budget without a decisive verdict, `run_fvvw` (with
-  `--hitl=prompt`) pauses after the fork-join barrier and offers the
-  operator one of four interventions: retry with more iterations, override
-  plan values, inject a raw payload/script, or force the verdict by hand
-  with a rationale. A forced verdict is durably marked
-  `evidence["human_attributed"]=True` and surfaces as an explicit caveat in
-  the disclosure report — never presented as machine-derived.
+  iteration/repair budget without a decisive verdict (or when NEITHER track
+  proves anything even without exhausting its budget —
+  `neither_proved()`), `run_fvvw` (with `--hitl=prompt`) pauses after the
+  fork-join barrier and offers the operator one of four interventions:
+  retry with more iterations, override plan values, inject a raw
+  payload/script, or force the verdict by hand with a rationale. A forced
+  verdict is durably marked `evidence["human_attributed"]=True` and
+  surfaces as an explicit caveat in the disclosure report — never presented
+  as machine-derived.
 
 ## Files
 
@@ -102,6 +119,13 @@ fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report
 fw-verify run --db-subfolder data/db/<stem> --hitl=prompt \
     --max-iterations 10 --dynamic-max-iterations 8
 
+# Dynamic-track containment/budget overrides
+fw-verify run --db-subfolder data/db/<stem> --benign-only              # restore the pre-v3 benign-marker-only posture
+fw-verify run --db-subfolder data/db/<stem> --dynamic-wall-clock 900   # cap the whole dynamic graph's real elapsed time (min 60s)
+
+# Token usage / cost controls
+fw-verify run --db-subfolder data/db/<stem> --rate-limit 2 --max-cost 5.00 --no-usage
+
 # Verify Stage 3b's externally-sourced PDF report claims instead of
 # Stage 3's own findings (see fw_audit/stage3b_claims/README.md)
 fw-verify run --db-subfolder data/db/<stem> --claims
@@ -123,11 +147,15 @@ ELF/rootfs/arch facts).
   `stage5_summary.json` — unchanged from before FVVW v3.
 - **Fork-join** (default), a SEPARATE subtree: `fvvw/reports/<gid>.json`
   (`common.verification.FVVWReport` — both tracks' results, the two-axis
-  verdict, residual unknowns), `fvvw/reports/<gid>.md` (the LLM-composed
-  disclosure document), `fvvw_summary.json`, and
-  `fvvw/logs/<gid>.static.jsonl` / `fvvw/logs/<gid>.dynamic.jsonl` — every
-  command either track ran plus its full result, for when a candidate
-  needs debugging beyond what the report quotes.
+  verdict, residual unknowns, and, from the dynamic track's 9-node graph:
+  `arbitration_log` (every fix Node 3's bring-up agent applied),
+  `observation` (Node 7's final signal/crash capture), `iteration_history`
+  (every routing decision Node 8 made across the run), `emulation_mode`),
+  `fvvw/reports/<gid>.md` (the LLM-composed disclosure document),
+  `fvvw_summary.json`, and `fvvw/logs/<gid>.static.jsonl` /
+  `fvvw/logs/<gid>.dynamic.jsonl` — every command either track ran plus its
+  full result, for when a candidate needs debugging beyond what the report
+  quotes.
 
 Neither path writes into an earlier stage's tree, and the two output
 subtrees never collide even against the same `db_subfolder`.
@@ -151,15 +179,21 @@ Observability section.
 ## What changed from v1 (pre-FVVW-v3)
 
 The original v1 pipeline (Joern-only, `agent/graph.py`'s generate/run/
-evaluate loop) is **completely unchanged** — every file it touches is
-reused verbatim by the fork-join's static track, and remains directly
-reachable via `--joern-only`. Everything else described above is additive:
-a new `fvvw/` package, new `tools/characterize_tool.py`/
-`crosscheck_tool.py`/`qemu_gdb_tool.py`/`verification_sandbox.py`, a
-session capability added alongside (never replacing) `SandboxExecutor`'s
-one-shot `run()`, and a second Docker image
-(`docker/Dockerfile.verification`) kept separate from `docker/
-Dockerfile.joern`.
+evaluate loop) is reused verbatim BY FVVW FEATURE WORK — every file it
+touches stays untouched for the sake of adding fork-join capability, and
+it remains directly reachable via `--joern-only`. It has since gained a
+**positive-proof discipline fix** (CONFIRMED/REFUTED now requires the
+evaluator to have actually named which hypothesis it proved, not just
+printed a marker) — a correctness fix, not FVVW feature work, so it's the
+one exception; see [CLAUDE.md](CLAUDE.md)'s hard-constraints section for
+the exact rule and its rationale. Everything else described above is
+additive: a new `fvvw/` package (now including the dynamic track's own
+9-node agentic `StateGraph` — `fvvw/dynamic_graph.py`/`dynamic_agents.py`/
+`dynamic_prompts.py`), new `tools/characterize_tool.py`/`crosscheck_tool.py`/
+`qemu_gdb_tool.py`/`verification_sandbox.py`, a session capability added
+alongside (never replacing) `SandboxExecutor`'s one-shot `run()`, and a
+second Docker image (`docker/Dockerfile.verification`) kept separate from
+`docker/Dockerfile.joern`.
 
 ## Explicitly deferred (not designed away)
 
