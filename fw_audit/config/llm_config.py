@@ -213,11 +213,19 @@ class AgentRole(str, Enum):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """A concrete, resolved model configuration."""
+    """A concrete, resolved model configuration.
+
+    ``temperature=None`` omits the parameter from the `init_chat_model` call
+    entirely rather than sending a value — some newer model snapshots (e.g.
+    Anthropic's Claude 5 family) reject an explicit `temperature` outright
+    ("`temperature` is deprecated for this model"), so a tier that targets
+    one of those must set `temperature=None` rather than rely on a numeric
+    default the provider no longer accepts.
+    """
 
     provider: ModelProvider
     model: str
-    temperature: float = 0.0
+    temperature: float | None = 0.0
     kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -312,7 +320,7 @@ TIER_TO_SPEC: dict[ModelTier, ModelSpec] = {
     ),
     ModelTier.BALANCED: ModelSpec(provider=ModelProvider.OLLAMA, model="kimi-k3"),
     ModelTier.HIGH_REASONING: ModelSpec(
-        provider=ModelProvider.ANTHROPIC, model="claude-sonnet-4-5"
+        provider=ModelProvider.ANTHROPIC, model="claude-sonnet-4-5", temperature=None
     ),
 }
 
@@ -378,7 +386,13 @@ def _parse_model_override(value: str) -> ModelSpec:
         ) from exc
     if not model:
         raise ValueError(f"Invalid model override {value!r}: missing model name after ':'.")
-    return ModelSpec(provider=provider, model=model)
+    # Anthropic's newer model snapshots (the Claude 5 family) reject an
+    # explicit `temperature` outright ("`temperature` is deprecated for
+    # this model") — an override string has no way to express "omit it",
+    # so every Anthropic override omits it by default rather than sending
+    # the dataclass's numeric default and risking a 400.
+    temperature = None if provider is ModelProvider.ANTHROPIC else 0.0
+    return ModelSpec(provider=provider, model=model, temperature=temperature)
 
 
 def resolve_spec(
@@ -669,11 +683,15 @@ def _build_from_spec(
 
     from langchain.chat_models import init_chat_model
 
+    temperature_kwargs: dict[str, Any] = (
+        {} if spec.temperature is None else {"temperature": spec.temperature}
+    )
+
     try:
         return init_chat_model(
             model=spec.model,
             model_provider=spec.provider.langchain_id,
-            temperature=spec.temperature,
+            **temperature_kwargs,
             **credential_kwargs,
             **identity_kwargs,
             **observability_kwargs,
