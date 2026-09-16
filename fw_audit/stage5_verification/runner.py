@@ -4,14 +4,16 @@ with a `--joern-only` fallback to the original static-only pipeline).
 Registered as the `fw-verify` console script (see pyproject.toml). Usage:
 
     fw-verify run --db-subfolder DIR [--only GID ...] [--decisions D[,D...]]
-                  [--model P:M] [--keep-workspace] [--joern-only]
+                  [--model P:M] [--keep-workspace] [--joern-only | --dynamic-only]
+                  [--live]
     fw-verify debug build-cpg --db-subfolder DIR --bin-id BIN_ID
     fw-verify debug script --workspace DIR --script-file PATH
     fw-verify debug verify --db-subfolder DIR --gid GID [--prompt-file PATH]
                             [--model P:M] [--max-iterations N] [--output PATH]
-    fw-verify debug strategy --db-subfolder DIR --gid GID
-    fw-verify debug dynamic --db-subfolder DIR --gid GID
-    fw-verify debug fvvw --db-subfolder DIR --gid GID [--output PATH]
+    fw-verify debug strategy --db-subfolder DIR --gid GID [--no-live]
+    fw-verify debug dynamic --db-subfolder DIR --gid GID [--no-live]
+                             [--stop-after NODE]
+    fw-verify debug fvvw --db-subfolder DIR --gid GID [--output PATH] [--no-live]
 
 `run` verifies every Stage 3 finding with `decision == ESCALATE` by default
 (`candidate_index.discover_candidates`). By DEFAULT this drives the full
@@ -21,12 +23,29 @@ verdict, LLM disclosure report), persisting to `stage5/fvvw/`.
 `--joern-only` routes to the ORIGINAL static-only pipeline
 (`driver.run_queue`) unchanged, persisting to `stage5/verifications/`+
 `stage5/reports/` exactly as it always has — the pre-FVVW-v3 behavior
-stays fully reachable. `--decisions` overrides which Stage 3 decision(s)
-qualify (e.g. `CONTEXT_REQUIRED`, on the chance a CPG resolves what Stage 3
-itself couldn't). `debug` dispatches to `debug.py`'s (Joern-only) and
+stays fully reachable. `--dynamic-only` routes to the dynamic (QEMU+GDB)
+track ALONE (`fvvw.driver.run_dynamic_only_queue` — no static track, no
+crosscheck, no joint two-axis verdict), persisting to
+`stage5/fvvw/dynamic_only/` — the production counterpart to
+`--joern-only`, for when only the dynamic track's own verdict is wanted.
+`--joern-only` and `--dynamic-only` are mutually exclusive. `--live`
+(default off in production; every `debug` subcommand below defaults it ON
+instead, `--no-live` there to quiet it) prints chain-of-thought console
+output — every LLM call's raw prompt/response, every tool/sandbox command
+and its result, every parsed agentic action/decision, every dynamic-graph
+node update — tagged `[gid]` so concurrent `stage5_workers` stay
+attributable; the full, untruncated record is always in
+`stage5/fvvw/logs/<gid>.<track>.jsonl` regardless of `--live`.
+`--decisions` overrides which Stage 3 decision(s) qualify (e.g.
+`CONTEXT_REQUIRED`, on the chance a CPG resolves what Stage 3 itself
+couldn't). `debug` dispatches to `debug.py`'s (Joern-only) and
 `fvvw.debug`'s (strategy/dynamic-only/full-fork-join) per-component,
 dry-run inspection functions — none of them persist into the pipeline's
-own tracked output directories.
+own tracked output directories. `debug dynamic --stop-after NODE` halts
+the dynamic graph right after that node fires (one of `plan_emulation`/
+`bringup`/`health_gate`/`gdb_attach`/`trigger`/`evaluate_route`/
+`plan_emulation_escalate`) — per-node diagnosis without running the rest
+of the track.
 """
 
 from __future__ import annotations
@@ -37,7 +56,6 @@ import sys
 from pathlib import Path
 
 from fw_audit.common.findings import Decision
-from fw_audit.common.verification import TranscriptEntry
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.observability import configure_tracing, flush_traces
 from fw_audit.observability import layout as usage_layout
@@ -56,34 +74,19 @@ from fw_audit.stage5_verification.errors import (
     VerifierModelUnavailableError,
 )
 from fw_audit.stage5_verification.fvvw import debug as fvvw_debug_mod
-from fw_audit.stage5_verification.fvvw.driver import run_fvvw_queue
+from fw_audit.stage5_verification.fvvw.driver import run_dynamic_only_queue, run_fvvw_queue
+from fw_audit.stage5_verification.live_console import make_transcript_on_step
 from fw_audit.stage5_verification.report_writer import render_report
 
-
-def _print_transcript_entries(entries: list[TranscriptEntry]) -> None:
-    """Live console renderer for `agent.verifier.verify_candidate`'s
-    `on_step` callback — prints each newly-produced turn as it happens:
-    the agent's reasoning, which tool(s) it decided to call and with what
-    arguments, and each tool's response. Terminal-friendly plain text, not
-    the Markdown `report_writer._render_transcript_section` produces (that
-    one is for the saved report; this one is for watching it happen live)."""
-    for entry in entries:
-        if entry.role == "system":
-            print(f"[turn {entry.turn}] (system prompt sent)")
-        elif entry.role == "human":
-            print(f"[turn {entry.turn}] >> task given to agent")
-        elif entry.role == "ai":
-            if entry.content.strip():
-                print(f"[turn {entry.turn}] agent: {entry.content.strip()}")
-            for call in entry.tool_calls:
-                args_str = ", ".join(f"{k}={v!r}" for k, v in call.args.items())
-                print(f"[turn {entry.turn}] agent calls {call.name}({args_str})")
-        elif entry.role == "tool":
-            snippet = entry.content.strip()
-            if len(snippet) > 500:
-                snippet = snippet[:500] + " …(truncated)"
-            print(f"[turn {entry.turn}] tool response: {snippet or '(empty)'}")
-        print()
+_DYNAMIC_GRAPH_NODES = (
+    "plan_emulation",
+    "bringup",
+    "health_gate",
+    "gdb_attach",
+    "trigger",
+    "evaluate_route",
+    "plan_emulation_escalate",
+)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -175,7 +178,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run ONLY the original static-only Joern pipeline (pre-FVVW-v3 behavior), "
         "persisting to stage5/verifications/+stage5/reports/ exactly as before — skips "
         "the strategy plan, the dynamic QEMU+GDB track, and the joint two-axis verdict "
-        "entirely. Without this flag, `run` drives the full FVVW v3 fork-join by default.",
+        "entirely. Without this flag, `run` drives the full FVVW v3 fork-join by default. "
+        "Mutually exclusive with --dynamic-only.",
+    )
+    run.add_argument(
+        "--dynamic-only",
+        action="store_true",
+        help="Run ONLY the dynamic (QEMU+GDB) track — no static track, no crosscheck, no "
+        "joint two-axis verdict — persisting to stage5/fvvw/dynamic_only/ instead of "
+        "stage5/fvvw/reports/. The production counterpart to --joern-only. Mutually "
+        "exclusive with --joern-only.",
+    )
+    run.add_argument(
+        "--live",
+        dest="live",
+        action="store_true",
+        default=None,
+        help="Print chain-of-thought console output for this run — every LLM call's raw "
+        "prompt/response, every tool/sandbox command and result, every parsed agentic "
+        "action/decision, every dynamic-graph node update — tagged [gid]. Default off "
+        "(Settings.stage5_live_console); the full untruncated record is always in "
+        "stage5/fvvw/logs/<gid>.<track>.jsonl regardless of this flag.",
+    )
+    run.add_argument(
+        "--no-live",
+        dest="live",
+        action="store_false",
+        help="Force chain-of-thought console output off for this run, overriding "
+        "Settings.stage5_live_console.",
     )
     run.add_argument(
         "--hitl",
@@ -283,6 +313,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     dbg_strategy.add_argument("--db-subfolder", type=str, required=True)
     dbg_strategy.add_argument("--gid", type=str, required=True, help="Global finding id.")
+    dbg_strategy.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Don't print the raw prompt/response and parsed StrategyPlan/parse "
+        "failures as they happen — just show the finished plan.",
+    )
 
     dbg_dynamic = dbg_sub.add_parser(
         "dynamic",
@@ -292,6 +328,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     dbg_dynamic.add_argument("--db-subfolder", type=str, required=True)
     dbg_dynamic.add_argument("--gid", type=str, required=True, help="Global finding id.")
+    dbg_dynamic.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Don't print every LLM call/tool call/parsed action/node update as it "
+        "happens — just wait and show the finished (or stopped-after) result.",
+    )
+    dbg_dynamic.add_argument(
+        "--stop-after",
+        choices=_DYNAMIC_GRAPH_NODES,
+        default=None,
+        metavar="NODE",
+        help="Halt the dynamic graph right after this node fires, for per-node "
+        "diagnosis without running the rest of the track — one of: "
+        + ", ".join(_DYNAMIC_GRAPH_NODES)
+        + ". If the node never fires this round (e.g. a conditional edge skips it), "
+        "the graph simply runs to completion as if this were not passed.",
+    )
 
     dbg_fvvw = dbg_sub.add_parser(
         "fvvw",
@@ -302,6 +355,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     dbg_fvvw.add_argument("--gid", type=str, required=True, help="Global finding id.")
     dbg_fvvw.add_argument(
         "--output", type=str, default=None, help="Write the JSON report here (default: stdout)."
+    )
+    dbg_fvvw.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Don't print every LLM call/tool call/parsed result/node update from "
+        "both tracks as it happens — just wait and show the finished report.",
     )
 
     return parser.parse_args(argv)
@@ -372,13 +431,24 @@ def _cmd_run(
             return 2
 
     joern_only = getattr(args, "joern_only", False)
-    queue_fn = run_queue if joern_only else run_fvvw_queue
-    summary_path_fn = (
-        layout.stage5_summary_path if joern_only else layout.fvvw_summary_path
-    )
+    dynamic_only = getattr(args, "dynamic_only", False)
+    if joern_only and dynamic_only:
+        print("error: --joern-only and --dynamic-only are mutually exclusive.", file=sys.stderr)
+        return 2
+
+    if joern_only:
+        queue_fn = run_queue
+        summary_path_fn = layout.stage5_summary_path
+    elif dynamic_only:
+        queue_fn = run_dynamic_only_queue
+        summary_path_fn = layout.fvvw_dynamic_only_summary_path
+    else:
+        queue_fn = run_fvvw_queue
+        summary_path_fn = layout.fvvw_summary_path
     findings_dir = (
         (db_subfolder / "stage3b" / "findings") if getattr(args, "claims", False) else None
     )
+    live = args.live if getattr(args, "live", None) is not None else settings.stage5_live_console
 
     try:
         summary = asyncio.run(
@@ -388,6 +458,7 @@ def _cmd_run(
                 only_global_ids=only,
                 run_id=args.run_id,
                 findings_dir=findings_dir,
+                live=live,
                 **decisions_kwargs,
             )
         )
@@ -403,10 +474,12 @@ def _cmd_run(
         f"Candidates: {summary.total_candidates} total, {summary.total_verified} verified, "
         f"{summary.total_failed} failed"
     )
-    label = "Verdicts" if joern_only else "Mechanism confidence tallies"
+    label = "Mechanism confidence tallies" if not (joern_only or dynamic_only) else "Verdicts"
     print(f"{label}: {summary.verdicts_by_type}")
     print(f"Summary: {summary_path_fn(layout.stage5_dir(db_subfolder))}")
-    if not joern_only:
+    if dynamic_only:
+        print("(Dynamic-track-only run — pass no flag for the full FVVW v3 fork-join.)")
+    elif not joern_only:
         print(
             "(Full FVVW v3 fork-join run — pass --joern-only for the original "
             "static-only pipeline.)"
@@ -458,7 +531,7 @@ def _cmd_debug(
             if args.prompt_file is not None:
                 prompt_override = Path(args.prompt_file).read_text(encoding="utf-8")
 
-            on_step = None if args.no_live else _print_transcript_entries
+            on_step = None if args.no_live else make_transcript_on_step(args.gid)
             if on_step is not None:
                 print(f"--- verifying {args.gid} (live) ---\n")
 
@@ -482,20 +555,34 @@ def _cmd_debug(
                 print(payload)
         elif args.debug_command == "strategy":
             result = asyncio.run(
-                fvvw_debug_mod.debug_strategy(Path(args.db_subfolder), args.gid)
+                fvvw_debug_mod.debug_strategy(
+                    Path(args.db_subfolder), args.gid, live=not args.no_live
+                )
             )
             print(f"target: {result.target.model_dump_json(indent=2)}")
             print(f"plan: {result.plan.model_dump_json(indent=2)}")
         elif args.debug_command == "dynamic":
+            stop_after = getattr(args, "stop_after", None)
             result = asyncio.run(
-                fvvw_debug_mod.debug_dynamic(Path(args.db_subfolder), args.gid)
+                fvvw_debug_mod.debug_dynamic(
+                    Path(args.db_subfolder),
+                    args.gid,
+                    live=not args.no_live,
+                    stop_after=stop_after,
+                )
             )
+            if stop_after is not None:
+                print(f"--- stopped after node {stop_after!r} ---")
             print(f"verdict: {result.result.verdict.value}")
             print(f"proved_hypothesis: {result.result.proved_hypothesis}")
             print(f"guard_logs: {result.guard_logs}")
             print(f"gdb_transcript:\n{result.gdb_transcript}")
         elif args.debug_command == "fvvw":
-            outcome = asyncio.run(fvvw_debug_mod.debug_fvvw(Path(args.db_subfolder), args.gid))
+            outcome = asyncio.run(
+                fvvw_debug_mod.debug_fvvw(
+                    Path(args.db_subfolder), args.gid, live=not args.no_live
+                )
+            )
             print(f"agreement: {outcome['agreement'].value}")
             print(f"mechanism_confidence: {outcome['mechanism_confidence'].value}")
             print(f"reachability_confidence: {outcome['reachability_confidence'].value}")

@@ -34,10 +34,13 @@ from fw_audit.stage5_verification.agent.prompts import (
     render_finding_brief,
 )
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
+from fw_audit.stage5_verification.cmdlog import CommandLog
 from fw_audit.stage5_verification.errors import (
     SandboxUnavailableError,
     VerifierModelUnavailableError,
 )
+from fw_audit.stage5_verification.live_console import LiveConsole
+from fw_audit.stage5_verification.llm_logging import LoggingChatModel
 from fw_audit.stage5_verification.tools.joern_tool import joern_executor
 
 OnStep = Callable[[list[TranscriptEntry]], None]
@@ -99,6 +102,25 @@ async def verify_candidate(
         evaluator_llm = get_llm_for_agent(AgentRole.STAGE5_RESULT_EVALUATOR, settings=settings)
     except (ImportError, ValueError) as exc:
         raise VerifierModelUnavailableError(str(exc)) from exc
+
+    # Wrap both LLMs for full before/after-parser visibility (llm_logging.
+    # LoggingChatModel — see that module's docstring), with ZERO other
+    # changes to this function's own logic. `on_step is not None` is
+    # reused, as-is, as the existing "a live view was asked for" signal
+    # (see this function's own `on_step` docstring) to also decide whether
+    # the wrapper echoes each raw prompt/response to the console — no new
+    # parameter needed. This creates no on-disk log (verify_candidate has
+    # never persisted a cmdlog JSONL, unlike the fork-join's
+    # `fvvw.static_track`); the ephemeral `CommandLog` below exists purely
+    # to carry a `LiveConsole` through to the wrapper.
+    live_console = (
+        LiveConsole(truncate_chars=settings.stage5_live_console_truncate_chars)
+        if on_step is not None
+        else None
+    )
+    llm_log = CommandLog(None, track="static", gid=candidate.global_id, live=live_console)
+    generator_llm = LoggingChatModel(generator_llm, role="generator", command_log=llm_log)
+    evaluator_llm = LoggingChatModel(evaluator_llm, role="evaluator", command_log=llm_log)
 
     stage5_dir_ = layout.stage5_dir(db_subfolder)
     workspace_dir_ = layout.workspace_dir(stage5_dir_, candidate.global_id)

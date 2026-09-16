@@ -380,3 +380,48 @@ def test_jsonl_recording_list_logs_on_setitem(tmp_path: Path):
     assert records[0]["kind"] == "joern_script"
     assert records[1]["kind"] == "joern_script_update"
     assert records[1]["notes"]["evaluator_verdict"] == "PASS"
+
+
+class _SpyLiveConsole:
+    """A minimal `LiveConsole` stand-in that records every `echo()` call
+    instead of printing, so tests can assert on what would have been shown
+    live without capturing stdout."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, str]] = []
+
+    def echo(self, record, *, gid: str = "") -> None:
+        self.calls.append((record, gid))
+
+
+def test_record_echoes_to_live_console_when_attached(tmp_path: Path):
+    live = _SpyLiveConsole()
+    log = CommandLog(
+        tmp_path / "gid.dynamic.jsonl", track="dynamic", gid="chunk::finding", live=live
+    )
+    log.record(node="reach_target", kind="gdb_batch", command="gdb ...", result=_result())
+    assert len(live.calls) == 1
+    record, gid = live.calls[0]
+    assert gid == "chunk::finding"
+    assert record.node == "reach_target"
+    # The JSONL write still happens — live echo is additive, not a substitute.
+    assert len(log.read_all()) == 1
+
+
+def test_record_echoes_to_live_console_even_when_disk_write_disabled(tmp_path: Path):
+    """`--no-command-log --live` should still show live output — see
+    `CommandLog.record`'s docstring for why `path=None` no longer implies
+    `live` is skipped too."""
+    live = _SpyLiveConsole()
+    log = CommandLog(None, track="dynamic", gid="chunk::finding", live=live)
+    log.record(node="bringup_agent", kind="llm_call", command="llm:bringup_agent")
+    assert len(live.calls) == 1
+    assert log.read_all() == []  # nothing on disk — path was None
+
+
+def test_fully_disabled_log_never_echoes():
+    log = CommandLog.disabled()
+    log.record(node="a", kind="k", command="cmd")
+    # No live console attached and no path — record() should short-circuit
+    # before even constructing a CommandRecord; read_all() stays empty.
+    assert log.read_all() == []

@@ -45,6 +45,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from fw_audit.stage5_verification.live_console import LiveConsole
+
 if TYPE_CHECKING:
     from fw_audit.executors.base import ExecutionResult, SessionHandle
 
@@ -156,9 +158,18 @@ class CommandLog:
     its lifetime, logging one `logger.warning` so the operator learns why
     the file is short, without the verification node itself failing."""
 
-    def __init__(self, path: Path | None, *, track: str = ""):
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        track: str = "",
+        gid: str = "",
+        live: LiveConsole | None = None,
+    ):
         self._path = path
         self._track = track
+        self._gid = gid
+        self._live = live
         self._seq = 0
         self._broken = False
         if self._path is not None:
@@ -172,7 +183,8 @@ class CommandLog:
     def disabled(cls) -> CommandLog:
         """A no-op instance — used when `Settings.stage5_command_log` is
         `False`, or as the default for any context that never received a
-        real path (e.g. `debug.py`'s dry runs)."""
+        real path (e.g. `debug.py`'s dry runs). Never carries a `live`
+        console either — a disabled log has nothing to echo."""
         return cls(None)
 
     @property
@@ -216,8 +228,16 @@ class CommandLog:
         `record(..., reached=True)` and `record(..., notes={"reached":
         True})` work, and a caller building its dict programmatically
         (`JsonlRecordingList`'s `to_fields`) can use whichever reads
-        better. Never raises."""
-        if self._path is None or self._broken:
+        better. Never raises.
+
+        When a `live` console was given at construction, the record is ALSO
+        echoed to it (`LiveConsole.echo`) regardless of whether the JSONL
+        write itself is enabled/healthy — a `--no-command-log` run with
+        `--live` still gets console visibility even though nothing lands on
+        disk. A truly disabled instance (`disabled()`, or any instance with
+        both `path=None` and `live=None`) still short-circuits immediately,
+        same as before this was added."""
+        if self._path is None and self._live is None:
             return
 
         self._seq += 1
@@ -248,6 +268,11 @@ class CommandLog:
             notes=merged_notes,
             ts=datetime.now(UTC).isoformat(),
         )
+        if self._live is not None:
+            self._live.echo(record, gid=self._gid)
+
+        if self._path is None or self._broken:
+            return
         try:
             with self._path.open("a", encoding="utf-8") as fh:
                 fh.write(record.to_json_line() + "\n")

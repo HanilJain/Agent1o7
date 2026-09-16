@@ -112,7 +112,9 @@ def _fake_report(global_id: str, bin_id: str, verdict: VerificationVerdict) -> V
 
 
 def _patch_verify(monkeypatch, *, side_effect=None, verdict=VerificationVerdict.CONFIRMED):
-    async def fake_verify_candidate(candidate, *, db_subfolder, settings, system_prompt=None):
+    async def fake_verify_candidate(
+        candidate, *, db_subfolder, settings, system_prompt=None, on_step=None
+    ):
         if side_effect is not None:
             result = side_effect(candidate)
             if isinstance(result, Exception):

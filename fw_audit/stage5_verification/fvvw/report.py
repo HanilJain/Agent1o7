@@ -62,6 +62,43 @@ Output ONLY the Markdown document, no commentary before or after it, no \
 markdown code fence wrapping the whole document.
 """
 
+DYNAMIC_ONLY_REPORT_SYSTEM_PROMPT = """\
+You are a firmware vulnerability disclosure report writer. You are given \
+the complete record of a SINGLE-TRACK verification run — a QEMU+GDB \
+dynamic emulation track only (`fw-verify run --dynamic-only`; the static \
+Joern track was deliberately not run for this candidate). Compose a \
+professional disclosure report in Markdown with these sections, in order:
+
+1. Executive summary — lead with the dynamic track's verdict and its \
+proved_hypothesis, in plain language a non-specialist reader can act on. \
+Explicitly note that only the dynamic track ran — there is no independent \
+static-analysis witness to compare against, so this is a single-witness \
+result, not a two-track reconciliation.
+2. Component context — what binary/firmware component this is, briefly.
+3. Architecture & threat model — the trust boundary and access requirement \
+EXACTLY as characterized (never inflate "local shell access" into \
+"unauthenticated remote attacker" or similar).
+4. Vulnerability analysis — the vulnerable code path and how it compares to \
+correct/reference handling.
+5. Dynamic analysis — the emulation environment, harness, and how the \
+required signals corroborated (or didn't) the claim; the raw GDB \
+transcript is quoted verbatim elsewhere in the document, so summarize \
+here, don't re-paste it.
+6. Method to reproduce + limitations — state plainly that no static-track \
+corroboration exists for this result, alongside any other supplied \
+limitations.
+
+Hard rules: never state a confidence level not supported by the supplied \
+data. Never claim reachability was confirmed if any guard was FORCED \
+rather than naturally satisfied — say so explicitly. Never invent a static \
+track result, an agreement classification, or a reconciliation you were \
+not given — there is none for this run. If a "Human review" section is \
+supplied below, you MUST state PLAINLY that a human operator — not the \
+automated pipeline — set the verdict, quoting the operator's rationale. \
+Output ONLY the Markdown document, no commentary before or after it, no \
+markdown code fence wrapping the whole document.
+"""
+
 
 def _sanitize(global_id: str) -> str:
     return global_id.replace("::", "__")
@@ -71,12 +108,12 @@ def render_report_brief(
     *,
     candidate: VerificationCandidate,
     finding: Finding,
-    static_result: TrackResult,
     dynamic_result: TrackResult,
-    agreement: Agreement,
-    mechanism_confidence: str,
-    reachability_confidence: str,
-    residual_unknowns: list[str],
+    static_result: TrackResult | None = None,
+    agreement: Agreement | None = None,
+    mechanism_confidence: str = "",
+    reachability_confidence: str = "",
+    residual_unknowns: list[str] | None = None,
     dynamic_gdb_transcript: str = "",
     human_review: HumanReviewRecord | None = None,
 ) -> str:
@@ -86,8 +123,15 @@ def render_report_brief(
     VERBATIM — FVVW §11's "every raw tool output... quoted verbatim"
     requirement — so the LLM can quote/summarize accurately rather than
     inventing plausible-sounding output.
+
+    `static_result=None` (the dynamic-only production path — `fw-verify
+    run --dynamic-only`) omits the static-track section's real content and
+    the reconciliation section entirely, replacing the former with an
+    explicit "NOT RUN" note so the LLM never fabricates a static result or
+    an agreement it was never given — see `write_report`'s own docstring
+    for the matching `DYNAMIC_ONLY_REPORT_SYSTEM_PROMPT` this pairs with.
     """
-    static_evidence = static_result.evidence or {}
+    residual_unknowns = residual_unknowns or []
     lines = [
         f"global_id: {candidate.global_id}",
         f"bin_id: {candidate.bin_id}",
@@ -100,21 +144,33 @@ def render_report_brief(
         f"attacker_control={finding.source.attacker_control})",
         f"sink: {finding.sink.expression} ({finding.sink.type})",
         f"security_condition: {finding.security_condition}",
-        "",
-        "## Static track (Joern) result",
-        f"verdict: {static_result.verdict.value}",
-        f"proved_hypothesis: {static_result.proved_hypothesis}",
-        f"summary: {static_evidence.get('summary', '(none)')}",
-        f"confidence: {static_evidence.get('confidence', '(none)')}",
-        "",
-        "Raw Joern attempts (verbatim):",
     ]
-    for attempt in static_evidence.get("attempts", []):
-        lines.append(f"--- attempt {attempt.get('attempt_index')} ---")
-        lines.append("script:")
-        lines.append(str(attempt.get("script", "")))
-        lines.append("stdout:")
-        lines.append(str(attempt.get("stdout", "")))
+    if static_result is not None:
+        static_evidence = static_result.evidence or {}
+        lines += [
+            "",
+            "## Static track (Joern) result",
+            f"verdict: {static_result.verdict.value}",
+            f"proved_hypothesis: {static_result.proved_hypothesis}",
+            f"summary: {static_evidence.get('summary', '(none)')}",
+            f"confidence: {static_evidence.get('confidence', '(none)')}",
+            "",
+            "Raw Joern attempts (verbatim):",
+        ]
+        for attempt in static_evidence.get("attempts", []):
+            lines.append(f"--- attempt {attempt.get('attempt_index')} ---")
+            lines.append("script:")
+            lines.append(str(attempt.get("script", "")))
+            lines.append("stdout:")
+            lines.append(str(attempt.get("stdout", "")))
+    else:
+        lines += [
+            "",
+            "## Static track (Joern) result",
+            "NOT RUN — this is a dynamic-track-only verification run "
+            "(`fw-verify run --dynamic-only`). Do not invent a static result, "
+            "an agreement classification, or a reconciliation — there is none.",
+        ]
     lines += [
         "",
         "## Dynamic track (QEMU+GDB) result",
@@ -124,16 +180,19 @@ def render_report_brief(
         "",
         "Raw GDB transcript (verbatim):",
         dynamic_gdb_transcript or "(no transcript — dynamic track did not run to completion)",
-        "",
-        "## Reconciliation (joint_evaluate — deterministic, computed by code)",
-        f"agreement: {agreement.value}",
-        f"mechanism_confidence: {mechanism_confidence}",
-        f"reachability_confidence: {reachability_confidence}",
-        "",
-        "residual_unknowns (include EVERY one of these in your limitations section, "
-        "verbatim or lightly rephrased — never drop one):",
-        *[f"  - {u}" for u in residual_unknowns],
     ]
+    if static_result is not None and agreement is not None:
+        lines += [
+            "",
+            "## Reconciliation (joint_evaluate — deterministic, computed by code)",
+            f"agreement: {agreement.value}",
+            f"mechanism_confidence: {mechanism_confidence}",
+            f"reachability_confidence: {reachability_confidence}",
+            "",
+            "residual_unknowns (include EVERY one of these in your limitations section, "
+            "verbatim or lightly rephrased — never drop one):",
+            *[f"  - {u}" for u in residual_unknowns],
+        ]
     if human_review is not None:
         lines += [
             "",
@@ -153,15 +212,15 @@ async def write_report(
     *,
     candidate: VerificationCandidate,
     finding: Finding,
-    static_result: TrackResult,
     dynamic_result: TrackResult,
-    agreement: Agreement,
-    mechanism_confidence: str,
-    reachability_confidence: str,
-    residual_unknowns: list[str],
     dynamic_gdb_transcript: str,
     llm: BaseChatModel,
     settings: Settings,
+    static_result: TrackResult | None = None,
+    agreement: Agreement | None = None,
+    mechanism_confidence: str = "",
+    reachability_confidence: str = "",
+    residual_unknowns: list[str] | None = None,
     system_prompt: str | None = None,
     human_review: HumanReviewRecord | None = None,
 ) -> str:
@@ -176,6 +235,15 @@ async def write_report(
     still consider stripping them before persisting — left as the caller's
     choice since this function's OWN contract is "return exactly what the
     LLM said").
+
+    `static_result=None` (the default's only legitimate use is `fw-verify
+    run --dynamic-only`, via `fvvw.driver.run_dynamic_only_queue`) selects
+    `DYNAMIC_ONLY_REPORT_SYSTEM_PROMPT` instead of the normal two-track
+    `REPORT_SYSTEM_PROMPT`, and `render_report_brief` omits the
+    static/reconciliation content accordingly — every existing two-track
+    caller (`fvvw.driver.run_fvvw_queue`, `fvvw.debug.debug_fvvw`) keeps
+    passing `static_result`/`agreement`/etc. explicitly, so this is purely
+    additive.
     """
     brief = render_report_brief(
         candidate=candidate,
@@ -189,7 +257,10 @@ async def write_report(
         dynamic_gdb_transcript=dynamic_gdb_transcript,
         human_review=human_review,
     )
-    system = system_prompt if system_prompt is not None else REPORT_SYSTEM_PROMPT
+    default_prompt = (
+        REPORT_SYSTEM_PROMPT if static_result is not None else DYNAMIC_ONLY_REPORT_SYSTEM_PROMPT
+    )
+    system = system_prompt if system_prompt is not None else default_prompt
     messages = [
         SystemMessage(content=system),
         HumanMessage(
@@ -213,4 +284,9 @@ async def write_report(
     return str(content).strip()
 
 
-__all__ = ["REPORT_SYSTEM_PROMPT", "render_report_brief", "write_report"]
+__all__ = [
+    "DYNAMIC_ONLY_REPORT_SYSTEM_PROMPT",
+    "REPORT_SYSTEM_PROMPT",
+    "render_report_brief",
+    "write_report",
+]

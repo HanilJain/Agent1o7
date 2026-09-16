@@ -43,7 +43,7 @@ from fw_audit.common.verification import (
 from fw_audit.config.settings import Settings
 from fw_audit.observability import run_config
 from fw_audit.stage5_verification.agent.cleaning import clean_json_payload
-from fw_audit.stage5_verification.cmdlog import aphase
+from fw_audit.stage5_verification.cmdlog import CommandLog, aphase
 from fw_audit.stage5_verification.fvvw.dynamic_prompts import (
     BRINGUP_AGENT_SYSTEM_PROMPT,
     DYNAMIC_ROUTER_SYSTEM_PROMPT,
@@ -88,6 +88,38 @@ def _parse_action(raw: object) -> dict | None:
     return parsed
 
 
+def _log_agent_turn(
+    command_log: CommandLog | None,
+    *,
+    node: str,
+    raw: str,
+    parsed: dict | None,
+) -> None:
+    """The "after parser" half of one agentic-loop turn — the PARSED action
+    on success, or the RAW failing text on failure (previously silently
+    dropped by every caller here — see this module's docstring). A no-op
+    when `command_log` is `None` (every existing call site that doesn't
+    pass one)."""
+    if command_log is None:
+        return
+    if parsed is not None:
+        command_log.record(
+            node=node,
+            kind="parsed_action",
+            command=f"{node} parsed action",
+            payload=json.dumps(parsed),
+            ok=True,
+        )
+    else:
+        command_log.record(
+            node=node,
+            kind="parse_failed",
+            command=f"{node} failed to parse an action from the LLM's response",
+            payload=raw,
+            ok=False,
+        )
+
+
 # --------------------------------------------------------------------- #
 # Node 3 — bringup_agent
 # --------------------------------------------------------------------- #
@@ -113,6 +145,7 @@ async def bringup_agent(
     llm: BaseChatModel,
     settings: Settings,
     max_steps: int | None = None,
+    command_log: CommandLog | None = None,
 ) -> BringupAgentResult:
     """Run the Node 3 bring-up/arbitration loop for one invocation (one
     pass through the strace-discover-fix-relaunch cycle, bounded by
@@ -164,6 +197,9 @@ async def bringup_agent(
                 ),
             )
             action = _parse_action(response.content)
+            _log_agent_turn(
+                command_log, node="bringup_agent", raw=str(response.content), parsed=action
+            )
             if action is None:
                 messages.append(
                     HumanMessage(
@@ -366,6 +402,7 @@ async def trigger_agent(
     vuln_class: str,
     sink_expression: str,
     max_steps: int | None = None,
+    command_log: CommandLog | None = None,
 ) -> TriggerAgentResult:
     """Run the Node 6 trigger/PoC loop for one invocation. Every payload
     the agent proposes is validated (`validate_real_payload` when
@@ -418,6 +455,9 @@ async def trigger_agent(
                 ),
             )
             action = _parse_action(response.content)
+            _log_agent_turn(
+                command_log, node="trigger_agent", raw=str(response.content), parsed=action
+            )
             if action is None:
                 messages.append(
                     HumanMessage(
@@ -571,6 +611,7 @@ async def route_observation(
     breakpoint_hit: bool,
     iteration: int,
     max_iterations: int,
+    command_log: CommandLog | None = None,
 ) -> RouteDecision:
     """Node 8's LLM step — called ONLY when `dynamic_track.match_oracle`
     already checked `observation` against `oracle` and returned `False`
@@ -614,9 +655,25 @@ async def route_observation(
         if payload is not None:
             try:
                 decision = RouteDecision.model_validate_json(payload)
+                if command_log is not None:
+                    command_log.record(
+                        node="evaluate_route",
+                        kind="parsed_decision",
+                        command="dynamic_evaluate parsed RouteDecision",
+                        payload=decision.model_dump_json(),
+                        ok=True,
+                    )
                 return decision
             except Exception:  # noqa: BLE001 - fall through to retry/fallback
                 pass
+        if command_log is not None:
+            command_log.record(
+                node="evaluate_route",
+                kind="parse_failed",
+                command="dynamic_evaluate failed to parse a RouteDecision",
+                payload=str(response.content),
+                ok=False,
+            )
         messages.append(
             HumanMessage(
                 content="That did not parse as the required JSON object. Return ONLY "

@@ -35,6 +35,7 @@ from fw_audit.config.settings import Settings
 from fw_audit.observability import run_config
 from fw_audit.stage5_verification.agent.cleaning import clean_json_payload
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
+from fw_audit.stage5_verification.cmdlog import CommandLog
 from fw_audit.stage5_verification.errors import Stage5InputError
 
 STRATEGY_SYSTEM_PROMPT = """\
@@ -287,6 +288,7 @@ async def strategy_agent(
     settings: Settings,
     system_prompt: str | None = None,
     max_regenerate_attempts: int = 2,
+    command_log: CommandLog | None = None,
 ) -> StrategyPlan:
     """Run the strategy agent for one candidate, retrying (bounded) when
     the post-check validator rejects the plan (mismatched/missing
@@ -298,6 +300,15 @@ async def strategy_agent(
     within the attempt budget — this halts the whole fork-join for this
     candidate (both tracks need `mem.plan` before they can start), unlike
     `characterize_target`'s narrower "target mismatch" failure.
+
+    `llm` is normally a `llm_logging.LoggingChatModel` (see `fvvw.graph.
+    resolve_fvvw_deps`) — the raw prompt/raw response for every attempt is
+    ALREADY captured by that wrapper's own `ainvoke`, before this function
+    ever parses anything. `command_log`, when given, additionally logs the
+    "after parser" half PER ATTEMPT — whether that attempt's response
+    parsed+validated (and the resulting `StrategyPlan`) or failed
+    (and why) — something a bare final return value can't show for the
+    attempts that got rejected along the way.
     """
     brief = render_strategy_brief(candidate, target, settings=settings)
     messages = build_strategy_messages(brief=brief, system_prompt=system_prompt)
@@ -315,7 +326,29 @@ async def strategy_agent(
         last_raw = str(getattr(response, "content", response))
         plan = parse_strategy_response(response.content)
         if plan is not None and validate_decisive_observable(plan):
+            if command_log is not None:
+                command_log.record(
+                    node="strategy_agent",
+                    kind="parsed_action",
+                    command=f"strategy_agent attempt {attempt} parsed+validated",
+                    payload=plan.model_dump_json(),
+                    ok=True,
+                )
             return plan
+
+        if command_log is not None:
+            reason = (
+                "parsed but failed validate_decisive_observable"
+                if plan is not None
+                else "did not parse as a StrategyPlan"
+            )
+            command_log.record(
+                node="strategy_agent",
+                kind="parse_failed",
+                command=f"strategy_agent attempt {attempt}: {reason}",
+                payload=last_raw,
+                ok=False,
+            )
 
         if attempt < max_regenerate_attempts:
             nudge = (

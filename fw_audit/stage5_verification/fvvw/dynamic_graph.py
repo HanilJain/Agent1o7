@@ -72,7 +72,7 @@ from fw_audit.common.verification import (
 from fw_audit.config.settings import Settings
 from fw_audit.executors.sandbox_executor import SandboxExecutor
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
-from fw_audit.stage5_verification.cmdlog import aphase
+from fw_audit.stage5_verification.cmdlog import CommandLog, aphase
 from fw_audit.stage5_verification.fvvw.dynamic_agents import (
     bringup_agent,
     route_observation,
@@ -92,6 +92,7 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     reach_target,
     satisfy_guards,
 )
+from fw_audit.stage5_verification.llm_logging import LoggingChatModel
 
 # Terminal routes health_gate_node/evaluate_route_node can produce, sharing
 # the same vocabulary `common.verification.RouteDecision.route` declares —
@@ -112,13 +113,25 @@ class DynamicGraphDeps:
     """Every resolved dependency the dynamic graph's nodes need, built once
     per `run_dynamic_track_only` call — mirrors `fvvw.graph.FVVWDeps`'s own
     shape, narrowed to just what the dynamic track (not the static track or
-    strategy/report roles) needs."""
+    strategy/report roles) needs.
+
+    `command_log`, when given, is threaded into `bringup_agent`/
+    `trigger_agent`/`route_observation` (via `_run_bringup`/`_run_trigger`/
+    `_run_evaluate_route` below) so each agentic loop can log+live-print its
+    own PARSED per-turn action/decision — the "after parser" half these
+    three roles had zero visibility into before (see `dynamic_agents.py`'s
+    module docstring; the log already carries its own `gid` from
+    construction — see `cmdlog.CommandLog` — so nothing else here needs
+    one). `command_log=None` (the default, e.g. a caller that never
+    resolved one) skips this — every `dynamic_agents.py` function treats it
+    as optional."""
 
     settings: Settings
-    bringup_llm: BaseChatModel
-    trigger_llm: BaseChatModel
-    dynamic_evaluator_llm: BaseChatModel
+    bringup_llm: BaseChatModel | LoggingChatModel
+    trigger_llm: BaseChatModel | LoggingChatModel
+    dynamic_evaluator_llm: BaseChatModel | LoggingChatModel
     session_executor: SandboxExecutor
+    command_log: CommandLog | None = None
 
 
 async def _run_bringup(
@@ -138,7 +151,12 @@ async def _run_bringup(
 
     async with aphase("bringup"):
         try:
-            result = await bringup_agent(ctx, llm=deps.bringup_llm, settings=deps.settings)
+            result = await bringup_agent(
+                ctx,
+                llm=deps.bringup_llm,
+                settings=deps.settings,
+                command_log=deps.command_log,
+            )
         except DynamicFault:
             # agent couldn't even start (no session yet) — fall through to
             # bringup_stabilize itself starting one.
@@ -282,6 +300,7 @@ async def _run_trigger(
                     plan=plan,
                     vuln_class=vuln_class,
                     sink_expression=sink_expression,
+                    command_log=deps.command_log,
                 )
                 observation = result.observation
                 gdb_transcript = transcript + result.gdb_transcript
@@ -381,6 +400,7 @@ async def _run_evaluate_route(
                 breakpoint_hit=reached,
                 iteration=iteration,
                 max_iterations=max_iterations,
+                command_log=deps.command_log,
             )
         elif not reached:
             decision = RouteDecision(
@@ -401,6 +421,7 @@ async def _run_evaluate_route(
                 breakpoint_hit=reached,
                 iteration=iteration,
                 max_iterations=max_iterations,
+                command_log=deps.command_log,
             )
 
         result: dict = {

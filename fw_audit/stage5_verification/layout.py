@@ -30,6 +30,13 @@ it — it survives workspace cleanup (`Settings.stage5_keep_workspace=False`
 still `rmtree`s the workspace but never touches `logs/`), since it's the
 one artifact meant to outlive an ordinary run regardless of that flag.
 
+`fw-verify run --dynamic-only` (the dynamic track alone, persisted) adds a
+THIRD subtree, `fvvw/dynamic_only/reports/<gid>.json`+`.md`
+(`common.verification.DynamicOnlyReport`) plus its own
+`fvvw_dynamic_only_summary.json` — never colliding with the fork-join's own
+`fvvw/reports/`/`fvvw_summary.json`; both modes still share `fvvw/logs/`
+(one JSONL per (candidate, track), same as always).
+
 `<gid>` is the global finding id `f"{chunk_id}::{finding_id}"` — same format
 and same `::` -> `__` filename sanitization as `stage4_rag.layout`.
 """
@@ -159,3 +166,39 @@ def fvvw_command_log_path(fvvw_dir_: Path, global_id: str, track: str) -> Path:
     stay independently greppable and neither can race the other's
     `CommandLog` instance."""
     return fvvw_logs_dir(fvvw_dir_) / f"{_sanitize_gid(global_id)}.{track}.jsonl"
+
+
+# --------------------------------------------------------------------- #
+# `fw-verify run --dynamic-only` — a SEPARATE subtree from `fvvw/reports/`
+# (the fork-join's own two-track output) and from `fvvw/logs/` (shared by
+# BOTH the fork-join and dynamic-only, one JSONL per (candidate, track) as
+# always) — never collides with either.
+# --------------------------------------------------------------------- #
+
+
+def fvvw_dynamic_only_dir(fvvw_dir_: Path) -> Path:
+    return fvvw_dir_ / "dynamic_only"
+
+
+def fvvw_dynamic_only_reports_dir(fvvw_dir_: Path) -> Path:
+    """`common.verification.DynamicOnlyReport` JSON + its disclosure
+    Markdown live together here, mirroring `fvvw_reports_dir`'s own
+    one-dir-not-two shape."""
+    return fvvw_dynamic_only_dir(fvvw_dir_) / "reports"
+
+
+def fvvw_dynamic_only_report_json_filename(global_id: str) -> str:
+    return f"{_sanitize_gid(global_id)}.json"
+
+
+def fvvw_dynamic_only_report_markdown_filename(global_id: str) -> str:
+    return f"{_sanitize_gid(global_id)}.md"
+
+
+def fvvw_dynamic_only_summary_path(stage5_dir_: Path) -> Path:
+    """Written by `fvvw.driver.run_dynamic_only_queue()` itself — a
+    SEPARATE file from both `stage5_summary_path()` (`--joern-only`) and
+    `fvvw_summary_path()` (the fork-join), so all three modes can run
+    against the same `db_subfolder` without overwriting each other's
+    run-level bookkeeping."""
+    return stage5_dir_ / "fvvw_dynamic_only_summary.json"

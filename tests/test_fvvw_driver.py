@@ -31,10 +31,15 @@ from fw_audit.common.verification import (
     Agreement,
     ArbitrationLog,
     ArbitrationLogEntry,
+    DynamicPlan,
+    Hypotheses,
     MechanismConfidence,
     ObservationRecord,
     ReachabilityConfidence,
     RouteDecision,
+    StaticPlan,
+    StrategyPlan,
+    TargetMeta,
     TrackResult,
     VerificationVerdict,
 )
@@ -152,7 +157,7 @@ def _fake_outcome(tmp_path: Path, *, agreement=Agreement.CONCORDANT_CONFIRM) -> 
 def _patch_fvvw(
     monkeypatch, tmp_path: Path, *, side_effect=None, agreement=Agreement.CONCORDANT_CONFIRM
 ):
-    async def fake_run_fvvw(candidate, *, db_subfolder, settings):
+    async def fake_run_fvvw(candidate, *, db_subfolder, settings, live=False):
         if side_effect is not None:
             result = side_effect(candidate)
             if isinstance(result, Exception):
@@ -266,7 +271,7 @@ async def test_run_fvvw_queue_persists_command_log_paths_when_enabled(tmp_path, 
     _write_findings(db_subfolder, "bin", ["c1"])
     _write_stage2_summary(db_subfolder, "bin")
 
-    async def fake_run_fvvw(candidate, *, db_subfolder, settings):
+    async def fake_run_fvvw(candidate, *, db_subfolder, settings, live=False):
         outcome = _fake_outcome(tmp_path)
         deps = outcome["deps"]
         deps.static_command_log = CommandLog(tmp_path / "c1.static.jsonl", track="static")
@@ -344,3 +349,115 @@ async def test_run_fvvw_queue_discordant_still_persists_and_verifies(tmp_path, m
     # workflow's job is to surface the disagreement, not to fail on it).
     assert summary.total_verified == 1
     assert summary.total_failed == 0
+
+
+# --------------------------------------------------------------------- #
+# `fw-verify run --dynamic-only` — `run_dynamic_only_queue`
+# --------------------------------------------------------------------- #
+
+
+def _fake_dynamic_only_outcome(tmp_path: Path) -> dict:
+    return {
+        "target": TargetMeta(arch="mips", endianness="big"),
+        "plan": StrategyPlan(
+            hypotheses=Hypotheses(
+                a="a", b="b", decisive_observable="metacharacter present"
+            ),
+            static_plan=StaticPlan(
+                target_function="FUN_1",
+                decisive_observable="metacharacter present",
+            ),
+            dynamic_plan=DynamicPlan(
+                reach_strategy="inferior_call", decisive_observable="metacharacter present"
+            ),
+        ),
+        "dynamic_result": TrackResult(
+            verdict=VerificationVerdict.CONFIRMED, proved_hypothesis="A"
+        ),
+        "guard_logs": [],
+        "dynamic_gdb_transcript": "gdb output here",
+        "arbitration_log": ArbitrationLog(),
+        "observation": ObservationRecord(signal="SIGSEGV"),
+        "iteration_history": [],
+        "emulation_mode": "user",
+        "deps": _FakeDeps(tmp_path),
+    }
+
+
+def _patch_dynamic_only(monkeypatch, tmp_path: Path, *, side_effect=None):
+    async def fake_run_dynamic_only(candidate, *, db_subfolder, settings, live=False):
+        if side_effect is not None:
+            result = side_effect(candidate)
+            if isinstance(result, Exception):
+                raise result
+        return _fake_dynamic_only_outcome(tmp_path)
+
+    async def fake_write_report(**kwargs):
+        return "# Dynamic-only disclosure report\n\nfake"
+
+    monkeypatch.setattr(fvvw_driver, "run_dynamic_only", fake_run_dynamic_only)
+    monkeypatch.setattr(fvvw_driver, "write_report", fake_write_report)
+
+
+async def test_run_dynamic_only_queue_no_findings_dir_raises_input_error(tmp_path):
+    with pytest.raises(Stage5InputError):
+        await fvvw_driver.run_dynamic_only_queue(
+            db_subfolder=tmp_path / "db" / "fw", settings=Settings(_env_file=None)
+        )
+
+
+async def test_run_dynamic_only_queue_persists_dynamic_only_report(tmp_path, monkeypatch):
+    db_subfolder = tmp_path / "db" / "fw"
+    _write_findings(db_subfolder, "bin", ["c1"])
+    _write_stage2_summary(db_subfolder, "bin")
+    _patch_dynamic_only(monkeypatch, tmp_path)
+
+    summary = await fvvw_driver.run_dynamic_only_queue(
+        db_subfolder=db_subfolder, settings=Settings(_env_file=None)
+    )
+
+    assert summary.status == "completed"
+    assert summary.total_verified == 1
+    assert summary.total_failed == 0
+    assert summary.verdicts_by_type == {"CONFIRMED": 1}
+
+    stage5_dir_ = layout.stage5_dir(db_subfolder)
+    fvvw_dir_ = layout.fvvw_dir(stage5_dir_)
+    reports_dir_ = layout.fvvw_dynamic_only_reports_dir(fvvw_dir_)
+    json_path = reports_dir_ / layout.fvvw_dynamic_only_report_json_filename("bin#0000::c1")
+    md_path = reports_dir_ / layout.fvvw_dynamic_only_report_markdown_filename("bin#0000::c1")
+    assert json_path.exists()
+    assert md_path.exists()
+
+    report_data = json.loads(json_path.read_text(encoding="utf-8"))
+    # Deliberately no two-track reconciliation fields — see
+    # common.verification.DynamicOnlyReport's own docstring for why.
+    assert "agreement" not in report_data
+    assert "mechanism_confidence" not in report_data
+    assert "static_result" not in report_data
+    assert report_data["dynamic_result"]["verdict"] == "CONFIRMED"
+    assert report_data["report_markdown"] == "# Dynamic-only disclosure report\n\nfake"
+
+    assert layout.fvvw_dynamic_only_summary_path(stage5_dir_).exists()
+    # The fork-join's own summary file must NOT be touched by this mode.
+    assert not layout.fvvw_summary_path(stage5_dir_).exists()
+
+
+async def test_run_dynamic_only_queue_permanent_failure_recorded_not_verified(
+    tmp_path, monkeypatch
+):
+    db_subfolder = tmp_path / "db" / "fw"
+    _write_findings(db_subfolder, "bin", ["c1"])
+    _write_stage2_summary(db_subfolder, "bin")
+    _patch_dynamic_only(
+        monkeypatch, tmp_path, side_effect=lambda candidate: SandboxUnavailableError("no docker")
+    )
+
+    summary = await fvvw_driver.run_dynamic_only_queue(
+        db_subfolder=db_subfolder,
+        settings=Settings(_env_file=None, stage5_queue_max_attempts=1, stage5_workers=1),
+    )
+
+    assert summary.total_verified == 0
+    assert summary.total_failed == 1
+    assert summary.candidates[0].status == "failed"

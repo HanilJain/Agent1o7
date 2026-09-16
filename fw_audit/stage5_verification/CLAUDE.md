@@ -7,8 +7,23 @@ LLM-authored strategy plan, reconciled by a deterministic **joint
 evaluator** into a two-axis verdict (mechanism confidence × reachability
 confidence) plus an LLM-composed disclosure report. `fw-verify run` drives
 this fork-join **by default**; `--joern-only` routes to the original
-static-only pipeline, byte-for-byte unchanged. Root `CLAUDE.md` covers only
+static-only pipeline, byte-for-byte unchanged; `--dynamic-only` routes to
+the dynamic (QEMU+GDB) track alone, persisted. Root `CLAUDE.md` covers only
 cross-cutting concerns (Executor abstraction, LLM routing, Settings).
+
+**Chain-of-thought console visibility (`--live`)** is available on `run`
+(default off — `Settings.stage5_live_console`) and on every `debug`
+subcommand (default on, `--no-live` to quiet it): every LLM call's exact
+prompt and raw response (before any downstream parsing), every parsed
+agentic action/decision (or parse failure), every tool/sandbox command and
+its result, and every dynamic-graph node's produced update, all tagged
+`[gid]` and printed live as they happen — see `live_console.py`/
+`llm_logging.py`/`streaming.py` below. The full, untruncated record is
+always in `fvvw/logs/<gid>.<track>.jsonl` regardless of `--live` (console
+output truncates for readability; the JSONL never does).
+`debug dynamic --stop-after NODE` halts the dynamic graph right after one
+named node fires, for per-node diagnosis without running the rest of the
+track — see "The 9 nodes" below for the node id vocabulary.
 
 **The dynamic track is a compiled 9-node agentic `StateGraph`** (spec
 Nodes 1-9; Node 1 is the shared `strategy_agent` upstream, Node 9 stays
@@ -47,6 +62,19 @@ below for the full node table and the architecture rationale.
   static track's generate/run/evaluate loop into a template-first design as
   part of FVVW work; that divergence from the design doc's script-first
   ideal is accepted deliberately, as the cost of reuse.
+  **A second, narrowly-scoped exception, alongside the correctness-fix one
+  below: Stage-5-WIDE observability work (chain-of-thought console output,
+  applying equally to `--joern-only` and the fork-join) may make a minimal,
+  purely-additive, composition-based edit to `agent/verifier.py`/
+  `driver.py` — never `agent/graph.py`/`agent/prompts.py` themselves.**
+  `agent/verifier.py` wraps its two resolved LLMs in `llm_logging.
+  LoggingChatModel` (see that module's docstring — the same "compose from
+  outside, never edit the loop" discipline `cmdlog.JsonlRecordingList`
+  already established); `driver.py` only starts exercising `verify_
+  candidate`'s own pre-existing, already-public `on_step` parameter that
+  its own docstring already invited ("driver.py's production path never
+  passes one"). Neither touches `build_verifier_graph`'s actual loop logic
+  — see the file table below for exactly what changed in each.
   **This constraint is scoped to FVVW feature work, not to correctness
   fixes in the static track's own loop** — those ARE in scope for edits to
   `agent/graph.py`/`agent/prompts.py`, and must be recorded here. As of the
@@ -206,13 +234,14 @@ UNTOUCHED by the rewrite.
 | File | Purpose |
 |---|---|
 | `layout.py` | Pure path algebra for `stage5/` — **now also carries the separate `fvvw/` subtree's paths**, including `fvvw/logs/` (additive; the original static-track paths are untouched). |
-| `cmdlog.py` | `CommandLog` — per-track, append-only JSONL of every command either track executes plus its full result, written to `stage5/fvvw/logs/<gid>.<static\|dynamic>.jsonl`. `LoggingSessionExecutor` wraps the dynamic track's session executor BY COMPOSITION (never edits `SandboxExecutor`) so every `exec_in_session` call is captured centrally. `JsonlRecordingList` intercepts `agent.graph.build_verifier_graph`'s `cpg_build_holder`/`attempts` list parameters so the static track gets full logging with ZERO edits to `agent/graph.py`. `phase()`/`aphase()` (sync/async) tag records with the active node name via a `ContextVar`, isolated per `asyncio` task the same way `observability.context.trace_context` is. Always on by default (`Settings.stage5_command_log`) — unlike LangSmith spans, NOT gated by `langsmith_tracing`; the whole point is a diagnosable run with no `--trace`. |
+| `cmdlog.py` | `CommandLog` — per-track, append-only JSONL of every command either track executes plus its full result, written to `stage5/fvvw/logs/<gid>.<static\|dynamic>.jsonl`. `LoggingSessionExecutor` wraps the dynamic track's session executor BY COMPOSITION (never edits `SandboxExecutor`) so every `exec_in_session` call is captured centrally. `JsonlRecordingList` intercepts `agent.graph.build_verifier_graph`'s `cpg_build_holder`/`attempts` list parameters so the static track gets full logging with ZERO edits to `agent/graph.py`. `phase()`/`aphase()` (sync/async) tag records with the active node name via a `ContextVar`, isolated per `asyncio` task the same way `observability.context.trace_context` is. Always on by default (`Settings.stage5_command_log`) — unlike LangSmith spans, NOT gated by `langsmith_tracing`; the whole point is a diagnosable run with no `--trace`. Optional `gid`/`live` (`live_console.LiveConsole`) — `record()` echoes to it, when attached, regardless of whether the JSONL write itself is enabled. |
 | `candidate_index.py` | Resolves `stage3/findings/*.json` into `VerificationCandidate`s. Resolves `source_path` (the Joern C, for the static track) via `stage2_summary.json` — **and now also resolves `binary_path`/`rootfs_dir`/`elf`/`functions`** (the real ELF + Stage 2's already-computed facts, for `characterize_target`/the dynamic track) via `resolve_binary_target()`. |
 | `errors.py` | `Stage5InputError`, `SandboxUnavailableError`, `VerifierModelUnavailableError`. |
 | `tools/joern_tool.py` | `build_cpg_async`/`run_joern_script_async` + `joern_executor()`. Owns the exact Joern CLI command strings. |
 | `agent/cleaning.py` | Strips `<think>` blocks/markdown fences from a local model's response — reused by `fvvw/strategy.py`. |
-| `agent/transcript.py`, `agent/prompts.py`, `agent/graph.py`, `agent/verifier.py` | The unmodified generate/run/evaluate loop — see the old v1 description below. |
-| `driver.py` | The original static-only worker pool — `run_queue()`, reachable via `fw-verify run --joern-only`. |
+| `agent/transcript.py`, `agent/prompts.py`, `agent/graph.py` | The unmodified generate/run/evaluate loop — see the old v1 description below. |
+| `agent/verifier.py` | The generate/run/evaluate loop's entry point — **one small, documented exception** to "never edit": `verify_candidate` wraps its two resolved LLMs in `llm_logging.LoggingChatModel` (reusing `on_step is not None` — already-existing, already-public — as the "live view wanted" signal, with no new parameter and no change to `on_step`'s own contract). No other line changed; `build_verifier_graph`/`agent/graph.py`'s actual loop logic is untouched. |
+| `driver.py` | The original static-only worker pool — `run_queue()`, reachable via `fw-verify run --joern-only`. `live=` (threaded from `--live`/`Settings.stage5_live_console`) makes `_process_one` pass `make_transcript_on_step(gid)` as `verify_candidate`'s `on_step` — the SAME extension point `debug verify` already used; no other change. |
 | `report_writer.py` | Renders one `VerificationReport` to Markdown (the static track's own artifact). |
 | `debug.py` | `debug_build_cpg`/`debug_run_script`/`debug_verify` — Joern-only debug entry points. `find_candidate()` (public; `_find_candidate` kept as an alias) is reused by `fvvw/debug.py`. |
 
@@ -238,12 +267,15 @@ tool-calling — both are plain text in/text out, for local-model reliability.
 | `fvvw/dynamic_prompts.py` | System prompts + the JSON action/observation contract for all four dynamic-track LLM roles (bring-up, trigger, router) — mirrors `fvvw/strategy.py`'s prompt+render shape. `render_bringup_brief`/`render_trigger_brief`/`render_router_brief`. |
 | `fvvw/dynamic_graph.py` | `build_dynamic_graph()` — the compiled `StateGraph(FVVWState)` for Nodes 2-8 (see "The 9 nodes" above for the full mapping). `DynamicGraphDeps` (the three new LLMs + session executor, narrower than `fvvw.graph.FVVWDeps`). `route_after_bringup`/`_health_gate`/`_gdb_attach`/`_trigger`/`_evaluate` — the pure conditional-edge functions implementing the spec's §10 decision table. `_build_track_result`/`_TERMINAL_ROUTES` — the ONLY place a dynamic-track `TrackResult` is constructed. |
 | `fvvw/joint.py` | `joint_evaluate()` — the only function reading both `TrackResult`s. `classify_agreement`/`classify_mechanism_confidence`/`classify_reachability_confidence`/`collect_residual_unknowns`. |
-| `fvvw/graph.py` | `run_fvvw()` — the actual fork-join: `characterize → strategy → fork(static_track, static_crosscheck, run_dynamic_track_only running concurrently) → await both → joint_evaluate`. `resolve_checkpointer()`, `FVVWDeps`/`resolve_fvvw_deps()` (now resolves SEVEN LLM roles — the original four plus `bringup_llm`/`trigger_llm`/`dynamic_evaluator_llm`). `run_dynamic_track_only()` — compiles + `ainvoke`s `dynamic_graph.build_dynamic_graph()` under a `stage5_dynamic_wall_clock_seconds` timeout, unpacking the terminal `FVVWState` into the `(TrackResult, guard_logs, dynamic_reached_sink, gdb_transcript, dynamic_extras)` tuple every caller expects. |
-| `fvvw/report.py` | `write_report()` — one LLM call composing the seven-layer disclosure document + reconciliation section, with every raw tool output (Joern attempts, GDB transcript) quoted verbatim. |
-| `fvvw/driver.py` | `run_fvvw_queue()` — a SEPARATE worker-pool queue (not an extension of `driver.py`) persisting `FVVWReport` JSON + disclosure Markdown to `stage5/fvvw/reports/`. |
-| `fvvw/debug.py` | `debug_strategy` (strategy only), `debug_dynamic` (dynamic track ONLY — the per-track debug path; `DebugDynamicResult` now also surfaces `arbitration_log`/`observation`/`iteration_history` for inspection, never persisted), `debug_fvvw` (full fork-join, dry run). |
+| `fvvw/graph.py` | `run_fvvw()` — the actual fork-join: `characterize → strategy → fork(static_track, static_crosscheck, run_dynamic_track_only running concurrently) → await both → joint_evaluate`. `resolve_checkpointer()`, `FVVWDeps`/`resolve_fvvw_deps()` (now resolves SEVEN LLM roles — the original four plus `bringup_llm`/`trigger_llm`/`dynamic_evaluator_llm` — each wrapped in `llm_logging.LoggingChatModel`; `live=True` also attaches a `LiveConsole` to both `CommandLog`s). `run_dynamic_track_only()` — compiles + streams (`streaming.stream_graph_live`, `stop_after=` for per-node diagnosis) `dynamic_graph.build_dynamic_graph()` under a `stage5_dynamic_wall_clock_seconds` timeout, unpacking the terminal `FVVWState` into the `(TrackResult, guard_logs, dynamic_reached_sink, gdb_transcript, dynamic_extras)` tuple every caller expects. `run_dynamic_only()` — the dynamic-track-alone production entry point (`characterize → strategy → run_dynamic_track_only`, no static/crosscheck/joint_evaluate), backing `fw-verify run --dynamic-only`. |
+| `fvvw/report.py` | `write_report()` — one LLM call composing the seven-layer disclosure document + reconciliation section, with every raw tool output (Joern attempts, GDB transcript) quoted verbatim. `static_result: TrackResult \| None = None` — when `None` (the dynamic-only path), selects `DYNAMIC_ONLY_REPORT_SYSTEM_PROMPT` and `render_report_brief` omits the static/reconciliation content instead of fabricating it. |
+| `fvvw/driver.py` | `run_fvvw_queue()` — a SEPARATE worker-pool queue (not an extension of `driver.py`) persisting `FVVWReport` JSON + disclosure Markdown to `stage5/fvvw/reports/`; `live=` threads chain-of-thought console output through. `run_dynamic_only_queue()` — the `--dynamic-only` production counterpart, persisting `common.verification.DynamicOnlyReport` JSON + disclosure Markdown to `stage5/fvvw/dynamic_only/reports/` and its own `fvvw_dynamic_only_summary.json` — never touches the fork-join's own output paths. |
+| `fvvw/debug.py` | `debug_strategy` (strategy only, `live=True` default), `debug_dynamic` (dynamic track ONLY — the per-track debug path; `DebugDynamicResult` now also surfaces `arbitration_log`/`observation`/`iteration_history` for inspection, never persisted; `live=True` default, `stop_after=` for per-node diagnosis — halts right after that node fires), `debug_fvvw` (full fork-join, dry run, `live=True` default). |
 | `tools/verification_sandbox.py` | `verification_executor()`/`verification_session_executor()` — resolve an `Executor`/session-capable `SandboxExecutor` pointed at `stage5_verification_image` (a SEPARATE image from Joern's). |
-| `cmdlog.py` | `CommandLog` — per-track, append-only JSONL of every command either track executes plus its full result, written to `stage5/fvvw/logs/<gid>.<static\|dynamic>.jsonl`. `LoggingSessionExecutor` wraps the dynamic session executor by COMPOSITION; `JsonlRecordingList` intercepts the static track's `cpg_build_holder`/`attempts` lists with zero edits to `agent/graph.py`. Always on by default (`Settings.stage5_command_log`), unlike LangSmith — the point is a diagnosable run with no `--trace`. |
+| `cmdlog.py` | `CommandLog` — per-track, append-only JSONL of every command either track executes plus its full result, written to `stage5/fvvw/logs/<gid>.<static\|dynamic>.jsonl`. `LoggingSessionExecutor` wraps the dynamic session executor by COMPOSITION; `JsonlRecordingList` intercepts the static track's `cpg_build_holder`/`attempts` lists with zero edits to `agent/graph.py`. Always on by default (`Settings.stage5_command_log`), unlike LangSmith — the point is a diagnosable run with no `--trace`. Now also takes an optional `gid`/`live` (a `live_console.LiveConsole`) — `record()` echoes every record to it (when attached) BEFORE the disk write, so `--no-command-log --live` still shows console output with nothing landing on disk. |
+| `live_console.py` | `LiveConsole.echo()` — the single console-formatting entry point `CommandLog.record()` calls, branching on `CommandRecord.kind` (`llm_call` → prompt+raw-response; `parsed_action`/`parsed_decision`/`parsed_result` → the after-parser payload; `parse_failed` → the raw failing text; `node_update` → a dynamic-graph node's produced update; anything else → a plain tool/sandbox command+result). Every line prefixed `[gid]`. `print_transcript_entries`/`make_transcript_on_step` — the static loop's turn-by-turn live renderer (relocated from `runner.py`, used by both `runner.py` and `driver.py`). |
+| `llm_logging.py` | `LoggingChatModel` — wraps any `BaseChatModel` by composition (mirrors `cmdlog.LoggingSessionExecutor`'s shape: `__getattr__` passthrough, override only `ainvoke`), logging the exact rendered prompt (before-parser input) and the raw `response.content` (after-LLM, before-any-parsing output) through the SAME `CommandLog.record(kind="llm_call")` every tool call uses — zero edits to `agent/graph.py`/`fvvw/strategy.py`/`fvvw/dynamic_agents.py`. Applied to all seven LLM roles in `fvvw.graph.resolve_fvvw_deps` and to the two static-loop roles directly inside `agent.verifier.verify_candidate`. |
+| `streaming.py` | `stream_graph_live()` — drives a compiled dynamic-graph `StateGraph` via `astream(stream_mode=["updates", "values"])` instead of a bare `ainvoke`, recording+live-echoing each node's produced update (`kind="node_update"`) and optionally halting right after a named `stop_after` node fires (`debug dynamic --stop-after`). `stop_after=None` returns bit-for-bit what `ainvoke` would have — a behavior-preserving swap in `run_dynamic_track_only`. NOT used for the static v1 loop (that one keeps its own richer, transcript-based `on_step` view — see `agent/verifier.py`/`fvvw/static_track.py`). |
 | `fvvw/hitl.py` | Human-in-the-loop: `HitlAction`/`HitlDecision`/`HitlRequest`, `Prompter` (an injectable callable — `terminal_prompter` for real use, a scripted fake in tests), `is_budget_exhausted()` (the trigger — reads the `evidence["budget_exhausted"]` fact tagged by the producing track), `force_verdict_result()`, `build_human_review_record()`. Hooked into `fvvw.graph.run_fvvw` AFTER the fork-join barrier, never inside a track. |
 
 ## Invoke
@@ -257,13 +289,24 @@ fw-verify run --db-subfolder data/db/<stem> --decisions CONTEXT_REQUIRED,ESCALAT
 # Static-only, pre-FVVW-v3 behavior
 fw-verify run --db-subfolder data/db/<stem> --joern-only --model ollama:qwen3:32b --keep-workspace
 
-# Per-track debug — each track runnable individually
+# Dynamic-track-only, persisted — the production counterpart to --joern-only
+fw-verify run --db-subfolder data/db/<stem> --dynamic-only
+
+# Chain-of-thought console output for a production run (default off) — every
+# LLM call's raw prompt/response, tool/sandbox command+result, parsed
+# agentic action/decision, dynamic-graph node update, tagged [gid]
+fw-verify run --db-subfolder data/db/<stem> --live
+
+# Per-track debug — each track runnable individually. Live console output
+# defaults ON for every debug subcommand (--no-live to quiet it).
 fw-verify debug build-cpg --db-subfolder data/db/<stem> --bin-id <bin_id>          # Joern, no LLM
 fw-verify debug script --workspace data/db/<stem>/stage5/workspace/<gid> --script-file q.sc  # Joern, no LLM
 fw-verify debug verify --db-subfolder data/db/<stem> --gid "<gid>" \
     --prompt-file my_prompt.txt --output report.json                              # Joern track only
 fw-verify debug strategy --db-subfolder data/db/<stem> --gid "<gid>"              # strategy_agent only
 fw-verify debug dynamic --db-subfolder data/db/<stem> --gid "<gid>"               # QEMU+GDB track only
+fw-verify debug dynamic --db-subfolder data/db/<stem> --gid "<gid>" \
+    --stop-after health_gate                     # per-node diagnosis: halt right after Node 4 fires
 fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report.json  # full fork-join, dry run
 
 # Human-in-the-loop — pauses AFTER the barrier when a track exhausts its
@@ -311,6 +354,16 @@ command_log_paths` points at both files directly. `FVVWReport.human_review`
 led to an operator intervention on this candidate — `None` for every
 ordinary, unattended run.
 
+**Dynamic-only (`--dynamic-only`), a THIRD, separate subtree — never
+collides with either of the above:** `fvvw/dynamic_only/reports/<gid>.json`
+(`common.verification.DynamicOnlyReport` — no `static_result`/`agreement`/
+`mechanism_confidence`/`reachability_confidence`, since there is no static
+track to reconcile against) → `fvvw/dynamic_only/reports/<gid>.md`
+(dynamic-track-only disclosure, `fvvw.report.write_report(...,
+static_result=None)`) → `fvvw_dynamic_only_summary.json`. Shares
+`fvvw/dynamic_workspace/`/`fvvw/logs/<gid>.dynamic.jsonl` with the
+fork-join (both write the same dynamic-track artifacts for the same `gid`).
+
 ## Debugging
 
 - `--trace` traces every LLM call and every sandboxed tool call
@@ -325,18 +378,40 @@ ordinary, unattended run.
   `stage5.dynamic_evaluate` (Node 8's LLM router, `route_observation` —
   note this run_name is SHARED with the pre-rewrite `dynamic_evaluate`
   rule engine's conceptual role, but is now the LLM call, not a
-  deterministic function). `run_dynamic_track_only`'s own `ainvoke` is
-  tagged `stage5.dynamic_track`; the dynamic graph's individual nodes are
-  auto-traced by LangGraph's native instrumentation under it with no
-  manual span needed (`bringup`/`health_gate`/`gdb_attach`/`trigger`/
-  `evaluate_route`/`plan_emulation`/`plan_emulation_escalate` node names).
-  `cmdlog`'s `aphase()` tags (same names as the graph nodes, plus
-  `bringup_agent`/`trigger_agent` for the two agentic loops specifically)
-  are a SEPARATE mechanism — the `node` field in `fvvw/logs/<gid>.
-  dynamic.jsonl`, not a LangSmith span; both exist independently (see
-  Command Log below). Root run: `stage5.fvvw.candidate` (fork-join) or
-  `stage5.candidate` (`--joern-only`). See root `CLAUDE.md`'s Observability
-  section.
+  deterministic function). `run_dynamic_track_only`'s own graph invocation
+  (`streaming.stream_graph_live`'s `astream`, not a bare `ainvoke` — see
+  that module's docstring) is tagged `stage5.dynamic_track`; the dynamic
+  graph's individual nodes are auto-traced by LangGraph's native
+  instrumentation under it with no manual span needed (`bringup`/
+  `health_gate`/`gdb_attach`/`trigger`/`evaluate_route`/`plan_emulation`/
+  `plan_emulation_escalate` node names). `cmdlog`'s `aphase()` tags (same
+  names as the graph nodes, plus `bringup_agent`/`trigger_agent` for the
+  two agentic loops specifically) are a SEPARATE mechanism — the `node`
+  field in `fvvw/logs/<gid>.dynamic.jsonl`, not a LangSmith span; both
+  exist independently (see Command Log below). Root run:
+  `stage5.fvvw.candidate` (fork-join) or `stage5.candidate`
+  (`--joern-only`). See root `CLAUDE.md`'s Observability section.
+- `--live` (default off on `run`, default on for every `debug` subcommand)
+  is a SEPARATE, THIRD sink from both LangSmith (`--trace`, cloud-only) and
+  `cmdlog` (disk-only JSONL) — a local terminal printer
+  (`live_console.LiveConsole`) that shows every LLM call's raw prompt/
+  response, every tool/sandbox command+result, every parsed agentic
+  action/decision (or parse failure), and every dynamic-graph node update,
+  tagged `[gid]`, AS THEY HAPPEN. It works whether or not `--trace`/
+  LangSmith is configured, and whether or not `--no-command-log` is passed
+  (see `cmdlog.CommandLog.record`'s docstring — a `--no-command-log --live`
+  run still shows console output with nothing landing on disk). Console
+  text truncates at `Settings.stage5_live_console_truncate_chars` (default
+  3000) for readability; the JSONL (when enabled) never truncates.
+- `debug dynamic --stop-after NODE` halts `streaming.stream_graph_live`
+  right after `NODE` fires, returning whatever `FVVWState` accumulated up
+  to that point — `DebugDynamicResult.result` in this case is a synthetic
+  `INCONCLUSIVE` `TrackResult` tagged `evidence["stopped_after"]=NODE` (NOT
+  `budget_exhausted` — this is a deliberate diagnostic stop, not a real
+  exhaustion, so it must never trip HITL's `is_budget_exhausted` trigger).
+  If `NODE` never actually fires this round (e.g. a conditional edge
+  skipped it), the graph simply runs to completion as if `--stop-after`
+  had not been passed.
 - `docker build -f docker/Dockerfile.joern -t fw-audit-joern:latest .` —
   the static track's image, unchanged.
 - `docker build -f docker/Dockerfile.verification -t

@@ -45,6 +45,7 @@ from fw_audit.stage5_verification.fvvw.hitl import (
     prompt_for_track,
     terminal_prompter,
 )
+from fw_audit.stage5_verification.live_console import make_transcript_on_step
 from fw_audit.stage5_verification.report_writer import render_report
 
 logger = logging.getLogger("fw_audit.stage5_verification")
@@ -117,6 +118,7 @@ class _RunContext:
     settings: Settings
     db_subfolder: Path
     stage5_dir: Path
+    live: bool = False
     records: dict[str, CandidateRunRecord] = dataclasses.field(default_factory=dict)
 
 
@@ -243,8 +245,9 @@ async def _process_one(candidate: VerificationCandidate, *, ctx: _RunContext) ->
         "stage5.candidate",
         inputs={"global_id": candidate.global_id},
     ) as run:
+        on_step = make_transcript_on_step(candidate.global_id) if ctx.live else None
         report: VerificationReport = await verify_candidate(
-            candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings
+            candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings, on_step=on_step
         )
         if ctx.settings.stage5_hitl_mode == "prompt" and _joern_only_budget_exhausted(
             report, ctx.settings
@@ -350,6 +353,7 @@ async def run_queue(
     only_global_ids: frozenset[str] | None = None,
     run_id: str | None = None,
     findings_dir: Path | None = None,
+    live: bool = False,
 ) -> VerificationRunSummary:
     """Stage 5's entry point: discovers Stage 3 candidates via
     `candidate_index.discover_candidates`, then verifies each through a
@@ -362,6 +366,10 @@ async def run_queue(
     3b's externally-sourced claims) instead. `None` (default) preserves
     the original Stage-3-only behavior exactly — see
     `candidate_index.discover_candidates`'s docstring.
+
+    `live` (default `False`) enables chain-of-thought console output —
+    `verify_candidate`'s `on_step` callback, previously only ever passed by
+    `fw-verify debug verify` — tagged `[gid]` per candidate.
 
     Raises `Stage5InputError` up front if the findings directory or Stage
     2's summary aren't usable — fail fast before spawning any worker,
@@ -397,7 +405,9 @@ async def run_queue(
         _write_summary(stage5_dir_, summary)
         return summary
 
-    ctx = _RunContext(settings=settings, db_subfolder=db_subfolder, stage5_dir=stage5_dir_)
+    ctx = _RunContext(
+        settings=settings, db_subfolder=db_subfolder, stage5_dir=stage5_dir_, live=live
+    )
     queue = CandidateQueue(
         maxsize=settings.stage5_queue_maxsize,
         workers=settings.stage5_workers,

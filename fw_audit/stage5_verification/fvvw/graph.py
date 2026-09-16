@@ -69,6 +69,9 @@ from fw_audit.stage5_verification.fvvw.static_track import (
     run_static_track,
 )
 from fw_audit.stage5_verification.fvvw.strategy import strategy_agent
+from fw_audit.stage5_verification.live_console import LiveConsole, make_transcript_on_step
+from fw_audit.stage5_verification.llm_logging import LoggingChatModel
+from fw_audit.stage5_verification.streaming import stream_graph_live
 from fw_audit.stage5_verification.tools.characterize_tool import characterize_target
 from fw_audit.stage5_verification.tools.crosscheck_tool import static_crosscheck
 from fw_audit.stage5_verification.tools.joern_tool import joern_executor
@@ -123,13 +126,13 @@ class FVVWDeps:
     this flag never needs its own branch anywhere but here."""
 
     settings: Settings
-    strategy_llm: BaseChatModel
-    static_generator_llm: BaseChatModel
-    static_evaluator_llm: BaseChatModel
-    report_llm: BaseChatModel
-    bringup_llm: BaseChatModel
-    trigger_llm: BaseChatModel
-    dynamic_evaluator_llm: BaseChatModel
+    strategy_llm: BaseChatModel | LoggingChatModel
+    static_generator_llm: BaseChatModel | LoggingChatModel
+    static_evaluator_llm: BaseChatModel | LoggingChatModel
+    report_llm: BaseChatModel | LoggingChatModel
+    bringup_llm: BaseChatModel | LoggingChatModel
+    trigger_llm: BaseChatModel | LoggingChatModel
+    dynamic_evaluator_llm: BaseChatModel | LoggingChatModel
     static_executor: Executor
     crosscheck_executor: Executor
     dynamic_session_executor: SandboxExecutor
@@ -141,7 +144,11 @@ class FVVWDeps:
 
 
 async def resolve_fvvw_deps(
-    *, db_subfolder: Path, candidate: VerificationCandidate, settings: Settings
+    *,
+    db_subfolder: Path,
+    candidate: VerificationCandidate,
+    settings: Settings,
+    live: bool = False,
 ) -> FVVWDeps:
     """Resolve every LLM role + executor the fork-join needs for one
     candidate, up front — mirrors `agent.verifier.verify_candidate`'s own
@@ -157,7 +164,20 @@ async def resolve_fvvw_deps(
     <static|dynamic>.jsonl`) and wraps `dynamic_session_executor` in a
     `LoggingSessionExecutor` so every dynamic-track command is captured
     centrally — see `cmdlog`'s module docstring for why this is composition
-    over the executor, never an edit to `SandboxExecutor` itself."""
+    over the executor, never an edit to `SandboxExecutor` itself.
+
+    Every one of the seven resolved LLMs is wrapped in `llm_logging.
+    LoggingChatModel` — full before/after-parser visibility (the exact
+    prompt sent, the raw response before any downstream parsing) for every
+    LLM call this candidate makes, with zero edits to any node/prompt file
+    (see that module's docstring). `live`, when `True`, attaches a
+    `LiveConsole` to both `CommandLog`s so every record (LLM call, tool
+    call, parsed action/decision, node update) is ALSO echoed to the
+    terminal, tagged `[gid]`, as it happens — `Settings.
+    stage5_command_log=False` no longer forces a fully silent
+    `CommandLog.disabled()` here, since a `--no-command-log --live` run
+    should still get console visibility even with nothing landing on disk
+    (see `cmdlog.CommandLog.record`'s docstring)."""
     try:
         strategy_llm = get_llm_for_agent(AgentRole.STAGE5_STRATEGY_AGENT, settings=settings)
         static_generator_llm = get_llm_for_agent(
@@ -180,32 +200,57 @@ async def resolve_fvvw_deps(
     fvvw_dir_ = layout.fvvw_dir(stage5_dir_)
     dynamic_workspace_dir = layout.fvvw_dynamic_workspace_dir(fvvw_dir_, candidate.global_id)
 
-    if settings.stage5_command_log:
-        static_command_log = CommandLog(
-            layout.fvvw_command_log_path(fvvw_dir_, candidate.global_id, "static"),
-            track="static",
-        )
-        dynamic_command_log = CommandLog(
-            layout.fvvw_command_log_path(fvvw_dir_, candidate.global_id, "dynamic"),
-            track="dynamic",
-        )
-    else:
-        static_command_log = CommandLog.disabled()
-        dynamic_command_log = CommandLog.disabled()
+    live_console = (
+        LiveConsole(truncate_chars=settings.stage5_live_console_truncate_chars) if live else None
+    )
+    static_path = (
+        layout.fvvw_command_log_path(fvvw_dir_, candidate.global_id, "static")
+        if settings.stage5_command_log
+        else None
+    )
+    dynamic_path = (
+        layout.fvvw_command_log_path(fvvw_dir_, candidate.global_id, "dynamic")
+        if settings.stage5_command_log
+        else None
+    )
+    static_command_log = CommandLog(
+        static_path, track="static", gid=candidate.global_id, live=live_console
+    )
+    dynamic_command_log = CommandLog(
+        dynamic_path, track="dynamic", gid=candidate.global_id, live=live_console
+    )
 
     dynamic_session_executor = LoggingSessionExecutor(
         verification_session_executor(settings), dynamic_command_log
     )
 
+    # strategy_agent/report_llm run once per candidate, upstream/downstream
+    # of the fork rather than belonging to either track — logged through
+    # static_command_log (an arbitrary but consistent choice) rather than
+    # adding a third "shared" JSONL file just for two roles.
     return FVVWDeps(
         settings=settings,
-        strategy_llm=strategy_llm,
-        static_generator_llm=static_generator_llm,
-        static_evaluator_llm=static_evaluator_llm,
-        report_llm=report_llm,
-        bringup_llm=bringup_llm,
-        trigger_llm=trigger_llm,
-        dynamic_evaluator_llm=dynamic_evaluator_llm,
+        strategy_llm=LoggingChatModel(
+            strategy_llm, role="strategy_agent", command_log=static_command_log
+        ),
+        static_generator_llm=LoggingChatModel(
+            static_generator_llm, role="generator", command_log=static_command_log
+        ),
+        static_evaluator_llm=LoggingChatModel(
+            static_evaluator_llm, role="evaluator", command_log=static_command_log
+        ),
+        report_llm=LoggingChatModel(
+            report_llm, role="report_writer", command_log=static_command_log
+        ),
+        bringup_llm=LoggingChatModel(
+            bringup_llm, role="bringup_agent", command_log=dynamic_command_log
+        ),
+        trigger_llm=LoggingChatModel(
+            trigger_llm, role="trigger_agent", command_log=dynamic_command_log
+        ),
+        dynamic_evaluator_llm=LoggingChatModel(
+            dynamic_evaluator_llm, role="dynamic_evaluate", command_log=dynamic_command_log
+        ),
         static_executor=joern_executor(settings),
         crosscheck_executor=verification_executor(settings),
         dynamic_session_executor=dynamic_session_executor,
@@ -224,6 +269,7 @@ async def run_dynamic_track_only(
     deps: FVVWDeps,
     settings_override: Settings | None = None,
     raw_recipe_override: str | None = None,
+    stop_after: str | None = None,
 ) -> tuple[TrackResult, list[dict], bool | None, str, dict]:
     """The dynamic track's full run: compiles and `ainvoke`s the 9-node
     agentic `StateGraph` (`fvvw.dynamic_graph.build_dynamic_graph` — spec
@@ -242,7 +288,11 @@ async def run_dynamic_track_only(
     `stage5_dynamic_max_iterations` without touching `deps` itself.
     `raw_recipe_override`, when given, is threaded onto the `BringupContext`
     so `instrument_trigger` runs it verbatim instead of the plan-derived
-    recipe — HITL's "inject" action.
+    recipe — HITL's "inject" action. `stop_after`, when given (one of the
+    graph's own node ids, e.g. `"bringup"`/`"health_gate"`), halts streaming
+    right after that node fires — `fw-verify debug dynamic --stop-after`'s
+    per-node diagnosis hook; `None` (every other caller, including
+    production) runs the graph to completion exactly as before.
 
     Returns `(TrackResult, guard_logs, dynamic_reached_sink, gdb_transcript,
     dynamic_extras)` — the extra values `joint_evaluate`/`fvvw.report`/the
@@ -285,6 +335,7 @@ async def run_dynamic_track_only(
         trigger_llm=deps.trigger_llm,
         dynamic_evaluator_llm=deps.dynamic_evaluator_llm,
         session_executor=deps.dynamic_session_executor,
+        command_log=deps.dynamic_command_log,
     )
 
     compiled = build_dynamic_graph(
@@ -301,13 +352,16 @@ async def run_dynamic_track_only(
     try:
         try:
             final_state = await asyncio.wait_for(
-                compiled.ainvoke(
+                stream_graph_live(
+                    compiled,
                     {},
                     config=run_config(
                         run_name="stage5.dynamic_track",
                         metadata={"global_id": candidate.global_id},
                         settings=settings,
                     ),
+                    command_log=deps.dynamic_command_log,
+                    stop_after=stop_after,
                 ),
                 timeout=settings.stage5_dynamic_wall_clock_seconds,
             )
@@ -339,6 +393,22 @@ async def run_dynamic_track_only(
                 f"stage5_dynamic_wall_clock_seconds="
                 f"{settings.stage5_dynamic_wall_clock_seconds}s wall-clock budget.",
                 "budget_exhausted": True,
+            },
+        )
+    elif result is None and stop_after is not None:
+        # A deliberate diagnostic cut-off (`debug dynamic --stop-after`),
+        # not a bug — the graph never reached a terminal route because we
+        # stopped consuming the stream right after `stop_after` fired.
+        # Everything else this function returns (guard_logs, gdb_transcript,
+        # dynamic_extras) still reflects whatever accumulated up to that
+        # node, which is the whole point of the diagnosis.
+        result = TrackResult(
+            verdict=VerificationVerdict.INCONCLUSIVE,
+            proved_hypothesis="none",
+            evidence={
+                "reason": f"stopped after node {stop_after!r} for diagnosis — "
+                "no terminal verdict was reached (or requested) this round.",
+                "stopped_after": stop_after,
             },
         )
     elif result is None:
@@ -540,6 +610,7 @@ async def run_fvvw(
     db_subfolder: Path,
     settings: Settings,
     hitl_prompter: Prompter = terminal_prompter,
+    live: bool = False,
 ) -> dict:
     """Run the complete fork-join workflow for one candidate: strategy ->
     fork(static, dynamic) -> join -> joint_evaluate -> (report composed
@@ -574,17 +645,23 @@ async def run_fvvw(
         )
 
     deps = await resolve_fvvw_deps(
-        db_subfolder=db_subfolder, candidate=candidate, settings=settings
+        db_subfolder=db_subfolder, candidate=candidate, settings=settings, live=live
     )
     deps.static_workspace_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(candidate.source_path, layout.source_path(deps.static_workspace_dir))
 
     target = await characterize_target(candidate)
     plan = await strategy_agent(
-        candidate, target, llm=deps.strategy_llm, settings=settings, system_prompt=None
+        candidate,
+        target,
+        llm=deps.strategy_llm,
+        settings=settings,
+        system_prompt=None,
+        command_log=deps.static_command_log,
     )
 
     # ---- fork: static + dynamic run concurrently -----------------------
+    on_step = make_transcript_on_step(candidate.global_id) if live else None
     static_task = asyncio.ensure_future(
         run_static_track(
             candidate,
@@ -596,6 +673,7 @@ async def run_fvvw(
             settings=settings,
             system_prompt=deps.system_prompt,
             command_log=deps.static_command_log,
+            on_step=on_step,
         )
     )
     crosscheck_task = asyncio.ensure_future(
@@ -750,10 +828,81 @@ async def run_fvvw(
     }
 
 
+async def run_dynamic_only(
+    candidate: VerificationCandidate,
+    *,
+    db_subfolder: Path,
+    settings: Settings,
+    live: bool = False,
+    stop_after: str | None = None,
+) -> dict:
+    """Production single-track entry point: `characterize -> strategy -> the
+    dynamic (QEMU+GDB) track alone` — no static track, no crosscheck, no
+    `joint_evaluate`. The dynamic-only counterpart to `--joern-only`'s
+    static-only `driver.run_queue`, for the case where only the dynamic
+    track's own verdict is wanted (or the static track's `source_path`
+    genuinely isn't available for this candidate).
+
+    Unlike `run_fvvw`, this does NOT require `candidate.source_path` to be
+    resolved — the dynamic track never reads it (only the static track's
+    CPG build does).
+
+    `agreement`/`mechanism_confidence`/`reachability_confidence` are
+    deliberately absent from the returned dict — those are two-track
+    reconciliation concepts `fvvw.joint.joint_evaluate` computes by
+    comparing static and dynamic results, and don't mean anything for one
+    track run alone (see `common.verification.DynamicOnlyReport`'s
+    docstring for why this gets its own report schema instead of a
+    `FVVWReport` with a placeholder `static_result`).
+
+    Returns `{"target", "plan", "dynamic_result", "guard_logs",
+    "dynamic_gdb_transcript", "arbitration_log", "observation",
+    "iteration_history", "emulation_mode", "deps"}` — persistence is
+    `fvvw.driver.run_dynamic_only_queue`'s job, mirroring `run_fvvw`'s own
+    "return a plain dict, let the driver persist" shape.
+    """
+    deps = await resolve_fvvw_deps(
+        db_subfolder=db_subfolder, candidate=candidate, settings=settings, live=live
+    )
+    target = await characterize_target(candidate)
+    plan = await strategy_agent(
+        candidate,
+        target,
+        llm=deps.strategy_llm,
+        settings=settings,
+        system_prompt=None,
+        command_log=deps.dynamic_command_log,
+    )
+
+    (
+        dynamic_result,
+        guard_logs,
+        _dynamic_reached_sink,
+        gdb_transcript,
+        dynamic_extras,
+    ) = await run_dynamic_track_only(
+        candidate, plan.dynamic_plan, target, deps=deps, stop_after=stop_after
+    )
+
+    return {
+        "target": target,
+        "plan": plan,
+        "dynamic_result": dynamic_result,
+        "guard_logs": guard_logs,
+        "dynamic_gdb_transcript": gdb_transcript,
+        "arbitration_log": dynamic_extras.get("arbitration_log"),
+        "observation": dynamic_extras.get("observation"),
+        "iteration_history": dynamic_extras.get("iteration_history") or [],
+        "emulation_mode": dynamic_extras.get("emulation_mode", ""),
+        "deps": deps,
+    }
+
+
 __all__ = [
     "FVVWDeps",
     "resolve_checkpointer",
     "resolve_fvvw_deps",
+    "run_dynamic_only",
     "run_dynamic_track_only",
     "run_fvvw",
 ]

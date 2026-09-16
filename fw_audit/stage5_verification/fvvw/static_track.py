@@ -17,6 +17,7 @@ reuse constraints" this commits to.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from langchain_core.language_models import BaseChatModel
@@ -27,6 +28,7 @@ from fw_audit.common.verification import (
     JoernScriptAttempt,
     StaticPlan,
     TrackResult,
+    TranscriptEntry,
     VerificationVerdict,
 )
 from fw_audit.config.settings import Settings
@@ -42,6 +44,31 @@ from fw_audit.stage5_verification.agent.prompts import render_finding_brief
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.cmdlog import CommandLog, JsonlRecordingList
 from fw_audit.stage5_verification.tools.joern_tool import run_joern_script_async
+
+OnStep = Callable[[list[TranscriptEntry]], None]
+"""Same shape as `agent.verifier.OnStep` — called once per graph step with
+only that step's newly-produced `TranscriptEntry` objects."""
+
+
+async def _stream_with_callback(
+    graph, initial_state: dict, on_step: OnStep, *, config: dict | None = None
+) -> dict:
+    """Local twin of `agent.verifier._stream_with_callback` — drives `graph`
+    via `astream(..., stream_mode="values")` instead of a single `ainvoke`,
+    calling `on_step` with each step's newly-appended transcript entries.
+    Duplicated rather than imported: `agent/verifier.py` is one of the
+    files this project's hard constraints keep untouched for FVVW feature
+    work (see this module's own docstring), and this is a ~10-line, purely
+    mechanical helper — not worth loosening that boundary for."""
+    seen = 0
+    state = initial_state
+    async for state in graph.astream(initial_state, config=config, stream_mode="values"):
+        step_entries = state.get("transcript", [])
+        new_entries = step_entries[seen:]
+        if new_entries:
+            on_step(new_entries)
+        seen = len(step_entries)
+    return state
 
 
 def render_static_brief(candidate: VerificationCandidate, plan: StaticPlan) -> str:
@@ -136,6 +163,7 @@ async def run_static_track(
     settings: Settings,
     system_prompt: str | None = None,
     command_log: CommandLog | None = None,
+    on_step: OnStep | None = None,
 ) -> TrackResult:
     """Run the EXISTING static verifier graph (`build_verifier_graph`,
     completely unmodified) against a strategy-enriched brief, and map its
@@ -160,6 +188,15 @@ async def run_static_track(
     logging with ZERO edits to `agent/graph.py` (see `cmdlog`'s module
     docstring). `None` (the default) behaves exactly as before — a plain
     list, no logging — so every existing caller is unaffected.
+
+    `on_step`, when given, is called after every graph node with that
+    step's newly-appended `TranscriptEntry` objects — the SAME live-view
+    contract `agent.verifier.verify_candidate`'s own `on_step` already
+    documents (this function mirrors that one's `_stream_with_callback`
+    approach locally rather than importing it, since `agent/verifier.py`
+    is one of the files this project's hard constraints keep untouched for
+    FVVW feature work). `None` (the default) behaves exactly as before — a
+    plain `graph.ainvoke`, no live callback.
     """
     brief = render_static_brief(candidate, plan)
 
@@ -208,7 +245,10 @@ async def run_static_track(
     # left at the library default — see the FVVW HITL plan's "Recursion-limit
     # trap" note.
     config["recursion_limit"] = 3 * settings.stage5_max_agent_iterations + 8
-    final_state = await graph.ainvoke(initial_state, config=config)
+    if on_step is None:
+        final_state = await graph.ainvoke(initial_state, config=config)
+    else:
+        final_state = await _stream_with_callback(graph, initial_state, on_step, config=config)
 
     verdict = final_state.get("verdict", VerificationVerdict.ERROR)
     evidence = {

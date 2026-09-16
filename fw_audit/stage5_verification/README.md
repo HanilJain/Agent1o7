@@ -14,6 +14,12 @@ anything, rather than reasoning over static text alone.
 (build/run/evaluate against Joern, nothing else) as the fork-join's
 static-track building block — reused unmodified by FVVW feature work, with
 one correctness exception (see "What changed from v1" below).
+`fw-verify run --dynamic-only` is the production counterpart for the
+dynamic (QEMU+GDB) track alone. `--live` (any mode; default on for every
+`debug` subcommand) prints chain-of-thought console output — every LLM
+call's raw prompt/response, every tool/sandbox command+result, every
+parsed agentic action/decision, every dynamic-graph node update — tagged
+`[gid]`, as it happens.
 
 ## What it does
 
@@ -72,17 +78,31 @@ one correctness exception (see "What changed from v1" below).
   it).
 - **`fvvw/graph.py`**: `run_fvvw()` wires it all together — characterize →
   strategy → fork the static and dynamic tracks (running concurrently) →
-  await both → `joint_evaluate`.
+  await both → `joint_evaluate`. `run_dynamic_only()` is the dynamic-only
+  counterpart (characterize → strategy → the dynamic track alone), backing
+  `--dynamic-only`. Every one of the seven LLM roles is wrapped in
+  `llm_logging.LoggingChatModel` for before/after-parser visibility, and
+  `run_dynamic_track_only()` streams the dynamic graph via
+  `streaming.stream_graph_live()` instead of a bare `ainvoke`, giving live
+  per-node output and an optional `stop_after` early-exit.
 - **`fvvw/report.py`**: `write_report()` — one LLM call composing the
   seven-layer disclosure document plus a reconciliation section, with every
   raw tool output (Joern script output, GDB transcript) quoted verbatim.
+  `static_result=None` (the dynamic-only path) composes a dynamic-track-only
+  disclosure instead, skipping the reconciliation section entirely.
 - **`fvvw/driver.py`**: `run_fvvw_queue()` — a bounded worker pool over
   candidates, persisting `FVVWReport` JSON + Markdown for each, entirely
-  separate from the original `driver.py`'s own queue.
+  separate from the original `driver.py`'s own queue. `run_dynamic_only_queue()`
+  is the `--dynamic-only` counterpart, persisting
+  `common.verification.DynamicOnlyReport` to its own `fvvw/dynamic_only/`
+  subtree.
 - **`cmdlog.py`**: `CommandLog` — per-track, append-only JSONL of every
   command either track executes plus its full result, always on by default
   (unlike LangSmith, not gated by `--trace`) so a failed run stays
-  diagnosable from disk alone.
+  diagnosable from disk alone. An optional `live` console (`live_console.py`)
+  echoes every record — LLM call, tool call, parsed action, node update —
+  to the terminal as it's written, even when the JSONL write itself is
+  disabled (`--no-command-log --live`).
 - **`fvvw/hitl.py`**: human-in-the-loop — when a track exhausts its own
   iteration/repair budget without a decisive verdict (or when NEITHER track
   proves anything even without exhausting its budget —
@@ -108,10 +128,19 @@ fw-verify run --db-subfolder data/db/<stem>
 # Original static-only pipeline
 fw-verify run --db-subfolder data/db/<stem> --joern-only --model ollama:qwen3:32b
 
-# Each track individually
+# Dynamic-track-only, persisted — the production counterpart to --joern-only
+fw-verify run --db-subfolder data/db/<stem> --dynamic-only
+
+# Chain-of-thought console output for a production run (default off)
+fw-verify run --db-subfolder data/db/<stem> --live
+
+# Each track individually — live console output defaults ON for every
+# debug subcommand (--no-live to quiet it)
 fw-verify debug build-cpg --db-subfolder data/db/<stem> --bin-id <bin_id>   # Joern, no LLM
 fw-verify debug verify --db-subfolder data/db/<stem> --gid "<gid>"          # Joern track only
 fw-verify debug dynamic --db-subfolder data/db/<stem> --gid "<gid>"        # QEMU+GDB track only
+fw-verify debug dynamic --db-subfolder data/db/<stem> --gid "<gid>" \
+    --stop-after health_gate                    # halt right after one node, for diagnosis
 fw-verify debug fvvw --db-subfolder data/db/<stem> --gid "<gid>" --output report.json  # both, dry run
 
 # Human-in-the-loop: pauses when a track exhausts its budget without a
@@ -156,19 +185,30 @@ ELF/rootfs/arch facts).
   `fvvw/logs/<gid>.dynamic.jsonl` — every command either track ran plus its
   full result, for when a candidate needs debugging beyond what the report
   quotes.
+- **Dynamic-only** (`--dynamic-only`), a THIRD, separate subtree:
+  `fvvw/dynamic_only/reports/<gid>.json` (`common.verification.
+  DynamicOnlyReport` — no `static_result`/`agreement`/confidence axes, since
+  there's no static track to reconcile against), `fvvw/dynamic_only/reports/
+  <gid>.md`, `fvvw_dynamic_only_summary.json`. Shares
+  `fvvw/dynamic_workspace/`/`fvvw/logs/<gid>.dynamic.jsonl` with the
+  fork-join.
 
-Neither path writes into an earlier stage's tree, and the two output
-subtrees never collide even against the same `db_subfolder`.
+None of the three paths writes into an earlier stage's tree, and no two
+output subtrees collide even against the same `db_subfolder`.
 
 ## Debugging
 
 Every control point is exposed independently: `fw-verify debug build-cpg`/
 `debug script` bypass the LLM entirely for the Joern mechanics;
 `fw-verify debug strategy` runs just the strategy agent; `fw-verify debug
-dynamic` runs ONLY the QEMU+GDB track; `fw-verify debug verify` runs the
-Joern track alone; `fw-verify debug fvvw` runs the complete fork-join as a
-dry run. See [CLAUDE.md](CLAUDE.md)'s Debugging section for the full
-command reference and common errors.
+dynamic` runs ONLY the QEMU+GDB track (`--stop-after NODE` halts right
+after one of its 7 nodes fires, for per-node diagnosis without running the
+rest); `fw-verify debug verify` runs the Joern track alone; `fw-verify
+debug fvvw` runs the complete fork-join as a dry run. `--live` (on by
+default for every `debug` subcommand) is a third, purely local visibility
+sink alongside LangSmith (`--trace`, cloud) and `cmdlog` (disk JSONL) — see
+[CLAUDE.md](CLAUDE.md)'s Debugging section for the full command reference
+and common errors.
 
 `--trace` additionally traces every LLM call and sandboxed tool call in
 LangSmith — one root run per candidate (`stage5.fvvw.candidate` or
@@ -184,16 +224,22 @@ touches stays untouched for the sake of adding fork-join capability, and
 it remains directly reachable via `--joern-only`. It has since gained a
 **positive-proof discipline fix** (CONFIRMED/REFUTED now requires the
 evaluator to have actually named which hypothesis it proved, not just
-printed a marker) — a correctness fix, not FVVW feature work, so it's the
-one exception; see [CLAUDE.md](CLAUDE.md)'s hard-constraints section for
-the exact rule and its rationale. Everything else described above is
-additive: a new `fvvw/` package (now including the dynamic track's own
-9-node agentic `StateGraph` — `fvvw/dynamic_graph.py`/`dynamic_agents.py`/
+printed a marker) — a correctness fix, not FVVW feature work. A SECOND,
+narrowly-scoped exception: `agent/verifier.py` wraps its two LLMs in
+`llm_logging.LoggingChatModel` for chain-of-thought visibility, and
+`driver.py` starts exercising `verify_candidate`'s own pre-existing
+`on_step` parameter — both purely additive, composition-based, and never
+touching `agent/graph.py`/`agent/prompts.py`'s actual loop logic. See
+[CLAUDE.md](CLAUDE.md)'s hard-constraints section for both exceptions'
+exact rules and rationale. Everything else described above is additive: a
+new `fvvw/` package (now including the dynamic track's own 9-node agentic
+`StateGraph` — `fvvw/dynamic_graph.py`/`dynamic_agents.py`/
 `dynamic_prompts.py`), new `tools/characterize_tool.py`/`crosscheck_tool.py`/
 `qemu_gdb_tool.py`/`verification_sandbox.py`, a session capability added
-alongside (never replacing) `SandboxExecutor`'s one-shot `run()`, and a
-second Docker image (`docker/Dockerfile.verification`) kept separate from
-`docker/Dockerfile.joern`.
+alongside (never replacing) `SandboxExecutor`'s one-shot `run()`, a second
+Docker image (`docker/Dockerfile.verification`) kept separate from
+`docker/Dockerfile.joern`, and the chain-of-thought/live-console layer
+(`live_console.py`/`llm_logging.py`/`streaming.py`).
 
 ## Explicitly deferred (not designed away)
 

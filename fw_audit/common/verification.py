@@ -812,3 +812,42 @@ class FVVWReport(BaseModel):
     started_at: datetime
     finished_at: datetime | None = None
     trace_url: str | None = None
+
+
+class DynamicOnlyReport(BaseModel):
+    """The dynamic-only production run's on-disk artifact:
+    `stage5/fvvw/dynamic_only/reports/<gid>.json` — `fw-verify run
+    --dynamic-only`'s persisted output (`fvvw.driver.run_dynamic_only_queue`).
+
+    Deliberately NOT `FVVWReport` with a placeholder `static_result` —
+    `Agreement`/`MechanismConfidence`/`ReachabilityConfidence` are two-track
+    RECONCILIATION concepts `fvvw.joint.joint_evaluate` computes by comparing
+    static and dynamic results; they don't mean anything for one track run
+    alone, and inventing a placeholder `static_result` just to satisfy
+    `FVVWReport`'s schema would misrepresent a track that never ran as one
+    that did. This model carries only what a single dynamic-track run
+    actually produces — the same fields `common.verification.TrackResult`
+    plus the dynamic track's own Node 9 contents (`FVVWReport`'s own fields
+    of the same names carry the identical meaning)."""
+
+    schema_version: int = 1
+    global_id: str
+    bin_id: str
+    target: TargetMeta
+    dynamic_plan: DynamicPlan
+    dynamic_result: TrackResult
+    guard_logs: list[dict] = Field(default_factory=list)
+    dynamic_gdb_transcript: str = ""
+    arbitration_log: ArbitrationLog = Field(default_factory=ArbitrationLog)
+    observation: ObservationRecord = Field(default_factory=ObservationRecord)
+    iteration_history: list[RouteDecision] = Field(default_factory=list)
+    emulation_mode: str = ""
+    report_markdown: str = ""
+    """`fvvw.report.write_report(..., static_result=None)`'s composed
+    dynamic-track-only disclosure — no reconciliation section, since there
+    is nothing to reconcile against."""
+    command_log_path: str = ""
+    """Where the dynamic track's `cmdlog.CommandLog` JSONL landed for this
+    run — empty when `Settings.stage5_command_log` was `False`."""
+    started_at: datetime
+    finished_at: datetime | None = None

@@ -32,6 +32,7 @@ from fw_audit.common.verification import (
 from fw_audit.config.llm_config import AgentRole, get_llm_for_agent
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
+from fw_audit.stage5_verification.cmdlog import CommandLog
 from fw_audit.stage5_verification.debug import find_candidate
 from fw_audit.stage5_verification.errors import (
     Stage5InputError,
@@ -44,6 +45,8 @@ from fw_audit.stage5_verification.fvvw.graph import (
 )
 from fw_audit.stage5_verification.fvvw.report import write_report
 from fw_audit.stage5_verification.fvvw.strategy import strategy_agent
+from fw_audit.stage5_verification.live_console import LiveConsole
+from fw_audit.stage5_verification.llm_logging import LoggingChatModel
 from fw_audit.stage5_verification.tools.characterize_tool import characterize_target
 
 
@@ -59,11 +62,18 @@ async def debug_strategy(
     global_id: str,
     *,
     settings: Settings | None = None,
+    live: bool = True,
 ) -> DebugStrategyResult:
     """Runs `characterize_target` + `strategy_agent` for ONE finding —
     emits the `StrategyPlan` only, without running either track. Useful
     for iterating on/inspecting the strategy prompt independent of the
-    (much more expensive) tracks it feeds."""
+    (much more expensive) tracks it feeds.
+
+    `live` (default `True`, matching `debug verify`'s existing default)
+    attaches a console-only `LiveConsole` (no JSONL persisted — this debug
+    command has no track/`db_subfolder` output directory of its own) so the
+    raw prompt/response and the parsed `StrategyPlan`/any parse failures
+    print as they happen."""
     settings = settings or get_settings()
     candidate = find_candidate(db_subfolder, global_id)
     try:
@@ -71,8 +81,16 @@ async def debug_strategy(
     except (ImportError, ValueError) as exc:
         raise VerifierModelUnavailableError(str(exc)) from exc
 
+    live_console = (
+        LiveConsole(truncate_chars=settings.stage5_live_console_truncate_chars) if live else None
+    )
+    command_log = CommandLog(None, track="strategy", gid=global_id, live=live_console)
+    wrapped_llm = LoggingChatModel(strategy_llm, role="strategy_agent", command_log=command_log)
+
     target = await characterize_target(candidate)
-    plan = await strategy_agent(candidate, target, llm=strategy_llm, settings=settings)
+    plan = await strategy_agent(
+        candidate, target, llm=wrapped_llm, settings=settings, command_log=command_log
+    )
     return DebugStrategyResult(candidate=candidate, target=target, plan=plan)
 
 
@@ -101,6 +119,8 @@ async def debug_dynamic(
     global_id: str,
     *,
     settings: Settings | None = None,
+    live: bool = True,
+    stop_after: str | None = None,
 ) -> DebugDynamicResult:
     """Runs ONLY the dynamic (QEMU+GDB) track for one finding —
     characterize -> strategy (needed to get a `DynamicPlan`) ->
@@ -109,18 +129,32 @@ async def debug_dynamic(
     report. This is the per-track debug entry point the user explicitly
     asked for, mirroring `stage5_verification.debug.debug_build_cpg`/
     `debug_run_script`'s Joern-only equivalent.
+
+    `live` (default `True`, matching `debug verify`'s existing default)
+    prints every LLM call, tool call, and dynamic-graph node update as it
+    happens. `stop_after`, when given (one of the dynamic graph's own node
+    ids — `plan_emulation`/`bringup`/`health_gate`/`gdb_attach`/`trigger`/
+    `evaluate_route`/`plan_emulation_escalate`), halts the run right after
+    that node fires — per-node diagnosis without running the rest of the
+    track (see `fvvw.graph.run_dynamic_track_only`'s docstring).
     """
     settings = settings or get_settings()
     candidate = find_candidate(db_subfolder, global_id)
 
     deps = await resolve_fvvw_deps(
-        db_subfolder=db_subfolder, candidate=candidate, settings=settings
+        db_subfolder=db_subfolder, candidate=candidate, settings=settings, live=live
     )
     target = await characterize_target(candidate)
-    plan = await strategy_agent(candidate, target, llm=deps.strategy_llm, settings=settings)
+    plan = await strategy_agent(
+        candidate,
+        target,
+        llm=deps.strategy_llm,
+        settings=settings,
+        command_log=deps.dynamic_command_log,
+    )
 
     result, guard_logs, _reached, transcript, dynamic_extras = await run_dynamic_track_only(
-        candidate, plan.dynamic_plan, target, deps=deps
+        candidate, plan.dynamic_plan, target, deps=deps, stop_after=stop_after
     )
     return DebugDynamicResult(
         candidate=candidate,
@@ -140,12 +174,17 @@ async def debug_fvvw(
     global_id: str,
     *,
     settings: Settings | None = None,
+    live: bool = True,
 ) -> dict:
     """Runs the COMPLETE fork-join (both tracks, joint_evaluate, and
     write_report) for one finding — a dry run: everything `fw-verify run`
     would do, without persisting to `stage5/fvvw/reports/`. Returns the
     same outcome dict `fvvw.graph.run_fvvw` does, plus a `report_markdown`
-    key with the composed disclosure report."""
+    key with the composed disclosure report.
+
+    `live` (default `True`, matching `debug verify`'s existing default)
+    prints every LLM call/tool call/parsed result/dynamic-graph node update
+    from both tracks as they happen, tagged `[gid]`."""
     settings = settings or get_settings()
     candidate = find_candidate(db_subfolder, global_id)
     if candidate.source_path is None:
@@ -154,7 +193,7 @@ async def debug_fvvw(
             "— the static track cannot build a CPG."
         )
 
-    outcome = await run_fvvw(candidate, db_subfolder=db_subfolder, settings=settings)
+    outcome = await run_fvvw(candidate, db_subfolder=db_subfolder, settings=settings, live=live)
     deps = outcome["deps"]
     report_markdown = await write_report(
         candidate=candidate,

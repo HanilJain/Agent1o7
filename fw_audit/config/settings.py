@@ -715,6 +715,26 @@ class Settings(BaseSettings):
     whole point is a diagnosable run with no `--trace`/LangSmith account.
     Set `False` only to suppress the extra disk writes (e.g. a constrained
     CI runner); it never affects a verdict either way."""
+    stage5_live_console: bool = Field(
+        default=False, validation_alias="FWA_STAGE5_LIVE_CONSOLE"
+    )
+    """Master switch for `stage5_verification.live_console.LiveConsole` —
+    live, `[gid]`-tagged chain-of-thought console output (every LLM call's
+    raw prompt/response, every tool/sandbox call, every parsed agentic
+    action/decision, every dynamic-graph node update) for `fw-verify run`.
+    Default `False`: production stays quiet unless `--live` is passed
+    per-invocation (`runner.py`'s `_cmd_run`). Debug subcommands
+    (`debug verify`/`debug strategy`/`debug dynamic`/`debug fvvw`) default
+    to live output regardless of this setting, matching `debug verify`'s
+    long-standing default-on/`--no-live` precedent — this setting only
+    governs `run`'s default."""
+    stage5_live_console_truncate_chars: int = Field(
+        default=3000, ge=100, validation_alias="FWA_STAGE5_LIVE_CONSOLE_TRUNCATE"
+    )
+    """Console-only truncation length for `LiveConsole.echo` — the
+    persisted `cmdlog` JSONL (when `stage5_command_log` is on) never
+    truncates regardless of this value; this only keeps a human-watched
+    terminal readable."""
     stage5_allow_real_payloads: bool = Field(
         default=True, validation_alias="FWA_STAGE5_ALLOW_REAL_PAYLOADS"
     )

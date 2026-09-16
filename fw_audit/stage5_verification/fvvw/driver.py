@@ -24,7 +24,14 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fw_audit.common.verification import CandidateRunRecord, FVVWReport, VerificationRunSummary
+from fw_audit.common.verification import (
+    ArbitrationLog,
+    CandidateRunRecord,
+    DynamicOnlyReport,
+    FVVWReport,
+    ObservationRecord,
+    VerificationRunSummary,
+)
 from fw_audit.config.settings import Settings, get_settings
 from fw_audit.observability import span, trace_context
 from fw_audit.stage5_verification import layout
@@ -38,7 +45,7 @@ from fw_audit.stage5_verification.errors import (
     Stage5InputError,
     VerifierModelUnavailableError,
 )
-from fw_audit.stage5_verification.fvvw.graph import run_fvvw
+from fw_audit.stage5_verification.fvvw.graph import run_dynamic_only, run_fvvw
 from fw_audit.stage5_verification.fvvw.report import write_report
 
 logger = logging.getLogger("fw_audit.stage5_verification.fvvw")
@@ -114,6 +121,7 @@ class _FVVWRunContext:
     settings: Settings
     db_subfolder: Path
     stage5_dir: Path
+    live: bool = False
     records: dict[str, CandidateRunRecord] = dataclasses.field(default_factory=dict)
 
 
@@ -134,7 +142,7 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
         inputs={"global_id": candidate.global_id},
     ) as run:
         outcome = await run_fvvw(
-            candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings
+            candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings, live=ctx.live
         )
         deps = outcome["deps"]
         report_markdown = await write_report(
@@ -293,6 +301,7 @@ async def run_fvvw_queue(
     only_global_ids: frozenset[str] | None = None,
     run_id: str | None = None,
     findings_dir: Path | None = None,
+    live: bool = False,
 ) -> VerificationRunSummary:
     """The fork-join's entry point — same discovery/candidate-filtering
     contract as `stage5_verification.driver.run_queue`, but drives
@@ -306,6 +315,12 @@ async def run_fvvw_queue(
     `<db_subfolder>/stage3/findings` location — see `stage5_verification.
     driver.run_queue`'s docstring for the `--claims` rationale, identical
     here.
+
+    `live` (default `False` — production stays quiet unless `--live` is
+    passed) enables chain-of-thought console output for every candidate
+    this worker pool processes, tagged `[gid]` so concurrent
+    `stage5_workers` stay attributable (see `live_console.LiveConsole`) —
+    no forcing `stage5_workers=1`, unlike HITL's blocking prompt.
     """
     settings = settings or get_settings()
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -337,7 +352,9 @@ async def run_fvvw_queue(
         _write_summary(stage5_dir_, summary)
         return summary
 
-    ctx = _FVVWRunContext(settings=settings, db_subfolder=db_subfolder, stage5_dir=stage5_dir_)
+    ctx = _FVVWRunContext(
+        settings=settings, db_subfolder=db_subfolder, stage5_dir=stage5_dir_, live=live
+    )
     queue = FVVWCandidateQueue(
         maxsize=settings.stage5_queue_maxsize,
         workers=settings.stage5_workers,
@@ -397,4 +414,241 @@ def _write_summary(stage5_dir_: Path, summary: VerificationRunSummary) -> None:
         pass
 
 
-__all__ = ["FVVWCandidateQueue", "run_fvvw_queue"]
+# --------------------------------------------------------------------- #
+# `fw-verify run --dynamic-only` — the dynamic (QEMU+GDB) track alone,
+# persisted to the SEPARATE `stage5/fvvw/dynamic_only/` subtree (see
+# `layout.py`). Mirrors `_process_one_fvvw`/`_worker`/`run_fvvw_queue`
+# above closely (same `FVVWCandidateQueue`/`_FVVWRunContext`, same
+# trace_context/span nesting) but drives `fvvw.graph.run_dynamic_only`
+# instead of `run_fvvw` and skips everything two-track-reconciliation
+# related (`joint_evaluate`, `agreement`, `crosscheck`) — duplicated rather
+# than parameterized, following this module's own precedent of NOT sharing
+# code with `stage5_verification.driver` even though the shapes are close.
+# --------------------------------------------------------------------- #
+
+
+async def _process_one_dynamic_only(
+    candidate: VerificationCandidate, *, ctx: _FVVWRunContext
+) -> None:
+    """Run the dynamic track alone for one candidate, compose + persist a
+    `DynamicOnlyReport`, update the run-level bookkeeping record."""
+    started_at = datetime.now(UTC)
+    with trace_context(
+        stage="5",
+        global_id=candidate.global_id,
+        chunk_id=candidate.chunk_id,
+        bin_id=candidate.bin_id,
+    ), span(
+        "stage5.fvvw.dynamic_only_candidate",
+        inputs={"global_id": candidate.global_id},
+    ) as run:
+        outcome = await run_dynamic_only(
+            candidate, db_subfolder=ctx.db_subfolder, settings=ctx.settings, live=ctx.live
+        )
+        deps = outcome["deps"]
+        report_markdown = await write_report(
+            candidate=candidate,
+            finding=candidate.finding,
+            dynamic_result=outcome["dynamic_result"],
+            dynamic_gdb_transcript=outcome["dynamic_gdb_transcript"],
+            llm=deps.report_llm,
+            settings=ctx.settings,
+        )
+        if run is not None:
+            run.end(outputs={"verdict": outcome["dynamic_result"].verdict.value})
+
+    report = DynamicOnlyReport(
+        global_id=candidate.global_id,
+        bin_id=candidate.bin_id,
+        target=outcome["target"],
+        dynamic_plan=outcome["plan"].dynamic_plan,
+        dynamic_result=outcome["dynamic_result"],
+        guard_logs=outcome["guard_logs"],
+        dynamic_gdb_transcript=outcome["dynamic_gdb_transcript"],
+        arbitration_log=outcome.get("arbitration_log") or ArbitrationLog(),
+        observation=outcome.get("observation") or ObservationRecord(),
+        iteration_history=outcome.get("iteration_history") or [],
+        emulation_mode=outcome.get("emulation_mode", ""),
+        report_markdown=report_markdown,
+        command_log_path=str(deps.dynamic_command_log.path or ""),
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+    )
+
+    fvvw_dir_ = layout.fvvw_dir(ctx.stage5_dir)
+    reports_dir_ = layout.fvvw_dynamic_only_reports_dir(fvvw_dir_)
+    _write_json(
+        reports_dir_ / layout.fvvw_dynamic_only_report_json_filename(candidate.global_id),
+        report.model_dump_json(indent=2),
+    )
+    _write_text(
+        reports_dir_ / layout.fvvw_dynamic_only_report_markdown_filename(candidate.global_id),
+        report_markdown,
+    )
+
+    if not ctx.settings.stage5_keep_workspace:
+        shutil.rmtree(deps.dynamic_workspace_dir, ignore_errors=True)
+
+    ctx.records[candidate.global_id] = CandidateRunRecord(
+        global_id=candidate.global_id,
+        chunk_id=candidate.chunk_id,
+        bin_id=candidate.bin_id,
+        status="verified",
+        attempts=1,
+        verdict=outcome["dynamic_result"].verdict.value,
+    )
+
+
+async def _worker_dynamic_only(queue: FVVWCandidateQueue, ctx: _FVVWRunContext) -> None:
+    async for item in queue:
+        try:
+            await _process_one_dynamic_only(item.candidate, ctx=ctx)
+        except (Stage5InputError, SandboxUnavailableError, VerifierModelUnavailableError) as exc:
+            logger.warning(
+                "dynamic-only candidate %s failed (attempt %d): %s",
+                item.candidate.global_id,
+                item.attempt + 1,
+                exc,
+            )
+            ctx.records[item.candidate.global_id] = CandidateRunRecord(
+                global_id=item.candidate.global_id,
+                chunk_id=item.candidate.chunk_id,
+                bin_id=item.candidate.bin_id,
+                status="failed",
+                attempts=item.attempt + 1,
+                error=str(exc),
+            )
+            await queue.nack(item)
+        except Exception as exc:  # noqa: BLE001 - unknown per-item failures must not crash the pool
+            logger.warning(
+                "dynamic-only candidate %s failed (attempt %d): %s",
+                item.candidate.global_id,
+                item.attempt + 1,
+                exc,
+            )
+            ctx.records[item.candidate.global_id] = CandidateRunRecord(
+                global_id=item.candidate.global_id,
+                chunk_id=item.candidate.chunk_id,
+                bin_id=item.candidate.bin_id,
+                status="failed",
+                attempts=item.attempt + 1,
+                error=str(exc),
+            )
+            await queue.nack(item)
+        except BaseException:
+            queue.abandon(item)
+            raise
+        else:
+            queue.ack(item)
+
+
+async def run_dynamic_only_queue(
+    *,
+    db_subfolder: Path,
+    settings: Settings | None = None,
+    decisions: frozenset = DEFAULT_DECISIONS,
+    only_global_ids: frozenset[str] | None = None,
+    run_id: str | None = None,
+    findings_dir: Path | None = None,
+    live: bool = False,
+) -> VerificationRunSummary:
+    """`fw-verify run --dynamic-only`'s entry point — the dynamic
+    (QEMU+GDB) track alone, persisted, with no static track, crosscheck, or
+    joint_evaluate. Same discovery/candidate-filtering/worker-pool
+    machinery as `run_fvvw_queue`, writing to the SEPARATE
+    `stage5/fvvw/dynamic_only/` subtree instead of `stage5/fvvw/reports/`.
+
+    Unlike `run_fvvw_queue`/`stage5_verification.driver.run_queue`,
+    candidates are NOT required to have a resolved `source_path` — the
+    dynamic track never reads it (only the static track's CPG build does).
+    """
+    settings = settings or get_settings()
+    run_id = run_id or uuid.uuid4().hex[:12]
+    started_at = datetime.now(UTC)
+
+    target_findings_dir = (
+        findings_dir if findings_dir is not None else db_subfolder / "stage3" / "findings"
+    )
+    if not target_findings_dir.is_dir():
+        raise Stage5InputError(
+            f"No findings directory at {target_findings_dir} — run `fw-analyze ... --queue` "
+            "then `fw-analyze ... --analyze --chunks-file <stage3/chunk_index.json>` "
+            "(or `fw-claims ingest ...` for --claims) first."
+        )
+
+    candidates = discover_candidates(db_subfolder, decisions=decisions, findings_dir=findings_dir)
+    if only_global_ids is not None:
+        candidates = [c for c in candidates if c.global_id in only_global_ids]
+
+    stage5_dir_ = layout.stage5_dir(db_subfolder)
+    if not candidates:
+        summary = VerificationRunSummary(
+            run_id=run_id,
+            status="no_targets",
+            db_subfolder=str(db_subfolder),
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+        )
+        _write_dynamic_only_summary(stage5_dir_, summary)
+        return summary
+
+    ctx = _FVVWRunContext(
+        settings=settings, db_subfolder=db_subfolder, stage5_dir=stage5_dir_, live=live
+    )
+    queue = FVVWCandidateQueue(
+        maxsize=settings.stage5_queue_maxsize,
+        workers=settings.stage5_workers,
+        max_attempts=settings.stage5_queue_max_attempts,
+    )
+
+    async def _produce() -> None:
+        try:
+            for candidate in candidates:
+                await queue.put(candidate)
+        finally:
+            await queue.close()
+
+    with trace_context(stage="5", run_id=run_id):
+        producer_task = asyncio.create_task(_produce())
+        worker_tasks = [
+            asyncio.create_task(_worker_dynamic_only(queue, ctx))
+            for _ in range(settings.stage5_workers)
+        ]
+        await producer_task
+        await asyncio.gather(*worker_tasks)
+
+    finished_at = datetime.now(UTC)
+    records = list(ctx.records.values())
+    verdicts_by_type: dict[str, int] = {}
+    for r in records:
+        if r.verdict:
+            verdicts_by_type[r.verdict] = verdicts_by_type.get(r.verdict, 0) + 1
+
+    summary = VerificationRunSummary(
+        run_id=run_id,
+        status="completed",
+        db_subfolder=str(db_subfolder),
+        model=_model_label(settings.stage5_verifier_model),
+        candidates=records,
+        total_candidates=len(records),
+        total_verified=sum(1 for r in records if r.status == "verified"),
+        total_failed=sum(1 for r in records if r.status == "failed"),
+        verdicts_by_type=verdicts_by_type,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+    _write_dynamic_only_summary(stage5_dir_, summary)
+    return summary
+
+
+def _write_dynamic_only_summary(stage5_dir_: Path, summary: VerificationRunSummary) -> None:
+    try:
+        stage5_dir_.mkdir(parents=True, exist_ok=True)
+        layout.fvvw_dynamic_only_summary_path(stage5_dir_).write_text(
+            summary.model_dump_json(indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+__all__ = ["FVVWCandidateQueue", "run_dynamic_only_queue", "run_fvvw_queue"]
