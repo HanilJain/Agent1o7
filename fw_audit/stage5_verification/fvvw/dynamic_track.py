@@ -47,6 +47,7 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     CONTAINER_WORKDIR,
     build_gdb_batch_command,
     build_qemu_user_launch_command,
+    lint_gdb_recipe,
     render_crash_capture_commands,
     render_crash_report_commands,
     render_gdb_recipe,
@@ -827,6 +828,68 @@ class DynamicFault(RuntimeError):
     setting `mem.repair.return_to` to the node that raised."""
 
 
+def _render_all_guard_commands(
+    guards, *, global_id: str, register: str, marker_prefix: str = "GUARD"
+) -> list[str]:
+    """Shared body for the two places a dynamic-track node must re-force
+    every guard in `ctx.plan.guards` into one flat GDB command list —
+    `satisfy_guards`'s own pass and `instrument_trigger`'s re-forcing pass
+    (a fresh QEMU run per node means guards don't carry over; see
+    `instrument_trigger`'s comment on why it re-derives them). Kept as one
+    function rather than two copies of the same loop so the "empty addr /
+    empty forced_value / invalid forced_value" handling
+    `render_guard_breakpoint_commands` does only has to be gotten right
+    once. A `ValueError` from an invalid `forced_value` (the
+    defense-in-depth check `render_guard_breakpoint_commands` runs even
+    though `GuardSpec`'s own pydantic validator should already have
+    caught it upstream) is translated into `DynamicFault` here, same as
+    `_build_and_lint_recipe` does for the recipe-assembly layer."""
+    commands: list[str] = []
+    try:
+        for guard in guards:
+            commands += render_guard_breakpoint_commands(
+                addr=guard.addr,
+                register=register,
+                forced_value=guard.forced_value,
+                log_marker=f"{marker_prefix}:{guard.name}",
+            )
+    except ValueError as exc:
+        raise DynamicFault(f"{global_id}: invalid guard forced_value: {exc}") from exc
+    return commands
+
+
+def _build_and_lint_recipe(
+    *,
+    global_id: str,
+    architecture: str,
+    gdb_port: int,
+    entry_addr: str,
+    breakpoint_commands: list[str],
+) -> str:
+    """The ONE place `render_gdb_recipe` is called from this module —
+    every dynamic-track node routes through here rather than calling
+    `render_gdb_recipe` directly, so the two safety nets
+    (`render_gdb_recipe`'s own empty-entry_addr/invalid-forced_value
+    `ValueError`s, and `lint_gdb_recipe`'s whole-script pre-flight check)
+    are both guaranteed to run before ANY recipe this module builds is
+    ever written to disk and handed to `gdb-multiarch -batch -x` — and so
+    a caught `ValueError` from either layer is translated into the
+    `DynamicFault` each node's docstring already documents raising on a
+    "GDB batch call itself errors" condition, rather than an uncaught
+    `ValueError` breaking that contract."""
+    try:
+        recipe = render_gdb_recipe(
+            architecture=architecture,
+            gdb_port=gdb_port,
+            entry_addr=entry_addr,
+            breakpoint_commands=breakpoint_commands,
+        )
+        lint_gdb_recipe(recipe)
+    except ValueError as exc:
+        raise DynamicFault(f"{global_id}: invalid GDB recipe, refusing to run it: {exc}") from exc
+    return recipe
+
+
 async def reach_target(ctx: BringupContext, *, gdb_transcript_so_far: str = "") -> tuple[str, bool]:
     """Drive the target to a stable, fully-relocated process state at the
     functional entry point. `natural_drive`: argv/env already supplied at
@@ -844,8 +907,12 @@ async def reach_target(ctx: BringupContext, *, gdb_transcript_so_far: str = "") 
     """
     arch, _ = ctx.emulation_plan.get("arch_spec_key", ("unknown", ""))
     entry_addr = ctx.plan.entry_addr or ctx.target.func_offset
-    recipe = render_gdb_recipe(
-        architecture=arch, gdb_port=1234, entry_addr=entry_addr, breakpoint_commands=[]
+    recipe = _build_and_lint_recipe(
+        global_id=ctx.candidate.global_id,
+        architecture=arch,
+        gdb_port=1234,
+        entry_addr=entry_addr,
+        breakpoint_commands=[],
     )
     recipe_path = f"{CONTAINER_SCRATCH}/recipe_reach.gdb"
     target_relpath = _target_relpath_in_workspace(ctx.candidate)
@@ -908,17 +975,12 @@ async def satisfy_guards(
     arch_spec = resolve_qemu_arch_spec(*ctx.emulation_plan.get("arch_spec_key", ("unknown", "")))
     register = arch_spec.arg_registers[0] if arch_spec else "$r0"
 
-    breakpoint_commands: list[str] = []
-    for guard in ctx.plan.guards:
-        marker = f"GUARD:{guard.name}"
-        breakpoint_commands += render_guard_breakpoint_commands(
-            addr=guard.addr,
-            register=register,
-            forced_value=guard.forced_value,
-            log_marker=marker,
-        )
+    breakpoint_commands = _render_all_guard_commands(
+        ctx.plan.guards, global_id=ctx.candidate.global_id, register=register
+    )
 
-    recipe = render_gdb_recipe(
+    recipe = _build_and_lint_recipe(
+        global_id=ctx.candidate.global_id,
         architecture=arch,
         gdb_port=1234,
         entry_addr=ctx.plan.entry_addr or ctx.target.func_offset,
@@ -1075,14 +1137,9 @@ async def instrument_trigger(
     # recipe must re-force them itself BEFORE the sink breakpoint, or the
     # real (blocking) guard return would stop the path from ever reaching
     # the sink and the capture would spuriously report "sink not reached".
-    guard_commands: list[str] = []
-    for guard in ctx.plan.guards:
-        guard_commands += render_guard_breakpoint_commands(
-            addr=guard.addr,
-            register=register,
-            forced_value=guard.forced_value,
-            log_marker=f"GUARD:{guard.name}",
-        )
+    guard_commands = _render_all_guard_commands(
+        ctx.plan.guards, global_id=ctx.candidate.global_id, register=register
+    )
     crash_marker = "CRASH"
     sink_addr = ctx.plan.sink_addr or ctx.target.func_offset
     trigger_commands = render_trigger_breakpoint_commands(
@@ -1106,7 +1163,8 @@ async def instrument_trigger(
         + [render_memory_dump_command(address=memory_watch_addr)]
         + render_crash_report_commands(marker=crash_marker)
     )
-    recipe = render_gdb_recipe(
+    recipe = _build_and_lint_recipe(
+        global_id=ctx.candidate.global_id,
         architecture=arch,
         gdb_port=1234,
         entry_addr=ctx.plan.entry_addr or ctx.target.func_offset,
@@ -1827,7 +1885,8 @@ async def direct_call_trigger(
     breakpoint_commands = render_direct_call_recipe_body(
         target_function_addr=target_addr, call_expression=call_expression
     ) + [f'printf "{marker}:done\\n"']
-    recipe = render_gdb_recipe(
+    recipe = _build_and_lint_recipe(
+        global_id=ctx.candidate.global_id,
         architecture=arch,
         gdb_port=1234,
         entry_addr=target_addr,

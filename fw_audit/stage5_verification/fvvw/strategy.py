@@ -93,8 +93,17 @@ is statically resolvable per the supplied target facts, else \
 target facts — func_offset is the target function's own validated address; \
 leave sink_addr empty if it cannot be inferred), guards (translate the \
 finding's security_condition/data_flow PROSE into a structured list of \
-{name, addr, forced_value} — addr may be empty if unresolved, but name and \
-forced_value must always be filled from the prose), argv_template, \
+{name, addr, forced_value, rationale} — addr may be empty if unresolved, \
+name and rationale must always be filled from the prose, but forced_value \
+is a DIFFERENT kind of field: it is machine-interpolated into a literal \
+GDB "set $reg = <forced_value>" statement, so it MUST be either an integer \
+literal (e.g. "1", "0x10"), a register name (e.g. "$a0"), a bare symbol, \
+or the empty string — NEVER a sentence or explanation. Put the prose \
+justification (e.g. "no escaping applied before sprintf", "no sanitizer \
+found on this path") in rationale instead, and if the guard has no real \
+value to force — you are only documenting an absence, not driving \
+execution past a check — leave forced_value empty; the guard will be \
+logged/observed but not forced), argv_template, \
 trigger_shape (roughly how the trigger should reach the sink: \
 "network_http" for an HTTP/CGI/UPnP/SOAP endpoint, "cli_argv" for a \
 CLI-argument-facing binary, or "direct_call" only if the finding's own \
@@ -158,7 +167,8 @@ Return ONLY a single JSON object (no markdown fences, no commentary, no \
 "crosscheck_required": true, "decisive_observable": "..."}, \
 "dynamic_plan": {"reach_strategy": "...", "entry_addr": "...", \
 "target_addr": "...", "sink_addr": "...", "guards": [{"name": "...", \
-"addr": "...", "forced_value": "..."}], "argv_template": [...], \
+"addr": "...", "forced_value": "...", "rationale": "..."}], \
+"argv_template": [...], \
 "trigger_shape": "...", "preconditions": [...], "oracle": "...", \
 "disconfirm_condition": "...", "payload_marker": "...", \
 "required_signals": [...], "decisive_observable": "..."}, \

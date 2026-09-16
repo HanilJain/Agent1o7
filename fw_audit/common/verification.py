@@ -27,11 +27,12 @@ per-round verdicts — never themselves sent to an LLM.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class VerificationVerdict(str, Enum):
@@ -350,18 +351,72 @@ class TargetMeta(BaseModel):
     )
 
 
+GDB_FORCED_VALUE_RE = re.compile(
+    r"^(?:"
+    r"-?(?:0[xX][0-9a-fA-F]+|\d+)"  # decimal or 0x-hex integer literal
+    r"|\$[a-zA-Z][a-zA-Z0-9]*"  # a GDB register name, e.g. $a0, $r0, $pc
+    r"|[A-Za-z_][A-Za-z0-9_]*"  # a bare symbol (function/global name)
+    r")$"
+)
+"""What `GuardSpec.forced_value` is allowed to look like: a value GDB's
+`set $reg = <this>` can actually evaluate — an integer literal, a register
+name, or a bare symbol. Deliberately does NOT accept arbitrary expressions
+or prose: the historical bug this guards against was a strategy-agent
+rationale sentence (`"absent - no escaping/backslashing applied..."`)
+landing directly in `forced_value` and being interpolated into a GDB `set`
+statement verbatim, where GDB parsed it as an (invalid) expression and
+aborted the whole recipe. Free-text justification belongs in `rationale`,
+never here."""
+
+
 class GuardSpec(BaseModel):
     """One named guard/branch condition the dynamic track must satisfy —
     the structured form the strategy agent derives from a Stage 3 finding's
     PROSE `security_condition`/`data_flow` fields (see `common.findings.
-    Finding`) plus `mem.target.func_offset`-relative addressing."""
+    Finding`) plus `mem.target.func_offset`-relative addressing.
+
+    `forced_value` and `rationale` are deliberately separate fields with
+    different consumers: `forced_value` is machine-interpolated into a GDB
+    `set $reg = <forced_value>` statement (see `tools.qemu_gdb_tool.
+    render_guard_breakpoint_commands`) and is therefore validated against
+    `GDB_FORCED_VALUE_RE` — a strict GDB-expression-shaped grammar, not free
+    text. `rationale` is the human-readable justification for why this
+    guard is being forced (why no sanitizer was found, why this path is
+    the one under test) and is only ever used in reports/logs/HITL
+    prompts (`fvvw.hitl`/`fvvw.report`) — never interpolated into a script.
+    A guard documenting an absence (no real value observed, nothing to
+    force) should leave `forced_value` empty rather than encode that fact
+    as a fake value; `satisfy_guards`/`render_guard_breakpoint_commands`
+    treat an empty `forced_value` as "observe only, don't force"."""
 
     name: str = Field(description="Human-readable guard name, e.g. 'acscli2_acs_restart'.")
     addr: str = Field(default="", description="Address of the guard's branch/check, if resolved.")
     forced_value: str = Field(
-        default="", description="The value satisfy_guards must force this guard to, to open "
-        "the path being tested."
+        default="",
+        description="The value satisfy_guards must force this guard to, to open the path "
+        "being tested. Must be a GDB-expression-shaped value ONLY — an integer literal "
+        "(e.g. '1', '0x10'), a register name (e.g. '$a0'), or a bare symbol. NEVER a "
+        "rationale sentence or free text; use `rationale` for that. Leave empty if this "
+        "guard should only be observed, not forced (e.g. documenting a missing sanitizer).",
     )
+    rationale: str = Field(
+        default="",
+        description="Free-text justification for why this guard is forced (or why it's "
+        "left as observe-only) — e.g. 'no escaping applied before sprintf'. Human-facing "
+        "only: used in reports/HITL prompts, never interpolated into a GDB script.",
+    )
+
+    @field_validator("forced_value")
+    @classmethod
+    def _forced_value_must_be_gdb_expression(cls, value: str) -> str:
+        if value and not GDB_FORCED_VALUE_RE.match(value.strip()):
+            raise ValueError(
+                f"GuardSpec.forced_value={value!r} is not a valid GDB expression (integer "
+                "literal, $register, or bare symbol). Free-text rationale belongs in the "
+                "`rationale` field, not `forced_value` — it is never interpolated into a "
+                "GDB script."
+            )
+        return value
 
 
 class StaticPlan(BaseModel):

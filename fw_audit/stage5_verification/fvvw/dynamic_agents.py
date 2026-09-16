@@ -389,6 +389,40 @@ def _container_path(path: str) -> str:
 # Node 6 — trigger_agent
 # --------------------------------------------------------------------- #
 
+ALLOWED_DELIVERY_TOOLS_BY_SHAPE: dict[str, frozenset[str]] = {
+    "direct_call": frozenset({"deliver_via_direct_call"}),
+    "network_http": frozenset({"deliver_via_network"}),
+    "cli_argv": frozenset({"deliver_via_argv"}),
+}
+"""Which `deliver_via_*` tool(s) the trigger agent may actually dispatch
+for a given `DynamicPlan.trigger_shape` — the enforceable half of what was
+previously only advisory (`render_trigger_brief` told the LLM the shape in
+prose, but `trigger_agent`'s dispatcher would run ANY `deliver_via_*` tool
+the LLM named regardless). A HITL `OVERRIDE_PLAN` decision that sets
+`plan_overrides={"trigger_shape": "direct_call"}` already lands in
+`DynamicPlan.trigger_shape` via `plan.model_copy(update=...)`
+(`fvvw.graph`'s dynamic-track HITL branch) BEFORE `trigger_agent` ever
+runs — so gating on `plan.trigger_shape` here makes an override
+structurally binding for free, with no separate override-plumbing needed.
+
+An unrecognized/empty shape intentionally falls back to allowing all three
+— see `allowed_delivery_tools_for_shape` — since a shape this table
+doesn't recognize is a plan-authoring gap, not evidence that no delivery
+mechanism should be allowed at all."""
+
+
+def allowed_delivery_tools_for_shape(trigger_shape: str) -> frozenset[str]:
+    """The `deliver_via_*` tool names `trigger_agent` may dispatch for
+    `trigger_shape`. Falls back to permitting all three known delivery
+    tools for an empty or unrecognized shape (rather than allowing none),
+    since `ALLOWED_DELIVERY_TOOLS_BY_SHAPE` not having an entry means the
+    plan didn't specify a recognized shape — not that delivery should be
+    blocked entirely."""
+    all_known_tools = frozenset(
+        {"deliver_via_direct_call", "deliver_via_network", "deliver_via_argv"}
+    )
+    return ALLOWED_DELIVERY_TOOLS_BY_SHAPE.get(trigger_shape, all_known_tools)
+
 
 @dataclass
 class TriggerAgentResult:
@@ -424,27 +458,47 @@ async def trigger_agent(
     payload is reported back to the LLM as a validation failure, giving it
     a chance to reshape the payload rather than silently downgrading it.
 
-    `deliver_via_direct_call` is only meaningful when
-    `ctx.emulation_plan["mode"] == "direct_call"` — the dispatcher does not
-    itself enforce that gate (the graph router controls which mode this
-    invocation runs under), it simply issues the GDB `call` command as
-    asked.
+    Which `deliver_via_*` tool the agent may actually dispatch is
+    STRUCTURALLY gated by `plan.trigger_shape`, via
+    `allowed_delivery_tools_for_shape` — not merely stated in the brief as
+    prose the agent can ignore. `deliver_via_direct_call` in particular is
+    only ever dispatched when `trigger_shape == "direct_call"`; a
+    `deliver_via_network`/`deliver_via_argv` proposal under that shape is
+    refused (see the action loop below) rather than silently run against
+    an emulation environment with no receiving listener for it. Since a
+    HITL `OVERRIDE_PLAN` decision already lands in `plan.trigger_shape`
+    before this function runs (`fvvw.graph`'s dynamic-track HITL branch:
+    `plan.model_copy(update=decision.plan_overrides)`), gating on
+    `plan.trigger_shape` here makes that override binding on this loop's
+    behavior, not just on the text it reads.
+
+    The loop also stops itself early — before exhausting
+    `Settings.stage5_trigger_agent_max_steps` — after
+    `Settings.stage5_trigger_unproductive_delivery_limit` consecutive
+    deliveries produce no observable effect (no signal, crash, memory
+    diff, or captured sink argument), rather than repeating cosmetically
+    different attempts at a delivery shape that has already demonstrated
+    it reaches nothing.
     """
     if ctx.handle is None:
         raise DynamicFault(f"{ctx.candidate.global_id}: no active session for trigger_agent.")
 
     step_budget = max_steps or settings.stage5_trigger_agent_max_steps
+    unproductive_limit = settings.stage5_trigger_unproductive_delivery_limit
     emulation_mode = ctx.emulation_plan.get("mode", "user")
+    trigger_shape = plan.trigger_shape or "cli_argv"
+    allowed_tools = allowed_delivery_tools_for_shape(trigger_shape)
 
     brief = render_trigger_brief(
         global_id=ctx.candidate.global_id,
-        trigger_shape=plan.trigger_shape or "cli_argv",
+        trigger_shape=trigger_shape,
         oracle=plan.oracle or plan.decisive_observable,
         disconfirm_condition=plan.disconfirm_condition,
         preconditions=list(plan.preconditions),
         vuln_class=vuln_class,
         sink_expression=sink_expression,
         emulation_mode=emulation_mode,
+        allowed_delivery_tools=sorted(allowed_tools),
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=TRIGGER_AGENT_SYSTEM_PROMPT),
@@ -456,6 +510,14 @@ async def trigger_agent(
     observation = ObservationRecord()
     gdb_transcript = ""
     summary = "step budget exhausted before the agent signaled done"
+    consecutive_unproductive_deliveries = 0
+    delivery_pending_observation = False
+    """Set when a `deliver_via_*` dispatched since the last `observe_result`
+    — tells the `observe_result` handler whether THIS observation is the
+    one that should be judged for productivity. A `craft_payload`/
+    `apply_precondition` turn in between does not itself count as a
+    delivery, so an `observe_result` called without any delivery since the
+    last one is not counted either way."""
 
     async with aphase("trigger_agent"):
         for step in range(step_budget):
@@ -522,24 +584,36 @@ async def trigger_agent(
                 )
                 continue
 
-            if tool in ("deliver_via_argv", "deliver_via_network"):
-                delivery_channel = tool
-                observation_text, ctx.plan.argv_template = await _dispatch_delivery(
-                    ctx, tool=tool, args=args, delivered_payload=delivered_payload
-                )
-                messages.append(
-                    HumanMessage(content=f"Delivery result:\n{observation_text}\nNext action?")
-                )
-                continue
-
-            if tool == "deliver_via_direct_call":
-                delivery_channel = "deliver_via_direct_call"
-                ctx.real_payload_override = str(args.get("call_expression", delivered_payload))
-                messages.append(
-                    HumanMessage(
-                        content="Direct-call expression recorded. Call observe_result next."
+            if tool in ("deliver_via_argv", "deliver_via_network", "deliver_via_direct_call"):
+                if tool not in allowed_tools:
+                    messages.append(
+                        HumanMessage(
+                            content=f"{tool!r} is not available for trigger_shape "
+                            f"{trigger_shape!r} — this run only permits "
+                            f"{sorted(allowed_tools)}. Propose one of those instead."
+                        )
                     )
-                )
+                    continue
+                delivery_channel = tool
+                delivery_pending_observation = True
+                if tool == "deliver_via_direct_call":
+                    ctx.real_payload_override = str(
+                        args.get("call_expression", delivered_payload)
+                    )
+                    messages.append(
+                        HumanMessage(
+                            content="Direct-call expression recorded. Call observe_result next."
+                        )
+                    )
+                else:
+                    observation_text, ctx.plan.argv_template = await _dispatch_delivery(
+                        ctx, tool=tool, args=args, delivered_payload=delivered_payload
+                    )
+                    messages.append(
+                        HumanMessage(
+                            content=f"Delivery result:\n{observation_text}\nNext action?"
+                        )
+                    )
                 continue
 
             if tool == "observe_result":
@@ -555,6 +629,18 @@ async def trigger_agent(
                         result_stdout=transcript,
                         result_stderr="",
                     )
+                    if delivery_pending_observation:
+                        productive = bool(
+                            observation.signal
+                            or observation.faulting_pc is not None
+                            or observation.memory_diff_detected
+                            or observation.filesystem_artifacts
+                            or captured
+                        )
+                        consecutive_unproductive_deliveries = (
+                            0 if productive else consecutive_unproductive_deliveries + 1
+                        )
+                        delivery_pending_observation = False
                     messages.append(
                         HumanMessage(
                             content=f"Observation: signal={observation.signal} "
@@ -568,6 +654,13 @@ async def trigger_agent(
                             content=f"Observation failed (setup fault): {exc}. Next action?"
                         )
                     )
+                if consecutive_unproductive_deliveries >= unproductive_limit:
+                    summary = (
+                        f"delivery unproductive — shape {trigger_shape!r} exhausted after "
+                        f"{consecutive_unproductive_deliveries} consecutive deliveries with no "
+                        "observable effect"
+                    )
+                    break
                 continue
 
             messages.append(HumanMessage(content=f"unknown tool {tool!r} — ignored. Next action?"))

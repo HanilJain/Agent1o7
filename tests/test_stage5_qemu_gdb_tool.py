@@ -13,6 +13,7 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     build_qemu_system_launch_command,
     build_qemu_user_launch_command,
     gdb_binary,
+    lint_gdb_recipe,
     normalize_hex_addr,
     render_gdb_recipe,
     render_guard_breakpoint_commands,
@@ -237,6 +238,136 @@ def test_render_trigger_breakpoint_commands_captures_sink_argument():
     )
     assert commands[0] == "break *0x00020ba8"
     assert any("TRIGGER:sink_arg" in c and "(char*)$r0" in c for c in commands)
+
+
+# ---------------------------------------------------------------------- #
+# Regression: the `sbin_hostapd` production failure — a strategy-agent
+# rationale sentence landing in `forced_value` and being interpolated
+# verbatim into a `set $reg = <forced_value>` GDB statement, which GDB
+# parsed as an (invalid) expression and aborted the WHOLE recipe. A
+# second, independently-triggering bug in the same run: every guard also
+# had an unresolved (empty) `addr`, so `break *{addr}` rendered as a bare
+# `break *` — GDB's actual `recipe_guards.gdb:7: Error in sourced command
+# file: Argument required (expression to compute).` in the production log
+# was THIS line, not the `set` line the guard metadata bug produced two
+# lines later — the entry-point/reach_target breakpoint never even fires
+# once a bare `break *` earlier in the same script aborts it. Both are
+# covered here since a fix for only one leaves the other able to reproduce
+# the same class of "GDB aborts mid-script, everything after silently
+# never runs" failure.
+# ---------------------------------------------------------------------- #
+
+
+def test_render_guard_breakpoint_commands_rejects_rationale_as_forced_value():
+    """The exact historical bad value from the `sbin_hostapd` run must be
+    refused at codegen, not interpolated into a `set` line — defense in
+    depth even though `GuardSpec`'s own pydantic validator (see
+    `tests/test_fvvw_schema.py`) should already reject it upstream."""
+    with pytest.raises(ValueError, match="not a valid GDB expression"):
+        render_guard_breakpoint_commands(
+            addr="0x00445688",
+            register="$a0",
+            forced_value="absent - no escaping/backslashing applied to param_2 before sprintf",
+            log_marker="GUARD:single_quote_escaping_check",
+        )
+
+
+def test_render_guard_breakpoint_commands_skips_unresolved_addr():
+    """An empty/unresolved guard `addr` must produce NO commands at all —
+    never a bare `break *` (no operand), which is what the production
+    recipe's line 7 actually was and what GDB's "Argument required
+    (expression to compute)" error was reporting."""
+    commands = render_guard_breakpoint_commands(
+        addr="", register="$a0", forced_value="1", log_marker="GUARD:unresolved"
+    )
+    assert commands == []
+
+
+def test_render_guard_breakpoint_commands_observes_without_forcing_when_value_absent():
+    """A guard documenting an absence (no real value to force — e.g. 'no
+    sanitizer found on this path') must still log the real value via
+    `printf`, but must NOT emit a `set` line — forcing a fake value for
+    something that was never meant to be executed is the exact confusion
+    that produced the historical bug."""
+    commands = render_guard_breakpoint_commands(
+        addr="0x00445688", register="$a0", forced_value="", log_marker="GUARD:observe_only"
+    )
+    assert commands[0] == "break *0x00445688"
+    assert any("real=%d" in c for c in commands)
+    assert not any(c.startswith("set ") for c in commands)
+
+
+def test_render_gdb_recipe_rejects_empty_entry_addr():
+    """An unresolved functional entry is a genuine setup fault — must
+    raise rather than emit a bare `break *` that would abort the recipe
+    at the very first breakpoint, before anything else in it ever runs."""
+    with pytest.raises(ValueError, match="entry_addr is empty"):
+        render_gdb_recipe(
+            architecture="mips", gdb_port=1234, entry_addr="", breakpoint_commands=[]
+        )
+
+
+def test_lint_gdb_recipe_accepts_a_clean_recipe():
+    """A recipe built entirely from valid guard/entry data must pass
+    `lint_gdb_recipe` with no complaint — the pre-flight check is a safety
+    net, not a source of false positives on well-formed recipes."""
+    guard_commands = render_guard_breakpoint_commands(
+        addr="0x00445688", register="$a0", forced_value="1", log_marker="GUARD:ok"
+    )
+    recipe = render_gdb_recipe(
+        architecture="mips",
+        gdb_port=1234,
+        entry_addr="0x00445688",
+        breakpoint_commands=guard_commands,
+    )
+    lint_gdb_recipe(recipe)  # must not raise
+
+
+def test_lint_gdb_recipe_rejects_bare_break_star():
+    """Catches a bare `break *` regardless of how the recipe text was
+    assembled — the recipe-level safety net, independent of the per-guard
+    check `render_guard_breakpoint_commands` already does."""
+    bad_recipe = (
+        "set architecture mips\n"
+        "target remote localhost:1234\n"
+        "break *\n"
+        "continue\n"
+    )
+    with pytest.raises(ValueError, match="no address operand"):
+        lint_gdb_recipe(bad_recipe)
+
+
+def test_lint_gdb_recipe_rejects_the_exact_historical_bad_line():
+    """The literal line that broke production:
+    `set $a0 = absent - no escaping/backslashing applied to param_2 before sprintf`
+    — must be caught by the recipe-level lint even if it somehow bypassed
+    every earlier check (e.g. a hand-assembled recipe in a debug helper)."""
+    bad_recipe = (
+        "set architecture mips\n"
+        "target remote localhost:1234\n"
+        "break *0x00445688\n"
+        "continue\n"
+        'printf "GUARD:single_quote_escaping_check:real=%d\\n", $a0\n'
+        "set $a0 = absent - no escaping/backslashing applied to param_2 before sprintf\n"
+        "continue\n"
+    )
+    with pytest.raises(ValueError, match="not a valid GDB expression"):
+        lint_gdb_recipe(bad_recipe)
+
+
+def test_lint_gdb_recipe_ignores_boilerplate_set_lines():
+    """`set architecture ...`/`set pagination off`/`set confirm off` are
+    fixed boilerplate this module controls itself, not guard-supplied
+    data — must never be flagged."""
+    recipe = (
+        "set architecture mips\n"
+        "set pagination off\n"
+        "set confirm off\n"
+        "target remote localhost:1234\n"
+        "break *0x00445688\n"
+        "continue\n"
+    )
+    lint_gdb_recipe(recipe)  # must not raise
 
 
 # ---------------------------------------------------------------------- #

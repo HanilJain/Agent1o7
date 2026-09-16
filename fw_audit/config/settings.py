@@ -808,6 +808,19 @@ class Settings(BaseSettings):
     )
     """Cap on the Node 6 trigger agent's own tool-calling steps within ONE
     invocation (craft payload, deliver, observe, refine)."""
+    stage5_trigger_unproductive_delivery_limit: int = Field(
+        default=2, ge=1, validation_alias="FWA_STAGE5_TRIGGER_UNPRODUCTIVE_DELIVERY_LIMIT"
+    )
+    """How many consecutive `deliver_via_*` dispatches with zero observable
+    effect (no signal, no crash, no memory diff, no captured sink argument)
+    the Node 6 trigger agent tolerates before it stops itself early with a
+    `"delivery unproductive — shape exhausted"` summary, rather than
+    burning the rest of `stage5_trigger_agent_max_steps` on cosmetically
+    different attempts at the same unproductive delivery shape. Production
+    example this guards against: `sbin_hostapd`'s dynamic-verification run
+    delivered 4 wording variants of the same `deliver_via_network` payload
+    in a row, none of which reached a listener that could parse them, and
+    the loop never recognized the pattern."""
 
     # ---- Stage 5 FVVW v3: human-in-the-loop on inconclusive tracks --------
     stage5_hitl_mode: str = Field(default="off", validation_alias="FWA_STAGE5_HITL_MODE")
