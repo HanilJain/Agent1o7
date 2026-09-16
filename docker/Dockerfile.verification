@@ -142,9 +142,16 @@ RUN for arch in arm armeb aarch64 aarch64_be mips mipsel mips64 mips64el ppc ppc
 # and gdb-multiarch both run fine as a non-root user against files the
 # container itself owns (staged into /work by the tool layer before a
 # session starts); a specific dynamic-track need for elevated privilege
-# inside the sandbox (e.g. a chroot requiring root) is granted per-command
-# via `docker exec -u root` at the call site in `tools/qemu_gdb_tool.py`,
-# not baked into this image's default user.
+# inside the sandbox (chroot(2) needs CAP_SYS_CHROOT, which this non-root
+# user lacks) is granted PER-COMMAND, not baked into this image's default
+# user: `fw_audit.executors.sandbox_executor.SandboxExecutor.
+# exec_in_session(..., user="root")` passes `docker exec -u root` for that
+# ONE command; `fw_audit.stage5_verification.fvvw.dynamic_track.
+# _bringup_exec_user` is what decides when to request it (only the
+# chroot-based QEMU launch and the Node 3 agent's `-strace` discovery
+# pass — never GDB recipe delivery or payload/trigger delivery), gated by
+# `Settings.stage5_sandbox_allow_privileged`. See that stage's CLAUDE.md
+# ("Session privilege escalation is PER-COMMAND") for the full rationale.
 RUN useradd -m -u 1000 verifier && mkdir -p /work && chown -R verifier:verifier /work
 USER verifier
 

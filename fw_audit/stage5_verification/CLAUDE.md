@@ -152,6 +152,38 @@ below for the full node table and the architecture rationale.
   `validate_benign_marker` to accommodate a payload that needs MORE than
   what's already allowed; widen the sandbox's containment instead if a
   legitimate test needs it.
+- **Session privilege escalation is PER-COMMAND, never session-wide.**
+  The session container always starts as its image's default (non-root)
+  user (`Dockerfile.verification`'s `USER verifier`). `SandboxExecutor.
+  exec_in_session(..., user=...)` lets ONE specific command run as root —
+  used for exactly the commands that chroot (the QEMU launch in
+  `dynamic_track._launch_qemu_and_wait`, via `_bringup_exec_user`, and the
+  Node 3 agent's `-strace` discovery pass in `dynamic_agents.
+  _dispatch_bringup_tool`) since `chroot(2)` needs `CAP_SYS_CHROOT` a
+  non-root user lacks. Every other command — GDB recipe delivery, trigger/
+  payload delivery, the QEMU-binary staging `cp` — stays unprivileged
+  regardless. This is deliberate: containment for a dynamic-track run
+  comes from the container boundary (`--network=none`, resource caps), not
+  from which uid runs inside it, so the one step that most needs a small
+  escape surface (payload delivery, per the bullet above) never runs
+  elevated. Gated by `Settings.stage5_sandbox_allow_privileged` (default
+  `True`); `False` makes a chroot-requiring target fail FAST with a clear
+  `BringupExhausted` diagnosis instead of retrying a raw `chroot: ...
+  Operation not permitted` — see `_bringup_exec_user`'s docstring. Never
+  make a bring-up repair "just work" by widening this to session-wide
+  root; add a new PER-COMMAND elevation call site instead.
+- **`ensure_session(ctx)` must be called before anything that needs a live
+  session — including the Node 3 bring-up AGENT, not just the
+  deterministic launch.** `dynamic_agents.bringup_agent` raises
+  immediately when `ctx.handle is None` (by design — it has nothing to
+  drive without one); a caller that invokes it before provisioning a
+  session gets an agent that always fails on its very first turn, forever
+  — this was a real bug (see "Fixed bugs" below). `ensure_session` also
+  pre-creates `CONTAINER_SCRATCH` UNPRIVILEGED, before any elevated launch
+  command can create it as root instead — a root-owned scratch dir would
+  block every later unprivileged GDB-recipe write into it. Never reorder
+  `dynamic_graph._run_bringup` to call `bringup_agent` before
+  `ensure_session`.
 - `SandboxExecutor.run()` (Joern's one-shot call) is **not modified** by
   the dynamic track's session capability (`start()`/`exec_in_session()`/
   `stop()`, added alongside it) — see `executors/sandbox_executor.py`'s
@@ -207,7 +239,7 @@ below for the full node table and the architecture rationale.
 |---|---|---|---|
 | 1 | Hypothesis + Oracle | LLM | `fvvw.strategy.strategy_agent` — shared with the static track; emits `Hypotheses.oracle`/`.disconfirm_condition` + `DynamicPlan.oracle`/`.disconfirm_condition` alongside the existing `decisive_observable` triple. `validate_decisive_observable` requires all of them non-empty. |
 | 2 | Plan Emulation | Deterministic | `dynamic_track.plan_emulation` — `emulation_mode` incl. `direct_call` (the Node 8 router's `escalate_direct_call` route forces it via `plan_emulation_escalate_node`). |
-| 3 | Bring-Up & Arbitration | **LLM agent + tools** | `dynamic_agents.bringup_agent` (a bounded JSON-action loop: `run_strace_discovery`/`inspect_binary`/`create_dummy_file`/`create_dummy_dir`/`create_device_node`/`force_env_var`/`relaunch_and_check`/`done`) driving `ctx.session_executor.exec_in_session` directly, THEN the deterministic `dynamic_track.bringup_stabilize`/`_launch_qemu_and_wait` underneath it. `dynamic_graph._run_bringup` retries a bare `DynamicFault` from `bringup_stabilize` itself in a bounded loop (bounded by `bringup_stabilize`'s own `repair_count` check) — this must never escape uncaught (see "Fixed bugs" below). |
+| 3 | Bring-Up & Arbitration | **LLM agent + tools** | `dynamic_graph._run_bringup` calls `dynamic_track.ensure_session` FIRST (provisions a live session + unprivileged `CONTAINER_SCRATCH`), then `dynamic_agents.bringup_agent` (a bounded JSON-action loop: `run_strace_discovery`/`inspect_binary`/`create_dummy_file`/`create_dummy_dir`/`create_device_node`/`force_env_var`/`relaunch_and_check`/`done`) driving `ctx.session_executor.exec_in_session` directly, THEN the deterministic `dynamic_track.bringup_stabilize`/`_launch_qemu_and_wait` underneath it. The chroot-based launch (and the agent's `-strace` pass) run with `user="root"` via `_bringup_exec_user` — see the privilege-escalation hard constraint above. `_run_bringup` retries a `DynamicFault` from `bringup_stabilize` itself in a bounded loop (bounded by `bringup_stabilize`'s own `repair_count` check, AND by `BringupContext.no_progress_since_last_fault()` aborting early if the same classified fault (`_classify_bringup_fault`) repeats with no new fix applied) — this must never escape uncaught (see "Fixed bugs" below). |
 | 4 | Health Gate | Deterministic | `dynamic_track.health_gate`/`HealthGateFailure` — `pgrep` liveness + a SECOND `/proc/net/tcp` gdbstub-rebind probe (distinct from `_launch_qemu_and_wait`'s own readiness probe). Failure routes back to Node 3 via `route_after_bringup`/`route_after_health_gate`. |
 | 5 | GDB Attach & Instrument | Deterministic | `dynamic_track.reach_target` (reused). Stripped-symbol → address agent fallback is NOT implemented in this revision (`reach_target` already resolves its entry address from `Settings`-independent facts supplied upstream) — flagged in `dynamic_graph.py`'s module docstring as a future extension point, not silently omitted. |
 | 6 | Trigger / PoC | **LLM agent** | `dynamic_agents.trigger_agent` (`craft_payload`/`apply_precondition`/`deliver_via_argv`/`deliver_via_network`/`deliver_via_direct_call`/`observe_result`/`done`) when `stage5_allow_real_payloads`, else the deterministic `instrument_trigger` (benign-marker) path — both live in `dynamic_graph._run_trigger`. Every crafted payload is validated (`validate_real_payload`/`validate_benign_marker`) BEFORE delivery; a rejection is reported back to the LLM as feedback, not silently downgraded. |
@@ -262,7 +294,7 @@ tool-calling — both are plain text in/text out, for local-model reliability.
 | `fvvw/static_track.py` | `run_static_track()` — renders a strategy-enriched brief (`render_static_brief`, layered on top of the existing `agent.prompts.render_finding_brief`) and invokes `build_verifier_graph()` **unmodified**; maps the terminal state into a `TrackResult`. |
 | `tools/crosscheck_tool.py` | `static_crosscheck()` — disassembles the REAL ELF (`objdump -d -C`) and confirms/refutes `StaticPlan.expected_intermediate_calls`/`.sanitizer_patterns` against it — an independent signal from the decompiled-C-based Joern track. |
 | `tools/qemu_gdb_tool.py` | Owns every `qemu-*`/`gdb-multiarch` command: the full arch table (`QEMU_ARCH_TABLE` — arm/armeb/aarch64/mips/mipsel/mips64/mips64el/ppc/ppc64, user+system binaries, per-arch argument registers, CPU-probe env fixes), launch-command assembly, the GDB batch-recipe renderer, plus the 9-node rewrite's new builders: `build_qemu_strace_command` (Node 3's `-strace` discovery), memory-dump (`x/32xb` before/after) and crash-capture (`handle SIGSEGV/SIGABRT/SIGILL stop`, `info registers`, `bt`, `$pc`) recipe bodies, `render_direct_call_recipe_body` (the `direct_call` emulation-mode harness). |
-| `fvvw/dynamic_track.py` | The dynamic track's reusable node bodies/helpers, now consumed by `fvvw/dynamic_graph.py` rather than called in a hand-written sequence: `plan_emulation` (Node 2, incl. `direct_call`), `bringup_stabilize`/`BringupContext`/`BringupExhausted`/`_launch_qemu_and_wait` (Node 3's deterministic underlayer), `health_gate`/`HealthGateFailure` (Node 4), `reach_target` (Node 5), `satisfy_guards`/`instrument_trigger` (Node 6's benign-marker path), `collect_observation`/`collect_signals` (Node 7), `match_oracle` (Node 8's deterministic first pass). `validate_benign_marker`/`BenignMarkerViolation` (the benign-only posture) and `validate_real_payload`/`PayloadContainmentViolation` (the default real-payload posture, deny-list-only) — both gated by `Settings.stage5_allow_real_payloads`. `validate_injected_recipe` — HITL-inject's own, unconditional GDB-escape-hatch gate. `direct_call_trigger` — the GDB `call` harness (spec's explicit last resort). The pre-rewrite `dynamic_evaluate()` rule engine is UNUSED by the graph (kept only for any code still calling it directly) — Node 8's verdict now comes from `dynamic_graph._build_track_result`. |
+| `fvvw/dynamic_track.py` | The dynamic track's reusable node bodies/helpers, now consumed by `fvvw/dynamic_graph.py` rather than called in a hand-written sequence: `plan_emulation` (Node 2, incl. `direct_call`), `ensure_session`/`bringup_stabilize`/`BringupContext`/`BringupExhausted`/`_launch_qemu_and_wait` (Node 3's session provisioning + deterministic underlayer), `health_gate`/`HealthGateFailure` (Node 4), `reach_target` (Node 5), `satisfy_guards`/`instrument_trigger` (Node 6's benign-marker path), `collect_observation`/`collect_signals` (Node 7), `match_oracle` (Node 8's deterministic first pass). `_bringup_exec_user` decides per-command session privilege (root only for a chroot-required launch, gated by `Settings.stage5_sandbox_allow_privileged`); `_classify_bringup_fault`/`_KNOWN_BRINGUP_ERRORS` turn a captured QEMU/chroot failure into a human-readable diagnosis, recorded via `BringupContext.record_bringup_fault`/`no_progress_since_last_fault` so a caller can stop retrying an unchanging fault early. `validate_benign_marker`/`BenignMarkerViolation` (the benign-only posture) and `validate_real_payload`/`PayloadContainmentViolation` (the default real-payload posture, deny-list-only) — both gated by `Settings.stage5_allow_real_payloads`. `validate_injected_recipe` — HITL-inject's own, unconditional GDB-escape-hatch gate. `direct_call_trigger` — the GDB `call` harness (spec's explicit last resort). The pre-rewrite `dynamic_evaluate()` rule engine is UNUSED by the graph (kept only for any code still calling it directly) — Node 8's verdict now comes from `dynamic_graph._build_track_result`. |
 | `fvvw/dynamic_agents.py` | The three agentic tool-calling loops: `bringup_agent` (Node 3), `trigger_agent` (Node 6), `route_observation` (Node 8's LLM router, called only when the deterministic first pass doesn't settle a round). Each is a bounded JSON-action ReAct loop (`_parse_action` via the SAME `agent.cleaning.clean_json_payload` discipline) whose dispatcher `await`s `ctx.session_executor.exec_in_session` directly — the "QEMU/GDB session driven async by the agents that need it" requirement. Command composition still lives entirely in `tools/qemu_gdb_tool.py`; these loops only call into it and into `dynamic_track.py`'s node functions. |
 | `fvvw/dynamic_prompts.py` | System prompts + the JSON action/observation contract for all four dynamic-track LLM roles (bring-up, trigger, router) — mirrors `fvvw/strategy.py`'s prompt+render shape. `render_bringup_brief`/`render_trigger_brief`/`render_router_brief`. |
 | `fvvw/dynamic_graph.py` | `build_dynamic_graph()` — the compiled `StateGraph(FVVWState)` for Nodes 2-8 (see "The 9 nodes" above for the full mapping). `DynamicGraphDeps` (the three new LLMs + session executor, narrower than `fvvw.graph.FVVWDeps`). `route_after_bringup`/`_health_gate`/`_gdb_attach`/`_trigger`/`_evaluate` — the pure conditional-edge functions implementing the spec's §10 decision table. `_build_track_result`/`_TERMINAL_ROUTES` — the ONLY place a dynamic-track `TrackResult` is constructed. |
@@ -560,6 +592,38 @@ fork-join (both write the same dynamic-track artifacts for the same `gid`).
   and loops back to `bringup`, repeatedly overwriting the already-terminal
   result rather than ending immediately — `route_after_bringup` makes this
   a conditional edge (`__end__` when exhausted) instead.
+- **Real-firmware incident (DIR-825, `sbin_hostapd`), four compounding
+  harness bugs, none related to the finding itself:** (1) the chroot-based
+  QEMU launch always failed with `chroot: cannot change root directory to
+  '.': Operation not permitted` — `SandboxExecutor.exec_in_session` had NO
+  way to run a command as root, even though `Dockerfile.verification`'s
+  own comment already claimed elevation was "granted per-command via
+  `docker exec -u root` at the call site" — that call site never existed.
+  Fixed by adding `exec_in_session(..., user=...)` and `_bringup_exec_user`
+  (see the privilege-escalation hard constraint above). (2) The repair
+  loop retried the IDENTICAL failing command 5 times with zero adaptation
+  — `bringup_stabilize` never inspected the captured QEMU log for a
+  diagnosable cause. Fixed by `_classify_bringup_fault`/
+  `BringupContext.no_progress_since_last_fault()`, which aborts early with
+  a named diagnosis once the same fault repeats with no new fix applied.
+  (3) `dynamic_agents.bringup_agent` — the "LLM decides what to fix" half
+  of Node 3 — never ran a single turn: it raises immediately when
+  `ctx.handle is None`, and the session used to only get created INSIDE
+  `bringup_stabilize`, which `_run_bringup` called AFTER the agent. The
+  real run's own LLM usage summary proved this: 5 bring-up attempts, 0
+  `stage5_bringup_agent` calls. Fixed by `ensure_session(ctx)`, called
+  FIRST in `_run_bringup`. (4) `LoggingSessionExecutor.start()`/`.stop()`
+  logged every session start/stop as `ok=False` unconditionally (`record()`
+  defaults `ok=bool(None)` → `False` when no `result`/`ok` is passed) —
+  cosmetic, but actively misleading: a successful `docker run -d`/
+  `docker rm -f` printed `(FAILED)` in `--live` output, burying the real
+  failure (which was 3 lines later) under false alarms. Fixed by passing
+  `ok=True` explicitly at both call sites (they only reach `record()`
+  after the wrapped call already succeeded — a real failure raises first).
+  Regression tests: `tests/test_fvvw_dynamic_track.py`'s privilege/
+  fault-classification/`ensure_session` groups,
+  `tests/test_fvvw_graph.py::test_run_fvvw_actually_invokes_bringup_agent`,
+  `tests/test_stage5_cmdlog.py::test_logging_session_executor_logs_start_and_stop_as_ok`.
 
 ## Adding a feature here
 

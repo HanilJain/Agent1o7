@@ -700,6 +700,28 @@ class Settings(BaseSettings):
     rather than silently opening egress. Set `True` only for an operator who
     has read and accepted that a specific run's container may gain scoped,
     revoked-after egress."""
+    stage5_sandbox_allow_privileged: bool = Field(
+        default=True, validation_alias="FWA_STAGE5_SANDBOX_ALLOW_PRIVILEGED"
+    )
+    """Master switch for the dynamic track's PER-COMMAND session privilege
+    escalation (`SandboxExecutor.exec_in_session(..., user="root")`):
+    `True` (default) lets `bringup_stabilize`/the Node 3 bring-up agent
+    request root on the ONE composite command that needs it — the
+    chroot-based QEMU launch (`chroot(2)` needs `CAP_SYS_CHROOT`, which the
+    session container's non-root default user doesn't have) — while every
+    other command in the same session, including GDB recipe delivery and
+    trigger/payload delivery, stays unprivileged regardless of this
+    setting. This is deliberately narrower than a session-wide root
+    container: containment for a dynamic-track run coming from the
+    container boundary itself (`--network=none`, `stage5_sandbox_*`
+    resource caps), not from which uid runs inside it, so escalating only
+    the specific setup step that needs it keeps the escape surface small
+    for the step (payload delivery) that most needs it to stay small. Set
+    `False` for a deployment that wants to forbid ANY privileged session
+    command outright — a target whose bring-up requires a chroot then
+    fails fast with a clear diagnosis (`BringupExhausted`, not a raw
+    `chroot: ... Operation not permitted`) instead of retrying a
+    precondition retrying cannot fix."""
     stage5_dynamic_workspace_root: str | None = Field(
         default=None, validation_alias="FWA_STAGE5_DYNAMIC_WORKSPACE_ROOT"
     )

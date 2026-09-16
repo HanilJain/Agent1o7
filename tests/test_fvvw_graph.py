@@ -78,7 +78,7 @@ class _FakeSessionExecutor:
     async def start(self, *, image=None, files=None, network=None):
         return SessionHandle(container_name="fake-session", workspace_dir=files)
 
-    async def exec_in_session(self, handle, command, *, timeout=None):
+    async def exec_in_session(self, handle, command, *, timeout=None, user=None):
         self.exec_calls.append(command)
         if "pgrep" in command:
             # health_gate's (Node 4) liveness check — must report ALIVE or
@@ -526,7 +526,7 @@ async def test_run_dynamic_track_only_enforces_wall_clock_budget(monkeypatch, tm
         async def start(self, *, image=None, files=None, network=None):
             return SessionHandle(container_name="fake-session", workspace_dir=files)
 
-        async def exec_in_session(self, handle, command, *, timeout=None):
+        async def exec_in_session(self, handle, command, *, timeout=None, user=None):
             await asyncio.sleep(60)  # far longer than the 1s wall-clock budget below
             raise AssertionError("unreachable — the wall-clock timeout must fire first")
 
@@ -620,7 +620,7 @@ async def test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself(
             super().__init__()
             self._stage_attempts = 0
 
-        async def exec_in_session(self, handle, command, *, timeout=None):
+        async def exec_in_session(self, handle, command, *, timeout=None, user=None):
             if command.startswith("cp ") and "$(command -v" in command:
                 self._stage_attempts += 1
                 if self._stage_attempts == 1:
@@ -631,7 +631,7 @@ async def test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself(
                         stderr="cp: cannot stat: No such file or directory",
                         timed_out=False,
                     )
-            return await super().exec_in_session(handle, command, timeout=timeout)
+            return await super().exec_in_session(handle, command, timeout=timeout, user=user)
 
     def on_run(command, files):
         if command.startswith("joern-parse"):
@@ -676,6 +676,80 @@ async def test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself(
     assert flaky_session._stage_attempts >= 2  # failed once, then retried successfully
 
 
+async def test_run_fvvw_actually_invokes_bringup_agent(monkeypatch, fake_executor, tmp_path: Path):
+    """Regression: `_run_bringup` used to call `bringup_agent` BEFORE any
+    session existed — `bringup_agent` raises immediately when
+    `ctx.handle is None`, so on every fresh candidate it always failed
+    before its first turn and the graph silently fell through to the
+    deterministic `bringup_stabilize` path only. A real run against real
+    firmware showed this directly: 5 bring-up attempts, 0
+    stage5_bringup_agent LLM calls. `_run_bringup` now calls
+    `ensure_session(ctx)` first, so the agent must be invoked at least
+    once — asserted here via the scripted bringup LLM's own call count."""
+    db_subfolder = tmp_path / "db"
+    source_path = tmp_path / "whole.c"
+    source_path.write_text("int main() { return 0; }\n", encoding="utf-8")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "bin").mkdir(parents=True)
+    binary_path = rootfs / "bin" / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+    candidate = _candidate(
+        source_path=source_path, binary_path=binary_path, rootfs_dir=rootfs, with_elf=True
+    )
+
+    roles = _patch_llm_roles(
+        monkeypatch,
+        strategy_response=_strategy_plan_json(),
+        generator_response='println("RESULT: FLOW_FOUND (1 path(s))")',
+        evaluator_response=_verdict_json("PASS"),
+    )
+
+    def on_run(command, files):
+        if command.startswith("joern-parse"):
+            (files / "cpg.bin").write_bytes(b"cpg")
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout="disasm\n", stderr="", timed_out=False
+            )
+        return ExecutionResult(
+            command=command,
+            returncode=0,
+            stdout="RESULT: FLOW_FOUND (1 path(s))",
+            stderr="",
+            timed_out=False,
+        )
+
+    joern_exec = fake_executor(on_run)
+    crosscheck_exec = fake_executor(on_run)
+    session_exec = _FakeSessionExecutor()
+
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.joern_executor", lambda settings: joern_exec
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_executor",
+        lambda settings: crosscheck_exec,
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_session_executor",
+        lambda settings: session_exec,
+    )
+
+    settings = Settings(_env_file=None)
+    result = await run_fvvw(candidate, db_subfolder=db_subfolder, settings=settings)
+
+    assert result["dynamic_result"] is not None
+    assert session_exec.exec_calls, "ensure_session never provisioned a session"
+    from fw_audit.config.llm_config import AgentRole
+
+    assert len(roles[AgentRole.STAGE5_BRINGUP_AGENT].calls) >= 1, (
+        "bringup_agent was never actually invoked — the ordering bug is back"
+    )
+
+
 # ---------------------------------------------------------------------- #
 # HITL — Stage 5 HITL plan Part 3, wired into run_fvvw between the barrier
 # and joint_evaluate.
@@ -697,7 +771,7 @@ class _NeverReachesSessionExecutor(_FakeSessionExecutor):
     route and exhausting the BRING-UP budget (ERROR) instead of the
     DYNAMIC-ITERATION budget (INCONCLUSIVE) these tests assert on."""
 
-    async def exec_in_session(self, handle, command, *, timeout=None):
+    async def exec_in_session(self, handle, command, *, timeout=None, user=None):
         self.exec_calls.append(command)
         if command.startswith("test -e"):
             return ExecutionResult(

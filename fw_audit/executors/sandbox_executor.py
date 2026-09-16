@@ -235,12 +235,29 @@ class SandboxExecutor(Executor):
         command: str,
         *,
         timeout: int | None = None,
+        user: str | None = None,
     ) -> ExecutionResult:
         """Run `command` inside `handle`'s already-running container via
         `docker exec` — the session equivalent of `run()`, addressed at an
-        existing container instead of starting a fresh one."""
+        existing container instead of starting a fresh one.
+
+        `user`, when given, is passed as `docker exec -u <user>` — a
+        PER-COMMAND privilege escalation, not a session-wide one. The
+        session container itself always starts as its image's default user
+        (see `start()`); a caller that needs root for one specific
+        operation (e.g. `chroot`, which needs `CAP_SYS_CHROOT` a non-root
+        user doesn't have) passes `user="root"` on JUST that call, leaving
+        every other command in the same session — including trigger/payload
+        delivery — running unprivileged. This keeps the escape surface
+        small for the one step (delivering attacker-controlled input to the
+        emulated target) that most needs it to stay small; see
+        `stage5_verification`'s containment discussion for why containment
+        here is structural (the container boundary), not content-based."""
         settings = self._settings
-        docker_args = ["exec", handle.container_name, "sh", "-c", command]
+        docker_args = ["exec"]
+        if user:
+            docker_args += ["-u", user]
+        docker_args += [handle.container_name, "sh", "-c", command]
 
         run_settings = settings
         if timeout is not None and timeout != settings.subprocess_timeout_seconds:

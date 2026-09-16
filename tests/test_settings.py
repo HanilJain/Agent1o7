@@ -32,6 +32,19 @@ def test_command_prefix_accepts_list_passthrough():
     assert settings.command_prefix == ["wsl"]
 
 
+def test_stage5_sandbox_allow_privileged_defaults_true():
+    """Default stays permissive (privileged per-command session escalation
+    allowed) so existing chroot-based dynamic-track bring-up keeps working
+    with no config change; the flag exists to let a deployment opt OUT."""
+    settings = Settings(_env_file=None)
+    assert settings.stage5_sandbox_allow_privileged is True
+
+
+def test_stage5_sandbox_allow_privileged_can_be_disabled():
+    settings = Settings(_env_file=None, FWA_STAGE5_SANDBOX_ALLOW_PRIVILEGED=False)
+    assert settings.stage5_sandbox_allow_privileged is False
+
+
 def test_firmware_and_database_path_default_under_data_dir(tmp_path: Path):
     settings = Settings(_env_file=None, FWA_DATA_DIR=str(tmp_path))
     assert settings.firmware_path == tmp_path / "firmware"

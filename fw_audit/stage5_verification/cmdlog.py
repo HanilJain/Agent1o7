@@ -339,12 +339,19 @@ class LoggingSessionExecutor:
         kwargs: dict[str, Any] = {"image": image, "files": files, "network": network}
         if extra_args is not None:
             kwargs["extra_args"] = extra_args
+        # `self._inner.start()` raises (never returns an error value) on
+        # failure — see `SandboxExecutor.start()`'s docstring — so reaching
+        # this `record()` call at all means the container genuinely came
+        # up; ok=True reflects that instead of `record()`'s "no result/ok
+        # given" default of False, which previously made every successful
+        # session_start log as "(FAILED)" in --live console output.
         handle = await self._inner.start(**kwargs)
         self._log.record(
             node=current_phase() or "session",
             kind="session_start",
             command=f"docker run -d ... {image or ''}".strip(),
             duration_ms=int((time.monotonic() - started) * 1000),
+            ok=True,
             container=handle.container_name,
             files=str(files) if files else "",
             network=network or "",
@@ -357,9 +364,10 @@ class LoggingSessionExecutor:
         command: str,
         *,
         timeout: int | None = None,
+        user: str | None = None,
     ) -> ExecutionResult:
         started = time.monotonic()
-        result = await self._inner.exec_in_session(handle, command, timeout=timeout)
+        result = await self._inner.exec_in_session(handle, command, timeout=timeout, user=user)
         self._log.record(
             node=current_phase() or "exec",
             kind="exec_in_session",
@@ -369,17 +377,23 @@ class LoggingSessionExecutor:
             cwd="",
             container=handle.container_name,
             timeout=timeout,
+            user=user or "",
         )
         return result
 
     async def stop(self, handle: SessionHandle) -> None:
         started = time.monotonic()
+        # `self._inner.stop()` is documented best-effort/never-raises (see
+        # `SandboxExecutor.stop()`) — there is no failure signal to
+        # propagate, so ok=True for the same reason as start() above: the
+        # call completing is the only outcome this wrapper ever observes.
         await self._inner.stop(handle)
         self._log.record(
             node=current_phase() or "session",
             kind="session_stop",
             command=f"docker rm -f {handle.container_name}",
             duration_ms=int((time.monotonic() - started) * 1000),
+            ok=True,
             container=handle.container_name,
         )
 

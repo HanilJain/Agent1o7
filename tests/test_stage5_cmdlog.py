@@ -213,14 +213,54 @@ class _FakeSessionExecutor:
         self.started_with = {"image": image, "files": files, "network": network}
         return SessionHandle(container_name="fake-container-abc123", workspace_dir=files)
 
-    async def exec_in_session(self, handle, command, *, timeout=None):
-        self.exec_calls.append((handle, command, timeout))
+    async def exec_in_session(self, handle, command, *, timeout=None, user=None):
+        self.exec_calls.append((handle, command, timeout, user))
         return ExecutionResult(
             command=command, returncode=0, stdout="ok", stderr="", timed_out=False
         )
 
     async def stop(self, handle):
         self.stopped_handle = handle
+
+
+def test_logging_session_executor_logs_start_and_stop_as_ok(tmp_path: Path):
+    """`start()`/`stop()` only ever reach `record()` after the wrapped call
+    already succeeded (a real failure raises before logging — see
+    `SandboxExecutor.start()`/`.stop()`) — so their records must show
+    ok=True, not the record()-default-False that previously made every
+    successful session start/stop print "(FAILED)" in --live output."""
+
+    async def _run():
+        inner = _FakeSessionExecutor()
+        log = CommandLog(tmp_path / "gid.dynamic.jsonl", track="dynamic")
+        wrapped = LoggingSessionExecutor(inner, log)
+        handle = await wrapped.start()
+        await wrapped.stop(handle)
+        return log
+
+    log = asyncio.run(_run())
+    records = {r["kind"]: r for r in log.read_all()}
+    assert records["session_start"]["ok"] is True
+    assert records["session_stop"]["ok"] is True
+
+
+def test_logging_session_executor_forwards_and_logs_user(tmp_path: Path):
+    """A per-command `user=` (e.g. "root" for a chroot call) must reach the
+    wrapped executor AND be visible in the record's notes, so a diagnosing
+    read of the JSONL can see which commands ran elevated."""
+
+    async def _run():
+        inner = _FakeSessionExecutor()
+        log = CommandLog(tmp_path / "gid.dynamic.jsonl", track="dynamic")
+        wrapped = LoggingSessionExecutor(inner, log)
+        handle = await wrapped.start()
+        await wrapped.exec_in_session(handle, "chroot . /qemu-mips ...", user="root")
+        return log, inner
+
+    log, inner = asyncio.run(_run())
+    assert inner.exec_calls[0][3] == "root"
+    record = [r for r in log.read_all() if r["kind"] == "exec_in_session"][0]
+    assert record["notes"]["user"] == "root"
 
 
 def test_logging_session_executor_passes_through_return_values(tmp_path: Path):
@@ -265,7 +305,7 @@ def test_logging_session_executor_tags_records_with_active_phase(tmp_path: Path)
 
 def test_logging_session_executor_records_full_stdout_and_stderr(tmp_path: Path):
     class _FailingExecutor(_FakeSessionExecutor):
-        async def exec_in_session(self, handle, command, *, timeout=None):
+        async def exec_in_session(self, handle, command, *, timeout=None, user=None):
             return ExecutionResult(
                 command=command,
                 returncode=1,

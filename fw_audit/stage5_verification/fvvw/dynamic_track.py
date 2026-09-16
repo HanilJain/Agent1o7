@@ -401,6 +401,17 @@ class BringupContext:
     """Raw ENOENT/failed-open lines the Node 3 agent's `qemu -strace` pass
     surfaced — the evidence base `arbitration_entries` was reasoned from,
     kept verbatim for `ArbitrationLog.strace_findings`."""
+    fault_log: list[tuple[str, int]] | None = None
+    """One `(signature, fixes_applied_so_far)` entry per `bringup_stabilize`
+    repair attempt that ended in a `DynamicFault` — `signature` is the
+    fault's classified string (see `_classify_bringup_fault`), and
+    `fixes_applied_so_far` is `len(applied_fixes)` AT THE MOMENT this fault
+    was recorded. Appended by `record_bringup_fault()`, called from
+    `_launch_qemu_and_wait` right before it raises. This is what lets a
+    caller (`dynamic_graph._run_bringup`) detect "the same fault fired
+    twice in a row with no new fix applied in between" and stop early with
+    a diagnosis instead of burning the whole repair budget re-running an
+    unchanged failure — see `no_progress_since_last_fault()`."""
 
     def __post_init__(self) -> None:
         if self.applied_fixes is None:
@@ -409,6 +420,36 @@ class BringupContext:
             self.arbitration_entries = []
         if self.strace_findings is None:
             self.strace_findings = []
+        if self.fault_log is None:
+            self.fault_log = []
+
+    def record_bringup_fault(self, signature: str) -> None:
+        """Append `(signature, len(applied_fixes))` to `fault_log`. Called
+        from `_launch_qemu_and_wait` right before it raises
+        `DynamicFault` — captures how many fixes had accumulated by the
+        time THIS fault occurred, so the next comparison can tell whether
+        anything changed since the previous fault."""
+        # `__post_init__` guarantees `fault_log`/`applied_fixes` are lists,
+        # never `None`, by the time any instance method runs — appending
+        # via `(self.fault_log or [])` here would be wrong: an EMPTY list
+        # is falsy, so that pattern would silently append to a throwaway
+        # list on every fault before the first fix, never persisting back
+        # onto `self.fault_log` at all.
+        assert self.fault_log is not None and self.applied_fixes is not None
+        self.fault_log.append((signature, len(self.applied_fixes)))
+
+    def no_progress_since_last_fault(self) -> bool:
+        """`True` when the two most recent faults share the same signature
+        AND no new fix was recorded between them — i.e. the repair attempt
+        between those two faults changed nothing about the environment
+        before retrying. A single fault (nothing yet to compare against)
+        is never "no progress" — this only fires from the SECOND repeat."""
+        log = self.fault_log
+        assert log is not None
+        if len(log) < 2:
+            return False
+        (sig_prev, fixes_prev), (sig_last, fixes_last) = log[-2], log[-1]
+        return sig_prev == sig_last and fixes_prev == fixes_last
 
 
 class BringupExhausted(RuntimeError):
@@ -416,6 +457,131 @@ class BringupExhausted(RuntimeError):
     `Settings.stage5_bringup_max_repairs` — the caller writes
     `mem.dynamic.result = not_run` (distinct from `refuted`) and lets the
     dynamic branch terminate; the static track is unaffected either way."""
+
+
+# Known bring-up failure signatures -> a human-readable diagnosis, matched
+# against the captured QEMU/chroot stdout+stderr. Purely additive/data-
+# driven — a new entry never requires new control flow. Order matters only
+# in that the first substring match wins; keep more specific patterns
+# above more general ones if that ever becomes ambiguous.
+_KNOWN_BRINGUP_ERRORS: dict[str, str] = {
+    "cannot change root directory": (
+        "chroot(2) failed inside the session container — this requires "
+        "CAP_SYS_CHROOT, which the container's default (non-root) user "
+        "does not have. Needs a privileged exec (user=\"root\") on the "
+        "launch command; see Settings.stage5_sandbox_allow_privileged."
+    ),
+    "no such file or directory": (
+        "the QEMU binary or a file/library the target opens at startup is "
+        "missing from the staged rootfs — check the QEMU static binary was "
+        "copied into the chroot root and that any dynamic interpreter/libs "
+        "the target needs are present."
+    ),
+    "invalid elf": (
+        "QEMU could not parse the target ELF — likely wrong "
+        "architecture/endianness selected for this target, or the binary "
+        "is corrupt/truncated in the extracted rootfs."
+    ),
+    "unsupported syscall": (
+        "the target issued a syscall this QEMU user-mode build does not "
+        "emulate — user-mode emulation may not be viable for this target; "
+        "consider system-mode (plan_emulation's 'system' mode) instead."
+    ),
+    "permission denied": (
+        "a file/device the target needs is not accessible to the session "
+        "user — check the placeholder file's permissions, or whether this "
+        "specific operation needs Settings.stage5_sandbox_allow_privileged."
+    ),
+}
+
+
+def _classify_bringup_fault(qemu_output: str) -> str:
+    """Match `qemu_output` (the captured QEMU/chroot stdout+stderr from a
+    failed bring-up attempt) against `_KNOWN_BRINGUP_ERRORS`, returning a
+    human-readable diagnosis string. Falls back to a generic "unrecognized"
+    signature when nothing matches — still useful as a FAULT SIGNATURE for
+    `BringupContext.no_progress_since_last_fault()`'s repeat-detection, even
+    when the cause can't be named."""
+    haystack = qemu_output.lower()
+    for needle, diagnosis in _KNOWN_BRINGUP_ERRORS.items():
+        if needle in haystack:
+            return diagnosis
+    return f"unrecognized bring-up failure: {qemu_output[:200]!r}"
+
+
+def _bringup_exec_user(ctx: BringupContext) -> str | None:
+    """The `user=` `exec_in_session` should run under for a command that
+    launches/execs the target INSIDE A CHROOT — the QEMU launch itself
+    (`_launch_qemu_and_wait`) and the Node 3 bring-up agent's `-strace`
+    discovery pass (`dynamic_agents._dispatch_bringup_tool`), which chroots
+    the same way. Returns `None` when the candidate isn't chrooted at all
+    (`rootfs_dir` unset) — nothing needs elevation. Otherwise returns
+    `"root"`, gated by `Settings.stage5_sandbox_allow_privileged`.
+
+    Raises `BringupExhausted` (never `DynamicFault`) when a chroot IS
+    required but privileged session commands are disabled: this is a
+    static precondition a repair retry cannot change, so it must not spend
+    any of the repair budget re-discovering the same refusal."""
+    if ctx.candidate.rootfs_dir is None:
+        return None
+    if not ctx.settings.stage5_sandbox_allow_privileged:
+        raise BringupExhausted(
+            f"{ctx.candidate.global_id}: target requires a chroot-based launch "
+            "(candidate.rootfs_dir is set), but "
+            "Settings.stage5_sandbox_allow_privileged=False forbids the "
+            "privileged session command chroot needs — cannot proceed."
+        )
+    return "root"
+
+
+async def ensure_session(ctx: BringupContext) -> SessionHandle:
+    """Start (if not already running) the session container this
+    candidate's whole bring-up/repair lifetime shares — split out of
+    `bringup_stabilize` so a caller can provision a LIVE session before
+    doing anything else with it. This exists specifically so the Node 3
+    bring-up agent (`dynamic_agents.bringup_agent`) has a session to drive
+    BEFORE it is invoked: that agent raises immediately when
+    `ctx.handle is None` (see its own docstring), so a caller (`dynamic_
+    graph._run_bringup`) must call this FIRST, not rely on
+    `bringup_stabilize` to create the session as a side effect of also
+    attempting a launch.
+
+    Idempotent — a second call with `ctx.handle` already set does nothing
+    beyond the network-grant bookkeeping, which only ever applies once
+    (`ctx.handle is None` guards the actual `start()` below).
+
+    Also pre-creates `CONTAINER_SCRATCH` (unprivileged, as the session's
+    default user) right after starting the container. This matters once a
+    chrooting bring-up later runs its launch command with `user="root"`
+    (see `_bringup_exec_user`): if THAT elevated command were the first to
+    `mkdir -p CONTAINER_SCRATCH`, the directory would end up root-owned,
+    and every later UNPRIVILEGED write into it (every GDB recipe file
+    `reach_target`/`satisfy_guards`/`instrument_trigger` write) would then
+    fail with permission denied. Creating it here, unprivileged, before
+    any elevated command can run, keeps it session-user-owned for the
+    whole session's lifetime."""
+    if ctx.handle is not None:
+        return ctx.handle
+
+    network_name: str | None = None
+    if _target_needs_network(ctx.plan) and ctx.settings.stage5_allow_network_grant:
+        network_name = f"fvvw-{uuid.uuid4().hex[:12]}"
+        ctx.applied_fixes.append(f"granted scoped network {network_name}")
+
+    ctx.handle = await ctx.session_executor.start(
+        image=ctx.settings.stage5_verification_image,
+        files=_workspace_dir_for(ctx),
+        network=network_name,
+    )
+    ctx.applied_fixes.append(f"started session {ctx.handle.container_name}")
+
+    await ctx.session_executor.exec_in_session(
+        ctx.handle,
+        f"mkdir -p {CONTAINER_SCRATCH}",
+        timeout=ctx.settings.stage5_qemu_timeout_seconds,
+    )
+
+    return ctx.handle
 
 
 async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
@@ -427,7 +593,9 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
     2. Build the exact launch command (chroot + CPU-probe env fix + QEMU +
        GDB stub flag + `-L` sysroot + target + argv) via
        `tools.qemu_gdb_tool.build_qemu_user_launch_command`.
-    3. Start (or reuse) the session container and launch QEMU inside it via
+    3. Ensure the session container is running (`ensure_session` — a
+       no-op if the Node 3 bring-up agent, or an earlier repair attempt,
+       already started one) and launch QEMU inside it via
        `exec_in_session` — backgrounded (the caller of THIS function is
        responsible for not blocking on it; see `_launch_qemu_backgrounded`).
     4. Verify the GDB stub is reachable with a lightweight probe.
@@ -462,10 +630,7 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
         ) as run,
         aphase("bringup_stabilize"),
     ):
-        network_name: str | None = None
-        if _target_needs_network(ctx.plan) and ctx.settings.stage5_allow_network_grant:
-            network_name = f"fvvw-{uuid.uuid4().hex[:12]}"
-            ctx.applied_fixes.append(f"granted scoped network {network_name}")
+        await ensure_session(ctx)
 
         # "." — the bind-mounted workspace root itself IS the rootfs root
         # (see `_workspace_dir_for`'s docstring); `chroot .` inside
@@ -490,19 +655,14 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
         )
         ctx.launch_cmd = launch_cmd
 
-        if ctx.handle is None:
-            ctx.handle = await ctx.session_executor.start(
-                image=ctx.settings.stage5_verification_image,
-                files=_workspace_dir_for(ctx),
-                network=network_name,
-            )
-            ctx.applied_fixes.append(f"started session {ctx.handle.container_name}")
-
         # Stage the static QEMU binary into the rootfs so `chroot . <qemu>`
         # can find it (see build_qemu_user_launch_command). Resolve the
         # real path via `command -v` (the Dockerfile symlinks
         # qemu-<arch> -> qemu-<arch>-static under /usr/bin) and copy it to
         # the rootfs root as `<arch>`-named, matching qemu_binary_in_chroot.
+        # Unprivileged: the workspace/rootfs bind mount is owned by the
+        # session's default user, and writing a new file into it needs no
+        # elevation (unlike chroot() itself, which the launch below does).
         if chrooting:
             copy_cmd = (
                 f'cp "$(command -v {arch_spec.user_binary})" '
@@ -526,7 +686,7 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
                 outputs={
                     "launch_cmd": launch_cmd,
                     "applied_fixes": list(ctx.applied_fixes),
-                    "network_granted": network_name is not None,
+                    "network_granted": bool(ctx.handle and ctx.handle.network_name),
                 }
             )
 
@@ -549,7 +709,18 @@ async def _launch_qemu_and_wait(ctx: BringupContext) -> None:
     Backgrounding means this returns as soon as the shell accepts the job,
     NOT once QEMU has bound the port — a GDB `target remote localhost:1234`
     that ran first would race the bind and fail with connection refused, so
-    the readiness poll here is what makes the subsequent batch reliable."""
+    the readiness poll here is what makes the subsequent batch reliable.
+
+    The backgrounded launch itself runs under `user=_bringup_exec_user(ctx)`
+    — `"root"` when the candidate is chrooted (gated by `Settings.
+    stage5_sandbox_allow_privileged`), `None` otherwise — since `chroot(2)`
+    needs `CAP_SYS_CHROOT`, which the session container's default user
+    lacks. Every OTHER command here (`pkill`, the readiness probe, the log
+    read) stays unprivileged; only the one composite command that actually
+    calls `chroot` is elevated. On a failed readiness probe, the QEMU/
+    chroot output is classified (`_classify_bringup_fault`) and recorded
+    (`ctx.record_bringup_fault`) BEFORE raising, so a caller can detect an
+    unchanging fault across repair attempts."""
     if ctx.handle is None:
         raise DynamicFault(f"{ctx.candidate.global_id}: no active session to launch QEMU in.")
 
@@ -558,6 +729,8 @@ async def _launch_qemu_and_wait(ctx: BringupContext) -> None:
     # Kill any straggler from a previous batch (best-effort — pkill exits
     # nonzero when nothing matches, which is fine); ` ; true` keeps the
     # exec from reporting failure on the common "nothing to kill" case.
+    # Unprivileged: killing a process this same session started needs no
+    # elevation.
     if arch_spec is not None:
         await ctx.session_executor.exec_in_session(
             ctx.handle,
@@ -565,11 +738,13 @@ async def _launch_qemu_and_wait(ctx: BringupContext) -> None:
             timeout=ctx.settings.stage5_qemu_timeout_seconds,
         )
 
+    launch_user = _bringup_exec_user(ctx)
     await ctx.session_executor.exec_in_session(
         ctx.handle,
         f"cd {CONTAINER_WORKDIR} && mkdir -p {CONTAINER_SCRATCH} && "
         f"({ctx.launch_cmd} > {_QEMU_LOG_PATH} 2>&1 &) ",
         timeout=ctx.settings.stage5_qemu_timeout_seconds,
+        user=launch_user,
     )
 
     probe = (
@@ -588,10 +763,12 @@ async def _launch_qemu_and_wait(ctx: BringupContext) -> None:
             timeout=ctx.settings.stage5_qemu_timeout_seconds,
         )
         qemu_output = (log_result.stdout + log_result.stderr).strip() or "(empty)"
+        diagnosis = _classify_bringup_fault(qemu_output)
+        ctx.record_bringup_fault(diagnosis)
         raise DynamicFault(
             f"{ctx.candidate.global_id}: QEMU gdbstub never opened port 1234 "
-            f"within the readiness window — launch_cmd={ctx.launch_cmd!r} "
-            f"qemu_output={qemu_output!r}"
+            f"within the readiness window — diagnosis={diagnosis!r} "
+            f"launch_cmd={ctx.launch_cmd!r} qemu_output={qemu_output!r}"
         )
 
 
@@ -1708,6 +1885,7 @@ __all__ = [
     "collect_signals",
     "direct_call_trigger",
     "dynamic_evaluate",
+    "ensure_session",
     "health_gate",
     "instrument_trigger",
     "match_oracle",

@@ -58,7 +58,13 @@ class SessionHandle:
     container_name: str
     """The `docker run -d --name <this>` container this handle addresses —
     same naming scheme `SandboxExecutor.run()` already uses for its one-shot
-    containers, so orphan cleanup tooling recognizes both."""
+    containers, so orphan cleanup tooling recognizes both. The container
+    itself always starts as its image's default user; a session-capable
+    executor's `exec_in_session()` grants root on a PER-COMMAND basis (an
+    optional `user=` argument) rather than starting the whole session
+    elevated — see `sandbox_executor.SandboxExecutor.exec_in_session()`'s
+    docstring for why (least-privilege: only the specific setup operation
+    that needs elevation gets it, never payload delivery)."""
     workspace_dir: Path | None = None
     """Host path bind-mounted into the session container, if any — mirrors
     `run()`'s `files` parameter. `None` for a session with no bind mount."""

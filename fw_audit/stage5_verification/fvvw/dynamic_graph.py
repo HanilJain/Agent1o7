@@ -137,48 +137,78 @@ class DynamicGraphDeps:
 async def _run_bringup(
     ctx: BringupContext, *, deps: DynamicGraphDeps
 ) -> dict:
-    """spec Node 3 body: run the agentic bring-up/arbitration loop
-    (`dynamic_agents.bringup_agent`), then attempt the actual QEMU
-    stand-up via the existing deterministic `bringup_stabilize` machinery
-    UNDERNEATH it — the agent decides WHAT fixes to apply (dummy files,
-    env overrides, ...), `bringup_stabilize`'s own launch-command assembly
-    and readiness poll is what actually starts/relaunches QEMU with those
-    fixes in effect. On a `BringupExhausted`, this node's own repair
-    budget (mem.repair) is spent and the graph should terminate rather
-    than loop again — surfaced as a `DynamicFault`-shaped dict the router
-    recognizes."""
-    from fw_audit.stage5_verification.fvvw.dynamic_track import bringup_stabilize
+    """spec Node 3 body: provision a live session, run the agentic
+    bring-up/arbitration loop (`dynamic_agents.bringup_agent`) against it,
+    then attempt the actual QEMU stand-up via the existing deterministic
+    `bringup_stabilize` machinery UNDERNEATH it — the agent decides WHAT
+    fixes to apply (dummy files, env overrides, ...), `bringup_stabilize`'s
+    own launch-command assembly and readiness poll is what actually
+    starts/relaunches QEMU with those fixes in effect. On a
+    `BringupExhausted`, this node's own repair budget (mem.repair) is
+    spent and the graph should terminate rather than loop again — surfaced
+    as a `DynamicFault`-shaped dict the router recognizes.
+
+    `ensure_session(ctx)` runs FIRST, before `bringup_agent` — a fixed
+    ordering bug: `bringup_agent` raises immediately when `ctx.handle is
+    None` (see its own docstring), and the session handle used to only
+    ever get created *inside* `bringup_stabilize`, which ran AFTER the
+    agent. On every fresh candidate that meant the agent's `ctx.handle is
+    None` check always fired, `bringup_agent` never got to run a single
+    turn, and the "LLM decides what to fix" half of Node 3 was dead code —
+    only the deterministic launch/retry loop underneath it ever executed.
+    Calling `ensure_session` here first means the agent's discovery/repair
+    tools (`run_strace_discovery`, `create_dummy_file`, `relaunch_and_
+    check`, ...) always have a real session to drive."""
+    from fw_audit.stage5_verification.fvvw.dynamic_track import (
+        bringup_stabilize,
+        ensure_session,
+    )
 
     async with aphase("bringup"):
+        result = None  # bound up front — several except branches below
+        # read it, and bringup_agent() can fail before ever assigning it
+        # (e.g. relaunch_and_check hitting a BringupExhausted precondition
+        # deep inside the agent's own tool loop).
         try:
+            await ensure_session(ctx)
+
             result = await bringup_agent(
                 ctx,
                 llm=deps.bringup_llm,
                 settings=deps.settings,
                 command_log=deps.command_log,
             )
-        except DynamicFault:
-            # agent couldn't even start (no session yet) — fall through to
-            # bringup_stabilize itself starting one.
-            result = None
 
-        # bringup_stabilize itself can raise a bare DynamicFault (a staging
-        # failure, or its OWN readiness-probe timeout via
-        # _launch_qemu_and_wait) — retriable via the same repair-count
-        # budget every other dynamic-track fault uses, not fatal on the
-        # first attempt. Retry it in a bounded loop here rather than let it
-        # escape this node uncaught: bringup_stabilize's own repair_count
-        # check is what actually bounds this loop, raising BringupExhausted
-        # (caught below) once Settings.stage5_bringup_max_repairs is spent —
-        # see the pre-graph run_dynamic_track_only's identical handling of
-        # this exact fault class (Bug C regression, test_fvvw_graph.py::
-        # test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_itself).
-        try:
+            # bringup_stabilize itself can raise a bare DynamicFault (a
+            # staging failure, or its OWN readiness-probe timeout via
+            # _launch_qemu_and_wait) — retriable via the same repair-count
+            # budget every other dynamic-track fault uses, not fatal on
+            # the first attempt. Retry it in a bounded loop here rather
+            # than let it escape this node uncaught: bringup_stabilize's
+            # own repair_count check is what actually bounds this loop,
+            # raising BringupExhausted (caught below) once Settings.
+            # stage5_bringup_max_repairs is spent — see the pre-graph
+            # run_dynamic_track_only's identical handling of this exact
+            # fault class (Bug C regression, test_fvvw_graph.py::
+            # test_run_fvvw_recovers_from_dynamic_fault_raised_by_bringup_
+            # itself). Additionally: if the SAME fault signature fires
+            # twice in a row with no new fix applied in between
+            # (`ctx.no_progress_since_last_fault()`), stop retrying early
+            # rather than spend the rest of the budget re-running an
+            # unchanged failure — the diagnosis from the classified fault
+            # is what makes it into BringupExhausted's message either way.
             while True:
                 try:
                     await bringup_stabilize(ctx)
                     break
-                except DynamicFault:
+                except DynamicFault as exc:
+                    if ctx.no_progress_since_last_fault():
+                        signature = ctx.fault_log[-1][0] if ctx.fault_log else str(exc)
+                        raise BringupExhausted(
+                            f"{ctx.candidate.global_id}: repair attempt made no "
+                            f"progress against a repeated bring-up fault — "
+                            f"{signature}"
+                        ) from exc
                     continue
         except BringupExhausted as exc:
             return {
@@ -190,6 +220,15 @@ async def _run_bringup(
                 "arbitration_log": result.arbitration_log if result else None,
                 "_bringup_exhausted": True,
             }
+        except DynamicFault:
+            # ensure_session's own start() failing raises a plain
+            # RuntimeError (uncaught, matching pre-existing behavior — see
+            # SandboxExecutor.start()'s docstring), so the only DynamicFault
+            # that can reach here is bringup_agent's "no active session"
+            # guard — now unreachable in normal operation since
+            # ensure_session runs first, but kept as a defensive fallback
+            # in case a future caller invokes bringup_agent without it.
+            result = None
 
         await cleanup_marker_artifact(ctx)
 

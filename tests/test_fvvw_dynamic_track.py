@@ -33,10 +33,13 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BringupContext,
     BringupExhausted,
     DynamicFault,
+    _bringup_exec_user,
+    _classify_bringup_fault,
     bringup_stabilize,
     cleanup_marker_artifact,
     collect_signals,
     dynamic_evaluate,
+    ensure_session,
     instrument_trigger,
     plan_emulation,
     reach_target,
@@ -353,6 +356,7 @@ class _FakeSessionExecutor:
 
     def __init__(self, on_exec=None) -> None:
         self.exec_calls: list[str] = []
+        self.exec_users: list[str | None] = []
         self.started = False
         self.stopped = False
         self._on_exec = on_exec
@@ -361,8 +365,9 @@ class _FakeSessionExecutor:
         self.started = True
         return SessionHandle(container_name="fake-session-abc123", workspace_dir=files)
 
-    async def exec_in_session(self, handle, command, *, timeout=None):
+    async def exec_in_session(self, handle, command, *, timeout=None, user=None):
         self.exec_calls.append(command)
+        self.exec_users.append(user)
         if self._on_exec is not None:
             result = self._on_exec(command)
             if result is not None:
@@ -616,6 +621,216 @@ async def test_bringup_stabilize_grants_network_when_allowed_and_needed(tmp_path
     await bringup_stabilize(ctx)
 
     assert any("granted scoped network" in f for f in ctx.applied_fixes)
+
+
+# ---------------------------------------------------------------------- #
+# Privilege escalation (chroot needs root) — per-command opt-in, never
+# session-wide; the launch is the ONLY command elevated, never the cp/
+# pkill/probe/log-read helpers around it.
+# ---------------------------------------------------------------------- #
+
+
+def test_bringup_exec_user_returns_none_when_not_chrooted(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.candidate = _candidate(binary_path=None, rootfs_dir=None)
+
+    assert _bringup_exec_user(ctx) is None
+
+
+def test_bringup_exec_user_returns_root_when_chrooted_and_allowed(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)  # _ctx's candidate sets rootfs_dir
+
+    assert _bringup_exec_user(ctx) == "root"
+
+
+def test_bringup_exec_user_raises_when_chrooted_but_privileged_disabled(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.settings = Settings(_env_file=None, FWA_STAGE5_SANDBOX_ALLOW_PRIVILEGED=False)
+
+    with pytest.raises(BringupExhausted, match="stage5_sandbox_allow_privileged"):
+        _bringup_exec_user(ctx)
+
+
+async def test_bringup_stabilize_elevates_only_the_launch_command(tmp_path: Path):
+    """The composite launch command (the one that runs `chroot`) must run
+    with user="root"; every other command in the same bring-up attempt —
+    the qemu-binary staging `cp`, the `pkill`, the readiness probe — must
+    stay unprivileged. Least-privilege: elevate only the ONE command that
+    actually needs CAP_SYS_CHROOT."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    await bringup_stabilize(ctx)
+
+    pairs = list(zip(executor.exec_calls, executor.exec_users, strict=True))
+    elevated = [cmd for cmd, user in pairs if user == "root"]
+    unprivileged = [cmd for cmd, user in pairs if user is None]
+    assert len(elevated) == 1
+    assert "chroot ." in elevated[0]
+    assert any("cp " in c for c in unprivileged)
+    assert any("pkill" in c for c in unprivileged)
+    assert any("04D2" in c for c in unprivileged)
+
+
+async def test_bringup_stabilize_never_elevates_when_not_chrooted(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.candidate = _candidate(binary_path=None, rootfs_dir=None)
+
+    await bringup_stabilize(ctx)
+
+    assert all(user is None for user in executor.exec_users)
+
+
+async def test_bringup_stabilize_fails_fast_when_chroot_required_but_privileged_disabled(
+    tmp_path: Path,
+):
+    """A chrooting target with privileged session commands disabled is a
+    static precondition retrying cannot fix — it must fail immediately
+    with a clear diagnosis (BringupExhausted), not spend the whole repair
+    budget hitting a raw 'chroot: ... Operation not permitted' repeatedly."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+    ctx.settings = Settings(_env_file=None, FWA_STAGE5_SANDBOX_ALLOW_PRIVILEGED=False)
+
+    with pytest.raises(BringupExhausted, match="stage5_sandbox_allow_privileged"):
+        await bringup_stabilize(ctx)
+
+    # Only the one attempt — no launch command was ever issued.
+    assert not any("chroot" in c for c in executor.exec_calls)
+
+
+# ---------------------------------------------------------------------- #
+# ensure_session — session-before-agent provisioning
+# ---------------------------------------------------------------------- #
+
+
+async def test_ensure_session_starts_a_session_when_none_exists(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    handle = await ensure_session(ctx)
+
+    assert executor.started
+    assert handle is ctx.handle
+    assert any(c.startswith("mkdir -p") for c in executor.exec_calls)
+
+
+async def test_ensure_session_is_idempotent(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    first = await ensure_session(ctx)
+    calls_after_first = len(executor.exec_calls)
+    second = await ensure_session(ctx)
+
+    assert first is second
+    assert len(executor.exec_calls) == calls_after_first  # no new exec on the second call
+
+
+async def test_ensure_session_precreates_scratch_dir_unprivileged(tmp_path: Path):
+    """The scratch dir must be created by the session's DEFAULT (non-root)
+    user, before any elevated command runs — else a root-owned scratch dir
+    would block every later unprivileged GDB-recipe write into it (see
+    ensure_session's own docstring)."""
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    await ensure_session(ctx)
+
+    pairs = list(zip(executor.exec_calls, executor.exec_users, strict=True))
+    mkdir_calls = [user for cmd, user in pairs if "mkdir" in cmd]
+    assert mkdir_calls == [None]
+
+
+# ---------------------------------------------------------------------- #
+# Fault classification + no-progress detection
+# ---------------------------------------------------------------------- #
+
+
+def test_classify_bringup_fault_recognizes_chroot_permission_error():
+    diagnosis = _classify_bringup_fault(
+        "chroot: cannot change root directory to '.': Operation not permitted"
+    )
+    assert "CAP_SYS_CHROOT" in diagnosis
+
+
+def test_classify_bringup_fault_falls_back_for_unknown_output():
+    diagnosis = _classify_bringup_fault("some never-before-seen QEMU crash text")
+    assert "unrecognized" in diagnosis
+
+
+def test_bringup_context_no_progress_false_on_first_fault(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    ctx.record_bringup_fault("chroot failed")
+
+    assert ctx.no_progress_since_last_fault() is False
+
+
+def test_bringup_context_no_progress_true_when_same_fault_repeats_with_no_new_fix(
+    tmp_path: Path,
+):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    ctx.record_bringup_fault("chroot failed")
+    ctx.record_bringup_fault("chroot failed")  # nothing added to applied_fixes in between
+
+    assert ctx.no_progress_since_last_fault() is True
+
+
+def test_bringup_context_no_progress_false_when_a_fix_was_applied_between_faults(
+    tmp_path: Path,
+):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    ctx.record_bringup_fault("missing library")
+    ctx.applied_fixes.append("created dummy file /lib/foo.so")
+    ctx.record_bringup_fault("missing library")  # same signature, but a fix WAS applied
+
+    assert ctx.no_progress_since_last_fault() is False
+
+
+def test_bringup_context_no_progress_false_when_signature_changes(tmp_path: Path):
+    executor = _FakeSessionExecutor()
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    ctx.record_bringup_fault("chroot failed")
+    ctx.record_bringup_fault("missing library")  # different signature
+
+    assert ctx.no_progress_since_last_fault() is False
+
+
+async def test_bringup_stabilize_records_fault_signature_on_dynamic_fault(tmp_path: Path):
+    def on_exec(command: str):
+        if "04D2" in command:
+            return ExecutionResult(
+                command=command, returncode=1, stdout="", stderr="", timed_out=False
+            )
+        if command.startswith("cat "):
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout="chroot: cannot change root directory to '.': Operation not permitted",
+                stderr="",
+                timed_out=False,
+            )
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    with pytest.raises(DynamicFault):
+        await bringup_stabilize(ctx)
+
+    assert len(ctx.fault_log) == 1
+    assert "CAP_SYS_CHROOT" in ctx.fault_log[0][0]
 
 
 async def test_reach_target_raises_dynamic_fault_on_connection_refused(tmp_path: Path):

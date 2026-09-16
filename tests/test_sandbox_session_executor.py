@@ -131,6 +131,45 @@ async def test_exec_in_session_composes_docker_exec(monkeypatch):
     assert captured["args"] == ["exec", "fw-audit-sandbox-session-abc123", "sh", "-c", "echo hello"]
 
 
+async def test_exec_in_session_omits_dash_u_by_default(monkeypatch):
+    """Default (no `user=`) must compose the exact same argv as before this
+    capability existed — a session-wide-unprivileged regression guard."""
+    captured: dict = {}
+
+    async def fake_run_command(binary, args, *, settings=None):
+        captured["args"] = args
+        return _ok(binary, args)
+
+    monkeypatch.setattr("fw_audit.executors.sandbox_executor.run_command", fake_run_command)
+
+    executor = SandboxExecutor(Settings(_env_file=None))
+    handle = SessionHandle(container_name="c1")
+    await executor.exec_in_session(handle, "echo hello")
+
+    assert "-u" not in captured["args"]
+    assert captured["args"] == ["exec", "c1", "sh", "-c", "echo hello"]
+
+
+async def test_exec_in_session_with_user_adds_dash_u_flag(monkeypatch):
+    """`user="root"` must escalate ONLY this one `docker exec` call — the
+    per-command privilege model (never session-wide) that lets `chroot`
+    run as root while every other command in the same session, including
+    payload delivery, stays unprivileged."""
+    captured: dict = {}
+
+    async def fake_run_command(binary, args, *, settings=None):
+        captured["args"] = args
+        return _ok(binary, args)
+
+    monkeypatch.setattr("fw_audit.executors.sandbox_executor.run_command", fake_run_command)
+
+    executor = SandboxExecutor(Settings(_env_file=None))
+    handle = SessionHandle(container_name="c1")
+    await executor.exec_in_session(handle, "chroot . /qemu-mips ...", user="root")
+
+    assert captured["args"] == ["exec", "-u", "root", "c1", "sh", "-c", "chroot . /qemu-mips ..."]
+
+
 async def test_exec_in_session_applies_custom_timeout(monkeypatch):
     captured: dict = {}
 

@@ -90,7 +90,7 @@ class _FakeSessionExecutor:
     async def start(self, *, image=None, files=None, network=None):
         return SessionHandle(container_name="fake-session", workspace_dir=files)
 
-    async def exec_in_session(self, handle, command, *, timeout=None):
+    async def exec_in_session(self, handle, command, *, timeout=None, user=None):
         if "pgrep" in command:
             # health_gate's (Node 4) liveness check.
             return ExecutionResult(

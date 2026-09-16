@@ -55,8 +55,10 @@ from fw_audit.stage5_verification.fvvw.dynamic_prompts import (
 from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BenignMarkerViolation,
     BringupContext,
+    BringupExhausted,
     DynamicFault,
     PayloadContainmentViolation,
+    _bringup_exec_user,
     _launch_qemu_and_wait,
     _target_relpath_in_workspace,
     collect_observation,
@@ -263,10 +265,21 @@ async def _dispatch_bringup_tool(
             rootfs_relpath="." if chrooting else None,
             qemu_binary_in_chroot=qemu_binary_in_chroot,
         )
+        # Chroots the same way bringup_stabilize's own launch does, so it
+        # needs the same per-command elevation — see _bringup_exec_user.
+        # Unlike the deterministic launch path, a disabled-privilege
+        # precondition here is fed back to the LLM as an observation
+        # (never raised) — bringup_agent's contract is to never crash on
+        # a survivable outcome, only on an unusable session.
+        try:
+            strace_user = _bringup_exec_user(ctx)
+        except BringupExhausted as exc:
+            return f"run_strace_discovery unavailable: {exc}", None
         result = await ctx.session_executor.exec_in_session(
             ctx.handle,
             f"cd {CONTAINER_WORKDIR} && timeout 5 {cmd} 2>&1 | head -100",
             timeout=ctx.settings.stage5_qemu_timeout_seconds,
+            user=strace_user,
         )
         return (result.stdout + result.stderr)[:4000], None
 
