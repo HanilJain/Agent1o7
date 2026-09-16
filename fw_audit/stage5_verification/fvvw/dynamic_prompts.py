@@ -224,11 +224,18 @@ def render_trigger_brief(
     vuln_class: str,
     sink_expression: str,
     emulation_mode: str,
+    allowed_delivery_tools: list[str] | None = None,
 ) -> str:
     """The trigger agent's per-invocation context — the hypothesis's
     proof/disproof conditions plus enough finding context to tailor the
     payload to the specific vulnerability class, per this module's system
-    prompt's own "tailor the payload" rule."""
+    prompt's own "tailor the payload" rule.
+
+    `allowed_delivery_tools`, when given, is stated as a HARD constraint,
+    not a suggestion — `dynamic_agents.trigger_agent`'s dispatcher refuses
+    any `deliver_via_*` tool not in this list regardless of what the agent
+    proposes, so telling it up front avoids wasting a step on a proposal
+    that will just be bounced back."""
     lines = [
         f"global_id: {global_id}",
         f"trigger_shape: {trigger_shape}",
@@ -243,6 +250,11 @@ def render_trigger_brief(
         lines += [f"  - {p}" for p in preconditions]
     else:
         lines.append("  (none)")
+    if allowed_delivery_tools:
+        lines.append(
+            f"ALLOWED delivery tools for this run (hard constraint — any other "
+            f"deliver_via_* proposal will be refused): {', '.join(allowed_delivery_tools)}"
+        )
     return "\n".join(lines)
 
 

@@ -7,6 +7,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+from pydantic import ValidationError
+
 from fw_audit.common.verification import (
     Agreement,
     DynamicPlan,
@@ -166,3 +169,66 @@ def test_fvvw_report_round_trips_with_both_track_results():
     parsed = FVVWReport.model_validate_json(report.model_dump_json())
     assert parsed == report
     assert parsed.schema_version == 1
+
+
+# ---------------------------------------------------------------------- #
+# GuardSpec.forced_value — regression for the `sbin_hostapd` production
+# failure: a strategy-agent rationale sentence landed directly in
+# `forced_value` and was interpolated verbatim into a GDB `set $reg = ...`
+# statement, which GDB then parsed as an invalid expression and aborted
+# the whole recipe. `forced_value` and `rationale` are separate fields —
+# model-layer validation is the FIRST of two independent checks (the
+# second, codegen-layer one lives in
+# tests/test_stage5_qemu_gdb_tool.py::
+# test_render_guard_breakpoint_commands_rejects_rationale_as_forced_value).
+# ---------------------------------------------------------------------- #
+
+
+def test_guard_spec_accepts_integer_forced_value():
+    guard = GuardSpec(name="ok", addr="0x1000", forced_value="1")
+    assert guard.forced_value == "1"
+
+
+def test_guard_spec_accepts_hex_forced_value():
+    guard = GuardSpec(name="ok", addr="0x1000", forced_value="0x10")
+    assert guard.forced_value == "0x10"
+
+
+def test_guard_spec_accepts_register_forced_value():
+    guard = GuardSpec(name="ok", addr="0x1000", forced_value="$a0")
+    assert guard.forced_value == "$a0"
+
+
+def test_guard_spec_accepts_empty_forced_value():
+    """Empty means 'observe only, don't force' — always valid."""
+    guard = GuardSpec(name="ok", addr="0x1000", forced_value="")
+    assert guard.forced_value == ""
+
+
+def test_guard_spec_rejects_the_exact_historical_bad_forced_value():
+    """The literal value from the `sbin_hostapd` production log."""
+    with pytest.raises(ValidationError, match="not a valid GDB expression"):
+        GuardSpec(
+            name="single_quote_escaping_check",
+            addr="",
+            forced_value="absent - no escaping/backslashing applied to param_2 before sprintf",
+        )
+
+
+def test_guard_spec_rejects_arbitrary_prose_forced_value():
+    with pytest.raises(ValidationError, match="not a valid GDB expression"):
+        GuardSpec(name="ok", addr="0x1000", forced_value="raw TLV octet string copied in")
+
+
+def test_guard_spec_rationale_is_free_text_and_never_validated():
+    """`rationale` carries exactly the kind of sentence `forced_value`
+    must reject — confirming the two fields are genuinely independent."""
+    guard = GuardSpec(
+        name="wps_get_value_sanitization",
+        addr="",
+        forced_value="",
+        rationale="raw TLV octet string copied into __ptr/auStack_1a8 without character "
+        "filtering",
+    )
+    assert "TLV" in guard.rationale
+    assert guard.forced_value == ""

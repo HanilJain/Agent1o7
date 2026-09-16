@@ -16,8 +16,11 @@ placeholder.
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
+
+from fw_audit.common.verification import GDB_FORCED_VALUE_RE
 
 CONTAINER_WORKDIR = "/work"
 
@@ -279,7 +282,22 @@ def render_gdb_recipe(
     place the `target remote`/`set architecture`/`set pagination off`/
     `set confirm off` boilerplate FVVW §7's recipe describes lives, so
     every dynamic-track node's recipe shares it instead of re-deriving it.
+
+    Raises `ValueError` if `entry_addr` is empty/unresolved — an unresolved
+    functional entry is a genuine bring-up/plan fault (there is nothing to
+    break at), not something to paper over by emitting a bare `break *`,
+    which GDB rejects with "Argument required (expression to compute)" and
+    aborts the ENTIRE batch script at that line — silently skipping every
+    breakpoint_commands entry after it too. Callers (`fvvw.dynamic_track`)
+    catch this and re-raise as their own `DynamicFault`, matching the
+    documented "raises DynamicFault if the GDB batch call itself errors"
+    contract each node already carries.
     """
+    if not entry_addr.strip():
+        raise ValueError(
+            "render_gdb_recipe: entry_addr is empty — cannot emit 'break *' with no "
+            "operand (GDB rejects it and aborts the whole recipe)."
+        )
     lines = [
         f"set architecture {architecture}",
         "set pagination off",
@@ -299,16 +317,109 @@ def render_guard_breakpoint_commands(
     address, print the REAL (un-overridden) return value first (logged via
     a distinguishable marker so `bringup_stabilize`/the report can later
     state honestly what the default behavior was), force it to
-    `forced_value`, then continue. Register defaults to the architecture's
-    first return-value-bearing register (`arg_registers[0]`) unless the
-    caller names a different one."""
-    return [
+    `forced_value` IF one was given, then continue. Register defaults to
+    the architecture's first return-value-bearing register
+    (`arg_registers[0]`) unless the caller names a different one.
+
+    Two deliberate safety behaviors, both guarding against the same class
+    of "GDB aborts mid-script, everything after this guard silently never
+    runs" failure a single bad line can cause:
+
+    - If `addr` is empty/unresolved, this guard is skipped ENTIRELY (no
+      break/continue emitted for it) rather than emitting `break *` with no
+      operand, which GDB rejects and which aborts the rest of the recipe —
+      including every OTHER guard queued after this one. An unresolved
+      guard address means "we can't test this guard dynamically", not
+      "test it by breaking everywhere".
+    - If `forced_value` is empty, this guard is OBSERVED (the real value is
+      still logged via `printf`) but not forced — no `set` line is emitted.
+      This is for guards that document an absence (e.g. "no sanitizer was
+      found on this path") rather than a concrete value to drive execution
+      past a check; manufacturing a fake forced value for something that
+      was never meant to be executed is exactly the historical bug this
+      guards against (see `common.verification.GuardSpec`'s docstring).
+    - If `forced_value` is non-empty, it is validated against
+      `common.verification.GDB_FORCED_VALUE_RE` before being interpolated —
+      raises `ValueError` on anything that isn't a GDB-expression-shaped
+      value (integer literal, `$register`, or bare symbol), so a rationale
+      sentence can never reach the `set` line even if `GuardSpec`'s own
+      pydantic validation were somehow bypassed upstream. Defense in depth,
+      not a substitute for the schema-level check.
+    """
+    if not addr.strip():
+        return []
+    commands = [
         f"break *{normalize_hex_addr(addr)}",
         "continue",
         f'printf "{log_marker}:real=%d\\n", {register}',
-        f"set {register} = {forced_value}",
-        "continue",
     ]
+    if forced_value.strip():
+        if not GDB_FORCED_VALUE_RE.match(forced_value.strip()):
+            raise ValueError(
+                f"render_guard_breakpoint_commands: forced_value={forced_value!r} is not a "
+                "valid GDB expression (integer literal, $register, or bare symbol) — refusing "
+                "to interpolate it into a 'set' statement. This should have been caught by "
+                "GuardSpec's own field validator; treat this as a defense-in-depth failure."
+            )
+        commands.append(f"set {register} = {forced_value}")
+    commands.append("continue")
+    return commands
+
+
+_BARE_BREAK_STAR_RE = re.compile(r"^\s*break\s*\*\s*$")
+"""Matches a `break *` line with NO address operand — the exact GDB error
+`Argument required (expression to compute).` this project hit in
+production (see `render_gdb_recipe`/`render_guard_breakpoint_commands`'s
+empty-addr guards). A trailing `*<addr>` or `*<symbol>` does not match."""
+
+_SET_REGISTER_LINE_RE = re.compile(r"^\s*set\s+(\$[a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$")
+"""Matches a `set $reg = <rhs>` line and captures the right-hand side, so
+`lint_gdb_recipe` can validate it against `GDB_FORCED_VALUE_RE` the same
+way `render_guard_breakpoint_commands` does. Deliberately narrow to `set
+$reg = ...` (register assignment) — other `set` lines this recipe emits
+(`set architecture ...`, `set pagination off`, `set confirm off`) are
+fixed boilerplate this module controls itself, not guard-supplied data,
+so they are intentionally not in scope for this check."""
+
+
+def lint_gdb_recipe(recipe: str) -> None:
+    """Pre-flight syntax check run on a FULLY ASSEMBLED recipe (the output
+    of `render_gdb_recipe`) right before it is written to disk and handed
+    to `gdb-multiarch -batch -x`, independent of whatever path built it.
+
+    This is deliberately a second, recipe-level check — not a replacement
+    for the per-guard validation `render_guard_breakpoint_commands` and
+    `GuardSpec`'s own pydantic validator already do. Those two catch a bad
+    VALUE before a line is even constructed; this one catches a bad LINE
+    regardless of how the recipe text was assembled (e.g. a future
+    call site that concatenates recipe fragments some other way, or a
+    hand-edited recipe passed into a debug helper) — the same
+    defense-in-depth reasoning `render_guard_breakpoint_commands`'s own
+    docstring gives for re-validating `forced_value` there.
+
+    Raises `ValueError` (never partially — the whole recipe is checked
+    before any of it is reported) describing every offending line found,
+    so a caller gets one clear "invalid GDB recipe" failure instead of
+    watching GDB abort silently mid-session with everything after that
+    line never executing. Does nothing (returns `None`) on a clean recipe.
+    """
+    problems: list[str] = []
+    for lineno, line in enumerate(recipe.splitlines(), start=1):
+        if _BARE_BREAK_STAR_RE.match(line):
+            problems.append(f"line {lineno}: 'break *' has no address operand: {line!r}")
+            continue
+        set_match = _SET_REGISTER_LINE_RE.match(line)
+        if set_match and not GDB_FORCED_VALUE_RE.match(set_match.group(2)):
+            problems.append(
+                f"line {lineno}: 'set {set_match.group(1)} = ...' right-hand side "
+                f"{set_match.group(2)!r} is not a valid GDB expression "
+                "(integer literal, $register, or bare symbol): "
+                f"{line!r}"
+            )
+    if problems:
+        raise ValueError(
+            "invalid GDB recipe — refusing to write it to disk:\n" + "\n".join(problems)
+        )
 
 
 def render_trigger_breakpoint_commands(
