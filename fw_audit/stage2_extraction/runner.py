@@ -15,6 +15,7 @@ from pathlib import Path
 
 from fw_audit.common.schemas import ExtractionStatus
 from fw_audit.config.settings import get_settings
+from fw_audit.observability import capture_run_log, configure_tracing, flush_traces
 from fw_audit.stage2_extraction.extract import Stage2InputError, run_extraction
 
 logger = logging.getLogger("fw_audit.stage2_extraction")
@@ -103,23 +104,35 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    settings = get_settings()
+    configure_tracing(settings)
+    # `stage1_summary_path`'s parent IS `db_subfolder` (Stage 1 writes
+    # `stage1_summary.json` directly under it) — known up front, unlike
+    # Stage 1 itself, so no post-hoc resolution trick is needed here.
+    db_subfolder = stage1_summary_path.parent
+    run_id = args.run_id or "run"
+
     try:
-        summary = asyncio.run(
-            run_extraction(
-                stage1_summary_path=stage1_summary_path,
-                run_id=args.run_id,
-                only=tuple(args.only),
-                dry_run=args.dry_run,
-            )
-        )
-    except Stage2InputError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        with capture_run_log(settings, db_subfolder=db_subfolder, stage="2", run_id=run_id):
+            try:
+                summary = asyncio.run(
+                    run_extraction(
+                        stage1_summary_path=stage1_summary_path,
+                        run_id=args.run_id,
+                        only=tuple(args.only),
+                        dry_run=args.dry_run,
+                    )
+                )
+            except Stage2InputError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
 
-    _print_summary(summary)
-    print(f"\nMachine-readable summary: {summary.db_subfolder}/stage2/stage2_summary.json")
+            _print_summary(summary)
+            print(f"\nMachine-readable summary: {summary.db_subfolder}/stage2/stage2_summary.json")
 
-    return 1 if summary.status == ExtractionStatus.FAILED else 0
+            return 1 if summary.status == ExtractionStatus.FAILED else 0
+    finally:
+        flush_traces()
 
 
 if __name__ == "__main__":

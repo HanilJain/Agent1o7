@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fw_audit.common.schemas import extension_from_path
 from fw_audit.config.settings import Settings, get_settings
-from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import capture_run_log, configure_tracing, flush_traces
 from fw_audit.observability import layout as usage_layout
 from fw_audit.observability.usage import (
     UsageBudgetExceededError,
@@ -183,46 +183,50 @@ def main(argv: list[str] | None = None) -> int:
     # the JSONL path is built from the SAME `settings.db_subfolder(stem)`
     # logic `run_ingestion` uses internally — see that function's body.
     stem = args.db_subfolder or firmware_path.stem
-    usage_dir_ = usage_layout.usage_dir(settings.db_subfolder(stem))
+    resolved_db_subfolder = settings.db_subfolder(stem)
+    usage_dir_ = usage_layout.usage_dir(resolved_db_subfolder)
 
     try:
-        with usage_registry(
-            jsonl_path=(
-                usage_layout.usage_jsonl_path(usage_dir_, stage="1", run_id=run_id)
-                if settings.llm_usage_artifact
-                else None
-            ),
-            settings=settings,
-        ) as registry:
-            try:
-                result = asyncio.run(
-                    run_ingestion(
-                        str(firmware_path),
-                        is_tplink=args.tplink,
-                        db_subfolder_name=args.db_subfolder,
-                        run_id=args.run_id,
-                        settings=settings,
+        with capture_run_log(
+            settings, db_subfolder=resolved_db_subfolder, stage="1", run_id=run_id
+        ):
+            with usage_registry(
+                jsonl_path=(
+                    usage_layout.usage_jsonl_path(usage_dir_, stage="1", run_id=run_id)
+                    if settings.llm_usage_artifact
+                    else None
+                ),
+                settings=settings,
+            ) as registry:
+                try:
+                    result = asyncio.run(
+                        run_ingestion(
+                            str(firmware_path),
+                            is_tplink=args.tplink,
+                            db_subfolder_name=args.db_subfolder,
+                            run_id=args.run_id,
+                            settings=settings,
+                        )
                     )
-                )
-            except UsageBudgetExceededError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 1
-            finally:
-                if settings.llm_usage_artifact:
-                    registry.write_report(
-                        usage_layout.usage_report_path(usage_dir_, stage="1", run_id=run_id),
-                        stage="1",
-                        run_id=args.run_id or "",
+                except UsageBudgetExceededError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 1
+                finally:
+                    if settings.llm_usage_artifact:
+                        registry.write_report(
+                            usage_layout.usage_report_path(usage_dir_, stage="1", run_id=run_id),
+                            stage="1",
+                            run_id=args.run_id or "",
+                        )
+
+                _print_summary(result)
+
+                if show_usage:
+                    summary_text = format_usage_summary(
+                        registry.snapshot(stage="1", run_id=args.run_id or "")
                     )
-
-            _print_summary(result)
-
-            if show_usage:
-                summary_text = format_usage_summary(
-                    registry.snapshot(stage="1", run_id=args.run_id or "")
-                )
-                if summary_text:
-                    print(f"\n{summary_text}")
+                    if summary_text:
+                        print(f"\n{summary_text}")
     finally:
         flush_traces()
 

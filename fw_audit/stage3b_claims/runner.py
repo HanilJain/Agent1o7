@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 from fw_audit.config.settings import get_settings
-from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import capture_run_log, configure_tracing, flush_traces
 from fw_audit.observability import layout as usage_layout
 from fw_audit.observability.usage import (
     UsageBudgetExceededError,
@@ -156,14 +156,17 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 
     run_id = args.run_id or "run"
     usage_dir_ = usage_layout.usage_dir(db_subfolder)
-    with usage_registry(
-        jsonl_path=(
-            usage_layout.usage_jsonl_path(usage_dir_, stage="3b", run_id=run_id)
-            if settings.llm_usage_artifact
-            else None
-        ),
-        settings=settings,
-    ) as registry:
+    with (
+        capture_run_log(settings, db_subfolder=db_subfolder, stage="3b", run_id=run_id),
+        usage_registry(
+            jsonl_path=(
+                usage_layout.usage_jsonl_path(usage_dir_, stage="3b", run_id=run_id)
+                if settings.llm_usage_artifact
+                else None
+            ),
+            settings=settings,
+        ) as registry,
+    ):
         try:
             summary = asyncio.run(
                 ingest_report(

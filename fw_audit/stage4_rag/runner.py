@@ -25,11 +25,12 @@ import argparse
 import asyncio
 import logging
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fw_audit.config.settings import Settings, get_settings
-from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import capture_run_log, configure_tracing, flush_traces
 from fw_audit.observability import layout as usage_layout
 from fw_audit.observability.usage import (
     UsageBudgetExceededError,
@@ -337,8 +338,13 @@ def main(argv: list[str] | None = None) -> int:
         usage_dir_ = usage_layout.usage_dir(db_subfolder)
         jsonl_path = usage_layout.usage_jsonl_path(usage_dir_, stage="4", run_id=run_id)
 
+    log_ctx = (
+        capture_run_log(settings, db_subfolder=db_subfolder, stage="4", run_id=run_id)
+        if db_subfolder is not None
+        else nullcontext()
+    )
     try:
-        with usage_registry(jsonl_path=jsonl_path, settings=settings) as registry:
+        with log_ctx, usage_registry(jsonl_path=jsonl_path, settings=settings) as registry:
             try:
                 if args.command == "build-corpus":
                     return _cmd_build_corpus(args)

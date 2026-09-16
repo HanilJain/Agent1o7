@@ -26,6 +26,12 @@ piece of the design:
   policy table independent of the counting mechanism.
 * `layout` — pure path algebra for the `<db_subfolder>/usage/` artifact,
   matching every stage's own `layout.py` convention.
+* `logfile` — `capture_run_log()`: persists every stage's console output
+  (both `logging` records and plain `print()` output) to `<db_subfolder>/
+  logs/<stage>.<run_id>.log`, plus a tail note cross-referencing that run's
+  LangSmith project when tracing was active. Same "always on, never breaks
+  a real run" precedent as `usage`/`stage5_verification.cmdlog`, gated only
+  by `Settings.log_to_file` (not `langsmith_tracing`).
 
 Every public function in `tracing`/`context`/`spans` is a true no-op — same
 behavior, same return values, no `langsmith` import attempted — when
@@ -43,6 +49,7 @@ from fw_audit.observability.context import (
     current_context,
     trace_context,
 )
+from fw_audit.observability.logfile import capture_run_log, log_file_path
 from fw_audit.observability.pricing import ModelPrice, estimate_cost, lookup_price
 from fw_audit.observability.spans import (
     aspan,
@@ -82,8 +89,10 @@ __all__ = [
     "lookup_price",
     "trace_context",
     "aspan",
+    "capture_run_log",
     "current_trace_url",
     "format_usage_summary",
+    "log_file_path",
     "run_config",
     "span",
     "stamp_usage_metadata",

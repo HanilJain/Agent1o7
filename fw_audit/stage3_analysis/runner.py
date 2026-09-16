@@ -70,7 +70,7 @@ import sys
 from pathlib import Path
 
 from fw_audit.config.settings import get_settings
-from fw_audit.observability import configure_tracing, flush_traces
+from fw_audit.observability import capture_run_log, configure_tracing, flush_traces
 from fw_audit.observability import layout as usage_layout
 from fw_audit.observability.usage import (
     UsageBudgetExceededError,
@@ -359,14 +359,18 @@ def main(argv: list[str] | None = None) -> int:
 
     chunk_handles = None
     usage_dir_ = usage_layout.usage_dir(report.db_subfolder)
-    with usage_registry(
-        jsonl_path=(
-            usage_layout.usage_jsonl_path(usage_dir_, stage="3", run_id=args.run_id or "run")
-            if settings.llm_usage_artifact
-            else None
-        ),
-        settings=settings,
-    ) as registry:
+    run_id = args.run_id or "run"
+    with (
+        capture_run_log(settings, db_subfolder=report.db_subfolder, stage="3", run_id=run_id),
+        usage_registry(
+            jsonl_path=(
+                usage_layout.usage_jsonl_path(usage_dir_, stage="3", run_id=args.run_id or "run")
+                if settings.llm_usage_artifact
+                else None
+            ),
+            settings=settings,
+        ) as registry,
+    ):
         if args.analyze:
             assert chunk_selection is not None  # guaranteed by the exit-2 check above
             try:

@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     # ---- Environment / logging ----------------------------------------
     environment: str = Field(default="development", validation_alias="FWA_ENVIRONMENT")
     log_level: str = Field(default="INFO", validation_alias="FWA_LOG_LEVEL")
+    log_to_file: bool = Field(default=True, validation_alias="FWA_LOG_TO_FILE")
+    """Master switch for `observability.logfile.capture_run_log` — every
+    stage's console output (both `logging` records and plain `print()`
+    output) additionally persisted to `<db_subfolder>/logs/<stage>.
+    <run_id>.log`. On by default, same "always on, never breaks a real
+    run" precedent as `stage5_command_log`/`llm_usage_tracking` — a
+    terminal's scrollback is otherwise the only record of a run. Set
+    `False` to suppress the extra disk writes (e.g. a constrained CI
+    runner); it never affects a run's actual behavior either way."""
 
     # ---- LLM credentials ----------------------------------------------
     anthropic_api_key: str | None = Field(
