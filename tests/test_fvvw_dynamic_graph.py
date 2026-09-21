@@ -168,6 +168,40 @@ def test_build_track_result_includes_memory_diff_and_artifacts_when_present():
     assert result.evidence["filesystem_artifacts"] == ["/tmp/claim_001_proof"]
 
 
+def test_confirmed_route_refused_on_empty_observation():
+    """T1-B defense in depth: even if some future bug lets a `confirmed`
+    RouteDecision reach `_build_track_result` with an observation carrying
+    NO positive evidence (no signal, no filesystem_artifacts, no captured
+    sink argument via reached_sink, no memory diff), the verdict is
+    downgraded to INCONCLUSIVE — never a persisted CONFIRMED TrackResult
+    built on an empty observation. This is the exact DIR-825 fingerprint:
+    a route claims confirmed but the ObservationRecord backing it is
+    empty."""
+    decision = RouteDecision(
+        route="confirmed", diagnosis="deterministic oracle match: 'X'", confidence="HIGH"
+    )
+    empty_observation = ObservationRecord()  # signal=None, no artifacts, no memory diff
+    result = _build_track_result(
+        decision, empty_observation, iteration=1, reached_sink=False
+    )
+    assert result.verdict == VerificationVerdict.INCONCLUSIVE
+    assert result.proved_hypothesis == "none"
+    assert result.evidence["budget_exhausted"] is True
+    assert "empty observation" in result.evidence["reason"].lower()
+
+
+def test_confirmed_route_allowed_when_reached_sink_true():
+    """The positive counterpart: a `confirmed` route with `reached_sink=
+    True` (a genuinely captured sink argument, even with no crash signal)
+    is NOT downgraded — reached_sink is one of T1-B's four positive-
+    evidence signals."""
+    decision = RouteDecision(route="confirmed", diagnosis="d", confidence="HIGH")
+    result = _build_track_result(
+        decision, ObservationRecord(), iteration=1, reached_sink=True
+    )
+    assert result.verdict == VerificationVerdict.CONFIRMED
+
+
 # --------------------------------------------------------------------- #
 # _run_evaluate_route — deterministic first pass (never reaches the LLM)
 # --------------------------------------------------------------------- #
@@ -299,6 +333,92 @@ async def test_evaluate_route_falls_through_to_router_when_ambiguous():
     assert router_llm.calls == 1
     assert result["route"].route == "retry_trigger"
     assert "dynamic_result" not in result
+
+
+async def test_process_exit_before_bp_routes_to_escalate():
+    """T1-E: an observation showing `process_exited_before_bp=True`
+    (the process died during startup/dispatch, before ever reaching the
+    entry/sink breakpoint) must route to `escalate_direct_call` — NEVER
+    `retry_gdb_attach`, which would re-attach to the same already-dead
+    process forever until the budget forces INCONCLUSIVE (the DIR-825
+    incident's actual failure loop). Checked entirely deterministically,
+    via `fvvw.supervisor.propose_action` — no LLM call needed."""
+    observation = ObservationRecord(process_exited_before_bp=True)
+    result = await _run_evaluate_route(
+        deps=_deps(max_iterations=5),
+        global_id="g1",
+        plan=_plan(oracle="SIGSEGV"),
+        observation=observation,
+        reached=False,
+        reached_sink=False,
+        iteration=1,
+    )
+    assert result["route"].route == "escalate_direct_call"
+    assert "dynamic_result" not in result  # not a terminal route
+
+
+async def test_evaluate_route_persists_verification_state_across_rounds():
+    """T3-O: the canonical VerificationState returned in one round's
+    result must be exactly what a caller passes back in as the NEXT
+    round's `verification_state` — proving the state genuinely
+    accumulates (attempt_history grows) rather than resetting each
+    call."""
+    deps = _deps(max_iterations=10)
+    plan = _plan(oracle="SIGSEGV")
+    observation = ObservationRecord()  # never matches, never has evidence
+
+    state = None
+    for i in range(1, 4):
+        result = await _run_evaluate_route(
+            deps=deps,
+            global_id="g1",
+            plan=plan,
+            observation=observation,
+            reached=False,
+            reached_sink=False,
+            iteration=i,
+            verification_state=state,
+        )
+        state = result["verification_state"]
+        assert state is not None
+
+    # Three rounds of an unchanging "not reached" condition must have
+    # accumulated attempt history — proving persistence, not a fresh
+    # state each call.
+    assert len(state.attempt_history) == 3
+
+
+async def test_confirmed_refused_without_evidence_via_supervisor(monkeypatch):
+    """Rejection of confirmation without evidence, exercised through the
+    FULL `_run_evaluate_route` pipeline (not `_build_track_result` in
+    isolation — see `test_confirmed_route_refused_on_empty_observation`/
+    `test_confirmed_route_allowed_when_reached_sink_true` for that layer
+    directly). `match_oracle`'s own current implementation makes
+    `oracle_hit=True` co-occurring with `has_evidence=False` structurally
+    unreachable (every one of its positive-match branches requires a
+    fact that ALSO satisfies `_has_positive_evidence`) — this is
+    deliberate defense in depth against a FUTURE bug in `match_oracle`
+    (a new oracle shape that doesn't require positive evidence), so this
+    test forces that hypothetical case directly by monkeypatching `match_
+    oracle` to return True unconditionally, then asserts the pipeline
+    still refuses to confirm on the empty observation and does not crash
+    or silently fall through to a bare LLM call either."""
+    from fw_audit.stage5_verification.fvvw import dynamic_graph as dynamic_graph_module
+
+    monkeypatch.setattr(dynamic_graph_module, "match_oracle", lambda observation, plan: True)
+
+    result = await _run_evaluate_route(
+        deps=_deps(max_iterations=5),
+        global_id="g1",
+        plan=_plan(oracle="SIGSEGV"),
+        observation=ObservationRecord(),  # empty — no signal/artifacts/memory diff
+        reached=False,
+        reached_sink=False,
+        iteration=1,
+    )
+    assert result["route"].route != "confirmed"
+    if "dynamic_result" in result:
+        assert result["dynamic_result"].verdict != VerificationVerdict.CONFIRMED
 
 
 # --------------------------------------------------------------------- #

@@ -34,6 +34,7 @@ from fw_audit.common.verification import (
     ObservationRecord,
     TargetMeta,
     TrackResult,
+    VerificationState,
     VerificationVerdict,
 )
 from fw_audit.config.settings import Settings
@@ -45,10 +46,10 @@ from fw_audit.stage5_verification.cmdlog import aphase
 from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     CONTAINER_SCRATCH,
     CONTAINER_WORKDIR,
+    STOPPED_MARKER_PREFIX,
     build_gdb_batch_command,
     build_qemu_user_launch_command,
     lint_gdb_recipe,
-    render_crash_capture_commands,
     render_crash_report_commands,
     render_gdb_recipe,
     render_guard_breakpoint_commands,
@@ -335,6 +336,29 @@ def plan_emulation(
             }
         }
 
+    # T2-G: a daemon target with a hard, apparent startup dependency
+    # (`target.is_daemon` AND `target.startup_reachable is False` —
+    # `characterize_target.detect_daemon_signal`'s deterministic scan)
+    # almost never gets PAST its own startup path under partial
+    # (single-service) emulation — no live interface/config/NVRAM
+    # environment to satisfy it — so `natural_drive` is close to
+    # hopeless as a FIRST attempt. Prefer `direct_call` up front for such
+    # a target, same last-resort-shaped mode as the router's own
+    # `escalate_direct_call` route, just chosen proactively instead of
+    # only after repeated bring-up failures.
+    if target.is_daemon and target.startup_reachable is False:
+        return {
+            "emulation_plan": {
+                "mode": "direct_call",
+                "arch_spec_key": (target.arch, target.endianness),
+                "reason": "daemon target with an unreachable startup path "
+                "(is_daemon=True, startup_reachable=False) — partial emulation is "
+                "unlikely to get past bring-up naturally; preferring direct_call from "
+                "the start rather than spending the bring-up budget on a strategy "
+                "unlikely to ever succeed.",
+            }
+        }
+
     kernel_hint_terms = ("nvram", "kernel", "ipc", "driver", "/proc/", "/sys/")
     needs_system_mode = any(
         any(term in guard.name.lower() for term in kernel_hint_terms) for guard in plan.guards
@@ -413,6 +437,19 @@ class BringupContext:
     twice in a row with no new fix applied in between" and stop early with
     a diagnosis instead of burning the whole repair budget re-running an
     unchanged failure — see `no_progress_since_last_fault()`."""
+    verification_state: VerificationState | None = None
+    """Tier 3 (T3-O): the Continuous Verification Supervisor's canonical
+    `VerificationState` for THIS candidate's whole dynamic-track run —
+    lives here for the same reason `applied_fixes`/`fault_log` do (a
+    long-lived object every node closure shares via the SAME `ctx`
+    instance across loop-back edges, never round-tripped through graph
+    state as a value — see `dynamic_graph`'s own module docstring on why).
+    `dynamic_graph._run_evaluate_route` reads/writes this each round via
+    `fvvw.supervisor.apply_event`/`apply_events`; every OTHER node body
+    only ever READS the facts it needs from here, never maintains its own
+    parallel copy. `None` until the first round populates it (via
+    `ensure_verification_state`) — never accessed directly with a bare
+    attribute read from a node body for exactly that reason."""
 
     def __post_init__(self) -> None:
         if self.applied_fixes is None:
@@ -423,6 +460,17 @@ class BringupContext:
             self.strace_findings = []
         if self.fault_log is None:
             self.fault_log = []
+        if self.verification_state is None:
+            self.verification_state = VerificationState(global_id=self.candidate.global_id)
+
+    def ensure_verification_state(self) -> VerificationState:
+        """Return `self.verification_state`, guaranteed non-`None` — every
+        Tier 3 call site reads through this accessor rather than the bare
+        (`| None`-typed) attribute directly, so a type checker/reader
+        never has to re-derive that `__post_init__` already guarantees
+        it's populated by construction time."""
+        assert self.verification_state is not None
+        return self.verification_state
 
     def record_bringup_fault(self, signature: str) -> None:
         """Append `(signature, len(applied_fixes))` to `fault_log`. Called
@@ -583,6 +631,33 @@ async def ensure_session(ctx: BringupContext) -> SessionHandle:
     )
 
     return ctx.handle
+
+
+async def restart_session(ctx: BringupContext) -> None:
+    """Tier 3's `restart_execution` route (T3-N): tear down the CURRENT
+    session (if any) so the NEXT `ensure_session` call starts a genuinely
+    FRESH one, rather than repairing/relaunching QEMU inside the SAME
+    session container a `retry_bringup` round would reuse.
+
+    Distinct from `retry_bringup`'s repair-IN-PLACE semantics
+    (`bringup_stabilize`'s whole job): for a process that has already
+    exited and cannot be revived by any environment fix (the repeated
+    dead-daemon case `fvvw.supervisor`'s no-repeat rule escalates away
+    from), a brand-new session is sometimes the only way to rule out
+    session-level state (a half-torn-down chroot, a stale scratch file
+    from an earlier attempt) as part of the actual cause, rather than
+    re-launching QEMU yet again inside a container that may itself be in
+    a compromised state.
+
+    Best-effort: a failed `stop()` is swallowed (the session may already
+    be gone) — this function's only real postcondition is `ctx.handle is
+    None` afterward, so the next `ensure_session` call is guaranteed to
+    provision a new container rather than treat the (possibly-broken)
+    existing handle as still usable."""
+    if ctx.handle is not None:
+        with contextlib.suppress(Exception):
+            await ctx.session_executor.stop(ctx.handle)
+        ctx.handle = None
 
 
 async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
@@ -1163,12 +1238,21 @@ async def instrument_trigger(
         + [render_memory_dump_command(address=memory_watch_addr)]
         + render_crash_report_commands(marker=crash_marker)
     )
+    # T1-D fix #1: `render_gdb_recipe` now emits `render_crash_capture_
+    # commands()` itself, in the TRUE preamble (before the first
+    # `continue`) — this call site used to prepend the same commands to
+    # `breakpoint_commands`, which `render_gdb_recipe`'s OLD preamble put
+    # AFTER its own hardcoded first `continue`, so signal disposition was
+    # set too late to catch a crash on that very first continue (the exact
+    # DIR-825 log ordering). Passing plain `breakpoint_commands` here now
+    # relies on `render_gdb_recipe`'s own default — never re-prepend it,
+    # or the handlers would be emitted (harmlessly, but redundantly) twice.
     recipe = _build_and_lint_recipe(
         global_id=ctx.candidate.global_id,
         architecture=arch,
         gdb_port=1234,
         entry_addr=ctx.plan.entry_addr or ctx.target.func_offset,
-        breakpoint_commands=render_crash_capture_commands() + breakpoint_commands,
+        breakpoint_commands=breakpoint_commands,
     )
     recipe_path = f"{CONTAINER_SCRATCH}/recipe_trigger.gdb"
     target_relpath = _target_relpath_in_workspace(ctx.candidate)
@@ -1428,12 +1512,38 @@ async def health_gate(ctx: BringupContext) -> None:
        exited from an unrelated arbitration gap (checked via `/proc/<pid>`
        existence for the qemu process itself, inside the session
        container).
-    4. If the plan implies a network-facing target (`_target_needs_network`),
+    4. **T1-C — real liveness ADVANCE, not just "QEMU is waiting":** a
+       throwaway GDB batch connects, breaks at the functional entry
+       (`plan.entry_addr or target.func_offset`), issues ONE `continue`,
+       and asserts the inferior actually STOPPED there (via `render_gdb_
+       recipe`'s own `STOPPED_MARKER_PREFIX` marker — see `_parse_reached_
+       marker`) rather than exiting. This is the fix for the DIR-825
+       incident's root cause: QEMU launched with `-g 1234` binds the
+       gdbstub port and WAITS before running the program at all, so
+       checks 2-3 above both pass (`pgrep` ALIVE, `/proc/net/tcp` BOUND)
+       even when the target will die the INSTANT GDB says `continue`
+       (hostapd's own "Failed reading config files" case) — checks 2-3
+       only prove "QEMU is waiting", never "the target can execute". A
+       process-exit-before-breakpoint result here is distinguished from a
+       transient stub problem: it raises `HealthGateFailure` with a
+       diagnosis naming "process exits during startup" explicitly, which
+       is the daemon/startup-unreachable signal Tier 2 (T2-G/T2-H) acts
+       on — repeatedly retrying THIS particular failure via `retry_
+       bringup` can never succeed (the process dies for a reason bring-up
+       repair (missing files/env) cannot fix if it's a genuine dispatch
+       problem, not an environment one), which is exactly why the caller
+       chain routes a repeat of this signature toward `escalate_direct_
+       call` (see `fvvw.supervisor`/T1-E) rather than looping here.
+       Reuses `build_gdb_batch_command`/`render_gdb_recipe`/
+       `_build_and_lint_recipe` — does NOT duplicate `_launch_qemu_and_
+       wait`'s own port-readiness poll (that step only proves the STUB
+       is listening, never that the target program itself advances).
+    5. If the plan implies a network-facing target (`_target_needs_network`),
        the expected port is actually open — best-effort, since partial
        emulation's default posture is `--network=none` and most findings
        are not network-facing; skipped when the plan gives no networking
        hint.
-    5. No further HTTP/content check is performed here — that is Node 6/7's
+    6. No further HTTP/content check is performed here — that is Node 6/7's
        job once a trigger is actually sent; Node 4 only confirms the
        target is ALIVE and REACHABLE, not that any particular endpoint
        already returns the right content (spec's own distinction between
@@ -1490,7 +1600,73 @@ async def health_gate(ctx: BringupContext) -> None:
                 run.end(outputs={"passed": False, "reason": "gdbstub port not bound"})
             raise HealthGateFailure("gdbstub port 1234 is not bound — QEMU may have exited.")
 
-        # Check 4: network-facing target — best-effort port-open check.
+        # Check 4 (T1-C): the real liveness ADVANCE probe — see this
+        # function's own docstring for the full rationale. A fresh QEMU
+        # launch is required (QEMU user-mode is single-use per GDB batch —
+        # it runs to completion/exits on disconnect, same discipline every
+        # other node in this module already follows via _launch_qemu_and_
+        # wait before its own batch).
+        entry_addr = ctx.plan.entry_addr or ctx.target.func_offset
+        if entry_addr.strip():
+            await _launch_qemu_and_wait(ctx)
+            recipe = _build_and_lint_recipe(
+                global_id=ctx.candidate.global_id,
+                architecture=arch,
+                gdb_port=1234,
+                entry_addr=entry_addr,
+                breakpoint_commands=[],
+            )
+            recipe_path = f"{CONTAINER_SCRATCH}/recipe_health_advance.gdb"
+            target_relpath = _target_relpath_in_workspace(ctx.candidate)
+            await ctx.session_executor.exec_in_session(
+                ctx.handle,
+                f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n"
+                f"{recipe}FVVWEOF",
+                timeout=ctx.settings.stage5_gdb_timeout_seconds,
+            )
+            advance_result = await ctx.session_executor.exec_in_session(
+                ctx.handle,
+                f"cd {CONTAINER_WORKDIR} && "
+                + build_gdb_batch_command(recipe_path, target_relpath),
+                timeout=ctx.settings.stage5_gdb_timeout_seconds,
+            )
+            combined = advance_result.stdout + advance_result.stderr
+            stopped = _parse_reached_marker(combined) is not None
+            exit_code = _parse_process_exit(combined)
+            if not stopped and exit_code is not None:
+                if run is not None:
+                    run.end(
+                        outputs={
+                            "passed": False,
+                            "reason": "process exits during startup",
+                            "exit_code": exit_code,
+                        }
+                    )
+                raise HealthGateFailure(
+                    f"target process exits during startup (before ever reaching the entry "
+                    f"breakpoint at {entry_addr!r}) — exit_code={exit_code}; this is a "
+                    "dispatch/startup-reachability problem (daemon config parse, missing "
+                    "interface/NVRAM, ...), NOT a transient QEMU/GDB stub problem — repeatedly "
+                    "retrying bring-up against the SAME dead process cannot fix it; see T2-G/"
+                    "T2-H for the direct-call escalation path this should route toward."
+                )
+            if not stopped:
+                # Neither the STOPPED marker nor a recognizable exit
+                # line — a genuine transient stub/connection problem
+                # (distinct from the "process exits during startup"
+                # case above), diagnosed honestly rather than silently
+                # treated as a pass.
+                if run is not None:
+                    run.end(
+                        outputs={"passed": False, "reason": "advance probe inconclusive"}
+                    )
+                raise HealthGateFailure(
+                    "health-gate advance probe neither confirmed the inferior stopped at "
+                    f"the entry breakpoint nor observed a clean process exit — transcript "
+                    f"excerpt: {combined[-500:]!r}"
+                )
+
+        # Check 5: network-facing target — best-effort port-open check.
         if _target_needs_network(ctx.plan):
             # Best-effort only: partial emulation defaults to no network
             # egress (stage5_allow_network_grant), so a target that legitimately
@@ -1586,6 +1762,36 @@ def _parse_memory_dump_blocks(stdout: str) -> list[str]:
     return blocks
 
 
+_PROCESS_EXIT_RE = re.compile(r"Inferior\s+\d+\s+.*exited with code\s+(\d+)", re.IGNORECASE)
+"""Matches GDB's own `[Inferior 1 (process N) exited with code 01]` line —
+T1-D fix #2's detection half. Captures the exit code so a caller can carry
+it as event payload (T3-L's process-health monitor) without a second
+regex pass."""
+
+
+def _parse_process_exit(combined: str) -> int | None:
+    """The exit code GDB reported for the inferior in this transcript, or
+    `None` if no exit line appears at all (the common "still running or
+    breakpoint-stopped" case). This alone does not say WHEN relative to
+    the entry breakpoint the exit happened — `_parse_reached_marker`
+    answers that half; `collect_observation` combines both into
+    `process_exited_before_bp`."""
+    match = _PROCESS_EXIT_RE.search(combined)
+    return int(match.group(1)) if match else None
+
+
+def _parse_reached_marker(combined: str) -> str | None:
+    """The faulting/stopped PC from `render_gdb_recipe`'s own
+    `STOPPED_MARKER_PREFIX` tag (T1-D fix #2), or `None` if the marker
+    never printed this round — since the marker is emitted immediately
+    after the recipe's own first `continue` and only prints when GDB is
+    looking at a live stopped inferior, its absence combined with a
+    `_parse_process_exit` hit is the mechanical proof the process died
+    before ever reaching the entry breakpoint."""
+    match = re.search(rf"{re.escape(STOPPED_MARKER_PREFIX)}(\S+)", combined)
+    return match.group(1) if match else None
+
+
 async def collect_observation(
     ctx: BringupContext,
     *,
@@ -1623,6 +1829,19 @@ async def collect_observation(
     faulting_pc = _parse_marker_field(combined, crash_marker, "PC")
     registers = _parse_register_dump(combined, crash_marker)
 
+    # T1-D/T1-E: was the entry breakpoint actually reached this round, or
+    # did the inferior exit first? `reached` is true exactly when the
+    # STOPPED_MARKER_PREFIX marker printed (a live stopped inferior);
+    # `process_exited_before_bp` is true exactly when GDB's own exit line
+    # appears WITHOUT that marker ever having printed — the mechanical
+    # "died during startup/dispatch, never got as far as the breakpoint"
+    # signal T1-E's deterministic route (and T3's TARGET_EXITED-while-
+    # not-hit reducer rule) both key off.
+    reached_marker = _parse_reached_marker(combined)
+    exit_code = _parse_process_exit(combined)
+    reached: bool | None = reached_marker is not None
+    process_exited_before_bp = exit_code is not None and reached_marker is None
+
     if not memory_before and not memory_after:
         blocks = _parse_memory_dump_blocks(result_stdout)
         if len(blocks) >= 2:
@@ -1656,21 +1875,54 @@ async def collect_observation(
         stdout=result_stdout[:2000],
         stderr=result_stderr[:2000],
         filesystem_artifacts=filesystem_artifacts,
+        reached=reached,
+        process_exited_before_bp=process_exited_before_bp,
         transcript=combined,
     )
 
 
-def match_oracle(observation: ObservationRecord, oracle: str) -> bool:
+def match_oracle(observation: ObservationRecord, plan: DynamicPlan) -> bool:
     """Node 8's DETERMINISTIC first pass (spec §10): does `observation`
-    mechanically satisfy `oracle`'s literal condition? Checked BEFORE any
-    LLM call — this is intentionally a plain string/signal/address match,
+    mechanically satisfy `plan.oracle`'s literal condition? Checked BEFORE
+    any LLM call — this is intentionally a plain structured-field match,
     never an LLM's own opinion (spec Design Principle #1: "ground every
-    claim in a verifiable event"). Conservative: only recognizes a small
-    set of oracle SHAPES (a named signal, a faulting-PC address, a
-    filesystem-artifact substring, a stdout/stderr substring) — an oracle
-    phrased outside these shapes returns `False` here and falls through to
-    the Node 8 LLM router to diagnose, never silently guessed at.
+    claim in a verifiable event") and, per T1-A, never a regex over the
+    oracle's own free-form PROSE matched against free-form transcript text
+    either.
+
+    Regression this guards against (the DIR-825 `sbin_hostapd` false
+    CONFIRMED): the oracle's own example text often embeds a scratch path
+    like `/tmp/<claim_id>_proof`; the harness's OWN GDB recipes are also
+    written under `/tmp/fvvw/...` (`tools.qemu_gdb_tool.CONTAINER_SCRATCH`)
+    and echoed into `observation.stdout`/`.transcript` verbatim as part of
+    the recorded GDB batch. A bare `re.search(r"(/[\\w./\\-]+)", oracle)`
+    extracts `/tmp/` from the oracle's OWN prose and then matches it
+    against `observation.stdout` — a substring collision between the
+    harness's own scratch-file paths and the oracle's example path — never
+    an actual observation of the claimed artifact. Fixed by checking only
+    STRUCTURED, harness-derived facts, and specifically never against
+    `observation.stdout`/`observation.stderr` for a filesystem-artifact
+    oracle:
+
+    - **signal**: a named signal (SIGSEGV/SIGABRT/SIGILL) mentioned in the
+      oracle text requires `observation.signal` to be set to that exact
+      name; a hex PC address embedded in the oracle text must also match
+      `observation.faulting_pc` when one is captured.
+    - **filesystem artifact**: an absolute path mentioned in the oracle
+      text is matched ONLY against `observation.filesystem_artifacts` —
+      the paths `collect_observation`'s real `test -e` on the resolved
+      marker path actually confirmed present. Never a substring match
+      against `observation.stdout`/`.stderr`/`.transcript` — those hold
+      the GDB session's OWN scratch-path traffic, not observed
+      target-filesystem state.
+    - **memory diff**: an "overwrite"/"memory"/"diff" oracle requires
+      `observation.memory_diff_detected is True`.
+    - Any oracle shape not expressible as one of these structured facts —
+      including a bare oracle that mentions no signal/artifact/diff
+      keyword at all — returns `False` (fall through to the LLM router),
+      never guessed at.
     """
+    oracle = plan.oracle or plan.decisive_observable
     oracle_lower = oracle.lower()
 
     for signal_name in ("sigsegv", "sigabrt", "sigill"):
@@ -1688,10 +1940,13 @@ def match_oracle(observation: ObservationRecord, oracle: str) -> bool:
     artifact_match = re.search(r"(/[\w./\-]+)", oracle)
     if artifact_match:
         needle = artifact_match.group(1)
-        if any(needle in path for path in observation.filesystem_artifacts):
-            return True
-        if needle in observation.stdout or needle in observation.stderr:
-            return True
+        # STRUCTURED evidence only — observation.filesystem_artifacts is
+        # populated exclusively by collect_observation's real `test -e`
+        # probe against the resolved marker path (see that function's own
+        # docstring). Never observation.stdout/.stderr/.transcript, which
+        # is GDB session output (recipe paths, echoed commands) that has
+        # nothing to do with what the TARGET's filesystem actually shows.
+        return any(needle in path for path in observation.filesystem_artifacts)
 
     return observation.memory_diff_detected and (
         "overwrite" in oracle_lower or "memory" in oracle_lower or "diff" in oracle_lower
@@ -1950,6 +2205,7 @@ __all__ = [
     "match_oracle",
     "plan_emulation",
     "reach_target",
+    "restart_session",
     "satisfy_guards",
     "validate_benign_marker",
     "validate_injected_recipe",

@@ -28,7 +28,7 @@ per-round verdicts — never themselves sent to an LLM.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal
 
@@ -348,6 +348,29 @@ class TargetMeta(BaseModel):
     rootfs_dir: str = Field(
         default="", description="Absolute host path to the extracted firmware filesystem root "
         "— what bringup_stabilize chroots/binds into the session container."
+    )
+    is_daemon: bool = Field(
+        default=False,
+        description="T2-G: best-effort — does this binary's own call graph reference "
+        "daemonization primitives (fork/setsid/daemon/openlog)? A cheap, deterministic scan "
+        "of Stage 2's already-computed GhidraFunction.calls table (characterize_target — no "
+        "sandbox call needed). A daemon almost always needs a live interface/config/NVRAM "
+        "environment to get past its own startup path under partial (single-service) "
+        "emulation, so this is one of the two facts (together with startup_reachable) that "
+        "should steer DynamicPlan.reach_strategy toward direct_call rather than natural_drive.",
+    )
+    startup_reachable: bool | None = Field(
+        default=None,
+        description="T2-G: best-effort — can this target plausibly get PAST its own startup "
+        "path (config-file parse, interface bind, NVRAM read) under partial single-service "
+        "QEMU user-mode emulation, before the claimed vulnerable function is ever reached "
+        "naturally? `None` when undetermined (the common case for a simple, self-contained "
+        "dispatcher binary with no daemon signal — startup reachability is not in doubt for "
+        "those). `False` when `is_daemon` is True AND the binary's own calls reference a "
+        "mandatory config-file parser near `main` with no evidence of a fallback/default path "
+        "— i.e. the daemon signal PLUS an apparent hard startup dependency. `plan_emulation` "
+        "(T2-G) and the strategy prompt both consume this to prefer direct_call over a "
+        "natural_drive attempt that is unlikely to ever get past bring-up.",
     )
 
 
@@ -680,7 +703,30 @@ class ObservationRecord(BaseModel):
     oracle_match: bool | None = Field(
         default=None, description="Result of Node 8's DETERMINISTIC first-pass check of this "
         "record against DynamicPlan.oracle — True/False once checked, None before it runs. "
-        "Never the LLM's own opinion; a literal string/signal/address match.",
+        "Never the LLM's own opinion; a literal string/signal/address match. Written back by "
+        "`dynamic_graph._run_evaluate_route` immediately after `match_oracle` runs (T1-B), so "
+        "the record and the route taken can never silently disagree — a persisted "
+        "ObservationRecord's oracle_match always reflects what the deterministic gate actually "
+        "decided for that round, not a stale None even on a confirmed/refuted terminal round.",
+    )
+    reached: bool | None = Field(
+        default=None, description="Whether the entry/sink breakpoint for THIS round's GDB "
+        "batch was actually hit (a real 'Breakpoint N, 0x...' stop line, not merely the SET "
+        "confirmation) — None when `collect_observation` had no transcript to parse this fact "
+        "from (a caller that predates T1-D, or a synthetic/injected-recipe observation). "
+        "Distinct from `process_exited_before_bp`: a round can have `reached=False` with the "
+        "process still alive (breakpoint just never fired yet) OR with the process already "
+        "exited — see that field for which case actually occurred.",
+    )
+    process_exited_before_bp: bool = Field(
+        default=False, description="True when this round's GDB transcript shows the inferior "
+        "exiting (`Inferior N ... exited with code M`) WITHOUT the reached/exited marker "
+        "`render_gdb_recipe`'s preamble prints confirming a breakpoint stop first (T1-D) — i.e. "
+        "the target died during startup/dispatch before ever reaching the entry/sink "
+        "breakpoint. This is the fact T1-E's deterministic route maps straight to "
+        "`escalate_direct_call` rather than the ordinary 'not yet hit, try again' "
+        "`retry_gdb_attach` path, since re-attaching to the same already-dead process can never "
+        "succeed no matter how many times it is retried.",
     )
     transcript: str = Field(
         default="", description="Every GDB command executed and its output for this round, "
@@ -703,12 +749,27 @@ class RouteDecision(BaseModel):
         "retry_trigger",
         "escalate_direct_call",
         "inconclusive",
+        # ---- Tier 3 (Continuous Verification Supervisor) additions — see
+        # `fvvw.supervisor`. Each follows the SAME "Adding a Node 8 route"
+        # checklist as the original seven: a `_ROUTE_TO_NODE`/
+        # `_TERMINAL_ROUTES` entry in `dynamic_graph.py` and a description
+        # in `DYNAMIC_ROUTER_SYSTEM_PROMPT`. None of these bypasses the
+        # hard iteration-budget cutoff in `_run_evaluate_route`. ----
+        "resolve_address",
+        "restart_execution",
+        "escalate",
     ] = Field(
         description="Which node to resume at, or a terminal disposition — mirrors the spec's "
-        "§10 decision table exactly: 'confirmed'/'refuted' end the loop; 'retry_bringup' "
-        "routes to Node 3; 'retry_gdb_attach' to Node 5; 'retry_trigger' to Node 6; "
-        "'escalate_direct_call' to Node 2 with emulation_mode='direct_call'; "
-        "'inconclusive' ends the loop (budget exhausted or genuinely stuck)."
+        "§10 decision table plus the Tier 3 supervisor's own recovery vocabulary: "
+        "'confirmed'/'refuted' end the loop; 'retry_bringup' routes to Node 3; "
+        "'retry_gdb_attach' to Node 5; 'retry_trigger' to Node 6; 'escalate_direct_call' to "
+        "Node 2 with emulation_mode='direct_call'; 'inconclusive' ends the loop (budget "
+        "exhausted or genuinely stuck); 'resolve_address' re-runs sink/address resolution "
+        "(T2-F) before returning to Node 5; 'restart_execution' returns to Node 3 with a "
+        "FRESH session (distinct from 'retry_bringup', which repairs the existing one) for a "
+        "process that has already exited; 'escalate' routes to the direct-call emulation mode "
+        "if not yet attempted, else ends the loop inconclusive — the supervisor's own "
+        "last-tier recovery action before giving up on a repeatedly-failing candidate."
     )
     diagnosis: str = Field(
         default="", description="Why this route was chosen — e.g. 'breakpoint from Node 5 "
@@ -906,3 +967,159 @@ class DynamicOnlyReport(BaseModel):
     run — empty when `Settings.stage5_command_log` was `False`."""
     started_at: datetime
     finished_at: datetime | None = None
+
+
+# --------------------------------------------------------------------- #
+# Tier 3 — Continuous Verification Supervisor (additive, on top of FVVW
+# v3). See `stage5_verification.fvvw.supervisor`/`fvvw.monitors` for the
+# reducer/monitor code that produces and consumes these; this module only
+# carries the DATA shapes, matching every other schema split in this file.
+#
+# Structured events are the ONLY way a fact enters `VerificationState` —
+# they originate exclusively from harness code (a node body, a monitor, a
+# GDB-transcript parser), never from agent/LLM reasoning. An agent may
+# READ the resulting `VerificationState` and PROPOSE a `RouteDecision`
+# (see `fvvw.supervisor.propose_action`), but it can never fabricate an
+# event or mutate a fact directly. This is the schema-level expression of
+# the plan's central invariant: "no amount of agent reasoning, confidence,
+# or planning can become evidence."
+# --------------------------------------------------------------------- #
+
+
+VerificationEventKind = Literal[
+    "TARGET_STARTED",
+    "TARGET_EXITED",
+    "GDB_CONNECTED",
+    "BREAKPOINT_HIT",
+    "BREAKPOINT_MISSED",
+    "TRIGGER_DELIVERED",
+    "TRIGGER_FAILED",
+    "SINK_REACHED",
+    "ARTIFACT_CREATED",
+    "SIGNAL_RECEIVED",
+    "TIMEOUT",
+]
+"""The closed vocabulary of facts a monitor/node body may report — see
+`fvvw.monitors` for which monitor emits which kind. Deliberately a
+`Literal` (not an open string) so an unrecognized kind is a type error at
+the call site, not a silently-ignored event the reducer never applies."""
+
+
+class VerificationEvent(BaseModel):
+    """One structured, harness-sourced fact about the dynamic-track run —
+    the ONLY input `fvvw.supervisor.apply_event` accepts. Frozen (pydantic
+    `model_config`) so an event, once constructed, can never be mutated
+    in place by a concurrent monitor — each observation is its own
+    immutable record, exactly the `VerificationState` reducer needs to
+    stay deterministic under concurrent emission (T3-K)."""
+
+    model_config = {"frozen": True}
+
+    kind: VerificationEventKind
+    source: str = Field(
+        description="Which monitor/node emitted this event, e.g. 'process_health_monitor', "
+        "'gdb_transcript_monitor', 'health_gate', 'instrument_trigger' — for audit/debugging, "
+        "never itself part of the reducer's decision logic."
+    )
+    seq: int = Field(
+        description="Monotonic sequence number for this event's KIND, assigned by the emitting "
+        "monitor/node (a simple per-run counter) — the reducer (T3-K) uses this to drop a "
+        "stale or duplicate event (seq <= the last-applied seq for that kind) so concurrent "
+        "monitors polling at different cadences can never regress the canonical state or "
+        "double-apply the same fact."
+    )
+    payload: dict = Field(
+        default_factory=dict,
+        description="Kind-specific structured detail, e.g. {'exit_code': 1} for TARGET_EXITED, "
+        "{'pc': '0x00012345'} for BREAKPOINT_HIT, {'path': '/tmp/claim_001_proof'} for "
+        "ARTIFACT_CREATED, {'signal': 'SIGSEGV'} for SIGNAL_RECEIVED. Never free-form prose — "
+        "every field here must be a literal value the emitting harness code actually read, "
+        "not a summary or a guess.",
+    )
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class AttemptRecord(BaseModel):
+    """One recovery action the supervisor actually took, and what came of
+    it — the generalization of `BringupContext.fault_log`/
+    `no_progress_since_last_fault`'s "did this repeat with no progress"
+    pattern to EVERY recovery route, not just bring-up faults. This is
+    what lets `fvvw.supervisor.validate_action` refuse to re-propose an
+    action that has already demonstrably failed the same way, rather than
+    re-discovering that failure by actually trying it again (the direct
+    fix for the dead-daemon `retry_gdb_attach` loop the DIR-825 incident
+    exposed)."""
+
+    action: str = Field(description="The route/action taken, e.g. 'retry_gdb_attach', "
+        "'escalate_direct_call' — the same vocabulary as RouteDecision.route.")
+    trigger_reason: str = Field(
+        default="", description="Why this action was proposed — the diagnosis text/state "
+        "snapshot summary that led the supervisor to choose it."
+    )
+    outcome: Literal["applied", "failed", "no_progress"] = Field(
+        description="'applied': the action was taken and produced a materially different "
+        "state afterward (a genuinely new attempt). 'failed': the action was taken but the "
+        "very next round showed the identical failure signature. 'no_progress': the action "
+        "was taken but nothing observable changed at all (e.g. a retry against a session that "
+        "was never actually replaced). Recorded by the SAME caller that observed the "
+        "following round's events, never self-reported by the action's own proposer."
+    )
+    seq: int = Field(description="Monotonic attempt counter for this run, independent of any "
+        "one event kind's own seq — orders the full attempt_history regardless of which "
+        "action kinds interleave.")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class VerificationState(BaseModel):
+    """`mem.dynamic.verification_state` — the Continuous Verification
+    Supervisor's single canonical picture of one candidate's dynamic-track
+    run, reduced deterministically from the `events` list below (never
+    written to directly — see `fvvw.supervisor.apply_event`). This is the
+    ONE place the facts Tier 1/Tier 2 introduced (`process_exited_before_bp`,
+    `reached`, sink reachability, daemon/startup signals) live once Tier 3
+    is wired in; `dynamic_graph`'s node bodies read them from here rather
+    than re-deriving a parallel copy per call site, which is exactly the
+    "conflicting copies of the same fact" failure mode the plan calls out.
+
+    Every field here mirrors a concrete DIR-825-class observable — none of
+    them is inferred from agent confidence or planning text. `oracle_match`
+    in particular is set ONLY from `match_oracle`'s own deterministic
+    check (T1-A/T1-B), never from this state's own reasoning."""
+
+    global_id: str = ""
+
+    process_status: Literal["not_started", "running", "exited"] = "not_started"
+    gdb_status: Literal["disconnected", "connected"] = "disconnected"
+    breakpoint_status: Literal["unset", "set", "hit", "missed"] = "unset"
+    reached: bool | None = None
+    process_exited_before_bp: bool = False
+
+    sink_addr: str = ""
+    sink_reachable: bool | None = None
+    captured_argument: str | None = None
+
+    signals: list[str] = Field(default_factory=list)
+    filesystem_artifacts: list[str] = Field(default_factory=list)
+    memory_observations: list[str] = Field(default_factory=list)
+
+    oracle_match: bool | None = None
+
+    current_strategy: str = ""
+    current_trigger_type: str = ""
+
+    attempt_history: list[AttemptRecord] = Field(default_factory=list)
+    failure_reason: str = ""
+    evidence_history: list[str] = Field(default_factory=list)
+
+    events: list[VerificationEvent] = Field(default_factory=list)
+    """The full ordered audit trail every fact above was reduced from —
+    kept alongside the reduced facts (not instead of them) so a reader can
+    always re-derive how the state reached its current shape, per the
+    plan's "record every attempted action and its result" requirement."""
+
+    last_applied_seq: dict[str, int] = Field(default_factory=dict)
+    """`{event_kind: highest_seq_applied}` — the reducer's own dedup
+    bookkeeping (T3-K), persisted alongside the state so a snapshot
+    round-trips through `FVVWState`/`FVVWReport` without losing the
+    monotonicity guarantee a fresh in-memory reducer would otherwise only
+    hold for the lifetime of one process."""

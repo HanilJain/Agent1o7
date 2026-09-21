@@ -88,8 +88,12 @@ decompiler output, which is nearly always), and decisive_observable \
 restated in CPGQL/data-flow terms.
 
 4. dynamic_plan: reach_strategy ("natural_drive" if the target's dispatch \
-is statically resolvable per the supplied target facts, else \
-"inferior_call"), entry_addr/target_addr/sink_addr (from the supplied \
+is statically resolvable per the supplied target facts AND the target facts \
+do not show is_daemon=true with startup_reachable=false — a daemon whose own \
+startup path is flagged unreachable under partial emulation should prefer \
+"inferior_call" even when dispatch is otherwise resolvable, since the \
+process is unlikely to get far enough to reach that dispatch point at all; \
+else "inferior_call"), entry_addr/target_addr/sink_addr (from the supplied \
 target facts — func_offset is the target function's own validated address; \
 leave sink_addr empty if it cannot be inferred), guards (translate the \
 finding's security_condition/data_flow PROSE into a structured list of \
@@ -105,9 +109,15 @@ value to force — you are only documenting an absence, not driving \
 execution past a check — leave forced_value empty; the guard will be \
 logged/observed but not forced), argv_template, \
 trigger_shape (roughly how the trigger should reach the sink: \
-"network_http" for an HTTP/CGI/UPnP/SOAP endpoint, "cli_argv" for a \
-CLI-argument-facing binary, or "direct_call" only if the finding's own \
-evidence gives no realistic front-door path), preconditions (anything that \
+"network_http" for an HTTP/CGI/UPnP/SOAP endpoint reachable via a plain \
+socket send, "cli_argv" for a CLI-argument-facing binary, \
+"network_wps"/"network_80211"/"network_eap" for a WPS/802.11/EAP protocol \
+handler (these require a live wireless-stack peer that partial emulation \
+cannot provide — naming one of these means the trigger agent will use \
+direct_call delivery only, never a socket send into a listener that does \
+not exist under this sandbox's default --network=none posture), or \
+"direct_call" only if the finding's own evidence gives no realistic \
+front-door path at all), preconditions (anything that \
 must be true before the sink is reachable, e.g. "must be authenticated", \
 "NVRAM key X must be set" — from the finding's own evidence, never \
 invented), oracle (dynamic_plan's own restatement of hypotheses.oracle in \
@@ -227,6 +237,9 @@ def render_strategy_brief(
         f"libc: {target.libc}",
         f"func_offset (validated entry point of the claimed function): {target.func_offset}",
         f"dispatch_resolvable: {target.dispatch_resolvable}",
+        f"is_daemon (T2-G, best-effort): {target.is_daemon}",
+        f"startup_reachable (T2-G, best-effort — False means a daemon target with an "
+        f"apparent hard config/NVRAM startup dependency): {target.startup_reachable}",
     ]
     return "\n".join(lines)
 

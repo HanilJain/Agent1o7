@@ -25,6 +25,7 @@ from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.errors import Stage5InputError
 from fw_audit.stage5_verification.tools.characterize_tool import (
     characterize_target,
+    detect_daemon_signal,
     detect_pie,
     guess_libc,
 )
@@ -261,3 +262,64 @@ async def test_characterize_target_handles_missing_elf_info():
     assert target.arch == "unknown"
     assert target.endianness == ""
     assert target.stripped is None
+
+
+# --------------------------------------------------------------------- #
+# detect_daemon_signal — T2-G: daemon / startup-reachability signal
+# --------------------------------------------------------------------- #
+
+
+def test_detect_daemon_signal_negative_for_ordinary_binary():
+    functions = (
+        GhidraFunction(
+            name="main", entry_point="0x1000", size=10, signature="void main()",
+            calls=["printf", "strcpy"],
+        ),
+    )
+    is_daemon, startup_reachable = detect_daemon_signal(functions)
+    assert is_daemon is False
+    assert startup_reachable is None
+
+
+def test_detect_daemon_signal_positive_without_config_dependency():
+    functions = (
+        GhidraFunction(
+            name="main", entry_point="0x1000", size=10, signature="void main()",
+            calls=["fork", "setsid", "printf"],
+        ),
+    )
+    is_daemon, startup_reachable = detect_daemon_signal(functions)
+    assert is_daemon is True
+    # daemon-ness ALONE never forces startup_reachable=False — only the
+    # daemon signal PLUS an apparent hard config/NVRAM dependency does.
+    assert startup_reachable is None
+
+
+def test_detect_daemon_signal_positive_with_config_dependency_sets_unreachable():
+    functions = (
+        GhidraFunction(
+            name="main", entry_point="0x1000", size=10, signature="void main()",
+            calls=["daemon", "config_read", "fopen"],
+        ),
+    )
+    is_daemon, startup_reachable = detect_daemon_signal(functions)
+    assert is_daemon is True
+    assert startup_reachable is False
+
+
+async def test_characterize_target_wires_daemon_signal_into_target_meta():
+    """End-to-end: characterize_target must surface detect_daemon_signal's
+    result on TargetMeta — this is what plan_emulation/the strategy prompt
+    actually consume (T2-G)."""
+    daemon_fn = GhidraFunction(
+        name="FUN_00026938",
+        entry_point="0x00026938",
+        size=10,
+        signature="void f()",
+        called_by=["caller"],
+        calls=["daemon", "nvram_get"],
+    )
+    candidate = _candidate(functions=(daemon_fn,))
+    target = await characterize_target(candidate)
+    assert target.is_daemon is True
+    assert target.startup_reachable is False

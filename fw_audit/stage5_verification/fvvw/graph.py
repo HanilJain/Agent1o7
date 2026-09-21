@@ -73,7 +73,10 @@ from fw_audit.stage5_verification.live_console import LiveConsole, make_transcri
 from fw_audit.stage5_verification.llm_logging import LoggingChatModel
 from fw_audit.stage5_verification.streaming import stream_graph_live
 from fw_audit.stage5_verification.tools.characterize_tool import characterize_target
-from fw_audit.stage5_verification.tools.crosscheck_tool import static_crosscheck
+from fw_audit.stage5_verification.tools.crosscheck_tool import (
+    resolve_sink_addresses,
+    static_crosscheck,
+)
 from fw_audit.stage5_verification.tools.joern_tool import joern_executor
 from fw_audit.stage5_verification.tools.verification_sandbox import (
     verification_executor,
@@ -110,6 +113,55 @@ def resolve_checkpointer(settings: Settings):
     raise ValueError(
         f"Unknown stage5_checkpoint_backend={backend!r}; expected 'memory' or 'sqlite'."
     )
+
+
+async def _resolve_sink_addr_into_plan(
+    candidate: VerificationCandidate,
+    plan,
+    *,
+    executor: Executor,
+    settings: Settings,
+    command_log: CommandLog | None,
+) -> dict:
+    """T2-F: run `tools.crosscheck_tool.resolve_sink_addresses` and, when it
+    finds a real disassembly-derived call-site address for one of `plan.
+    static_plan.sink_names`, OVERRIDE `plan.dynamic_plan.sink_addr` with it
+    — a real call-site address is strictly more reliable than the strategy
+    LLM's own guess (which, per that prompt's own instructions, may simply
+    leave `sink_addr` empty when it cannot infer one). Runs BEFORE the
+    fork (not inside `static_crosscheck`'s own concurrent task) since the
+    dynamic track's OWN concurrent task needs this fact from the very
+    first bring-up round, not after the fork has already started.
+
+    Mutates `plan.dynamic_plan` in place (the same "DynamicPlan is a
+    mutable pydantic model, mutated as new facts arrive" pattern `fvvw.
+    hitl`'s `OVERRIDE_PLAN` action and `dynamic_agents.trigger_agent`'s own
+    `ctx.plan.argv_template = ...` assignment already establish) and
+    returns the raw `SinkAddressResolution.to_evidence_dict()` for the
+    caller to persist alongside the plan/observations, so a reader can see
+    WHY a given sink_addr was chosen without re-running objdump.
+
+    Never raises — `resolve_sink_addresses` itself never raises (mirrors
+    `static_crosscheck`'s own "purely corroborative, never blocks the
+    track" posture); an unresolved sink leaves `plan.dynamic_plan.
+    sink_addr` exactly as the strategy agent set it (often empty), and it
+    is `dynamic_graph._build_track_result`'s job (T1-B/T2-F's "checked
+    precondition for CONFIRMED") to refuse a confirmation built on an
+    unresolved sink, not this function's."""
+    resolution = await resolve_sink_addresses(
+        candidate,
+        target_function=plan.static_plan.target_function,
+        sink_names=list(plan.static_plan.sink_names),
+        executor=executor,
+        settings=settings,
+        command_log=command_log,
+    )
+    for sink_name in plan.static_plan.sink_names:
+        call_site = resolution.best_call_site(sink_name)
+        if call_site:
+            plan.dynamic_plan.sink_addr = call_site
+            break
+    return resolution.to_evidence_dict()
 
 
 @dataclass
@@ -442,6 +494,15 @@ async def run_dynamic_track_only(
         "observation": observation,
         "iteration_history": final_state.get("iteration_history") or [],
         "emulation_mode": ctx.emulation_plan.get("mode", ""),
+        # T3-O: the Continuous Verification Supervisor's canonical state,
+        # accumulated across every round via BringupContext.verification_
+        # state — falls back to ctx's OWN copy (never None once
+        # BringupContext.__post_init__ has run) rather than the graph's
+        # final_state snapshot, since a wall-clock timeout (`timed_out`
+        # above) discards `final_state` entirely but `ctx` — and
+        # everything accumulated onto it before the timeout fired — still
+        # survives.
+        "verification_state": final_state.get("verification_state") or ctx.verification_state,
     }
     return result, guard_logs, dynamic_reached_sink, gdb_transcript, dynamic_extras
 
@@ -659,6 +720,17 @@ async def run_fvvw(
         system_prompt=None,
         command_log=deps.static_command_log,
     )
+    # T2-F: resolve the real sink call-site address BEFORE the fork —
+    # the dynamic track's own concurrent task needs this fact from its
+    # very first round, so this cannot run inside static_crosscheck's own
+    # (concurrent, post-fork) task.
+    sink_resolution_evidence = await _resolve_sink_addr_into_plan(
+        candidate,
+        plan,
+        executor=deps.crosscheck_executor,
+        settings=settings,
+        command_log=deps.static_command_log,
+    )
 
     # ---- fork: static + dynamic run concurrently -----------------------
     on_step = make_transcript_on_step(candidate.global_id) if live else None
@@ -818,7 +890,10 @@ async def run_fvvw(
         "residual_unknowns": verdict.residual_unknowns,
         "guard_logs": guard_logs,
         "dynamic_gdb_transcript": gdb_transcript,
-        "crosscheck_evidence": crosscheck_result.to_evidence_dict(),
+        "crosscheck_evidence": {
+            **crosscheck_result.to_evidence_dict(),
+            "sink_addresses": sink_resolution_evidence,
+        },
         "human_review": human_review,
         "deps": deps,
         "arbitration_log": dynamic_extras.get("arbitration_log"),
@@ -873,6 +948,17 @@ async def run_dynamic_only(
         system_prompt=None,
         command_log=deps.dynamic_command_log,
     )
+    # T2-F: same "resolve before the dynamic track ever runs" ordering
+    # as run_fvvw's own fork — there is no static/crosscheck task here to
+    # run this alongside, so it is simply the next step in this straight-
+    # line sequence.
+    sink_resolution_evidence = await _resolve_sink_addr_into_plan(
+        candidate,
+        plan,
+        executor=deps.crosscheck_executor,
+        settings=settings,
+        command_log=deps.dynamic_command_log,
+    )
 
     (
         dynamic_result,
@@ -894,6 +980,7 @@ async def run_dynamic_only(
         "observation": dynamic_extras.get("observation"),
         "iteration_history": dynamic_extras.get("iteration_history") or [],
         "emulation_mode": dynamic_extras.get("emulation_mode", ""),
+        "sink_resolution_evidence": sink_resolution_evidence,
         "deps": deps,
     }
 

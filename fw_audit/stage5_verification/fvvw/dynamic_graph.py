@@ -67,6 +67,7 @@ from fw_audit.common.verification import (
     RouteDecision,
     TargetMeta,
     TrackResult,
+    VerificationState,
     VerificationVerdict,
 )
 from fw_audit.config.settings import Settings
@@ -90,13 +91,29 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     match_oracle,
     plan_emulation,
     reach_target,
+    restart_session,
     satisfy_guards,
+)
+from fw_audit.stage5_verification.fvvw.supervisor import (
+    propose_action,
+    record_attempt,
+    validate_action,
 )
 from fw_audit.stage5_verification.llm_logging import LoggingChatModel
 
 # Terminal routes health_gate_node/evaluate_route_node can produce, sharing
 # the same vocabulary `common.verification.RouteDecision.route` declares —
-# used as the LangGraph conditional-edge return values.
+# used as the LangGraph conditional-edge return values. Tier 3 additions
+# (T3-N — see `fvvw.supervisor`'s module docstring for the full
+# separation-of-concerns rationale): `resolve_address` re-runs T2-F sink
+# resolution before returning to Node 5; `restart_execution` returns to
+# `bringup` but with a FRESH session (`restart_session`, called from
+# `bringup_node` itself when it sees this route — see that node's own
+# body), distinct from `retry_bringup`'s repair-in-place semantics.
+# `"escalate"` is deliberately ABSENT here — `fvvw.supervisor.
+# validate_action` always resolves it into a concrete route
+# (`escalate_direct_call` or `inconclusive`) before a `RouteDecision`
+# carrying it can ever reach this dict.
 _ROUTE_TO_NODE: dict[str, str] = {
     "confirmed": "__end__",
     "refuted": "__end__",
@@ -105,6 +122,8 @@ _ROUTE_TO_NODE: dict[str, str] = {
     "retry_trigger": "trigger",
     "escalate_direct_call": "plan_emulation_escalate",
     "inconclusive": "__end__",
+    "resolve_address": "resolve_address",
+    "restart_execution": "bringup",
 }
 
 
@@ -346,6 +365,20 @@ async def _run_trigger(
                 reached_sink = observation.faulting_pc is not None or bool(
                     observation.filesystem_artifacts
                 )
+                if result.is_direct_call:
+                    # T2-H: whatever this round's ObservationRecord shows,
+                    # it came from a DIRECT invocation (GDB `call`), never
+                    # a realistic end-to-end trigger — force the emulation
+                    # mode label to reflect that regardless of what
+                    # `ctx.emulation_plan["mode"]` happened to be set to
+                    # (a trigger agent may choose deliver_via_direct_call
+                    # for its OWN trigger_shape reasons even when the
+                    # emulation MODE itself never escalated to
+                    # direct_call). `fvvw.report`/`FVVWReport.
+                    # emulation_mode` reads this straight off `ctx.
+                    # emulation_plan`, so a reader can never mistake this
+                    # for a realistic front-door reach.
+                    ctx.emulation_plan["mode"] = "direct_call"
             else:
                 trig_transcript, captured = await instrument_trigger(
                     ctx, gdb_transcript_so_far=transcript
@@ -377,6 +410,112 @@ async def _run_trigger(
         }
 
 
+def _has_positive_evidence(observation: ObservationRecord, *, reached_sink: bool) -> bool:
+    """T1-B's positive-evidence test, shared by BOTH choke points
+    (`_run_evaluate_route`'s confirm-gate below AND `_build_track_result`'s
+    own defense-in-depth refusal) so the two can never quietly drift apart
+    on what "positive evidence" means. `True` only when the round carries
+    at least one STRUCTURED, harness-derived fact: a captured crash
+    signal, a captured filesystem artifact, a detected memory diff, or a
+    genuinely reached sink with a captured argument (`reached_sink`,
+    already computed by the caller from `observation.faulting_pc is not
+    None or bool(observation.filesystem_artifacts)`/`captured is not
+    None` — see `_run_trigger`). An empty observation with NONE of these
+    — the exact DIR-825 fingerprint — is never positive evidence, no
+    matter what a deterministic match or an LLM router's own confidence
+    claims."""
+    return bool(
+        observation.signal
+        or observation.filesystem_artifacts
+        or observation.memory_diff_detected
+        or reached_sink
+    )
+
+
+def _update_state_for_round(
+    state: VerificationState,
+    *,
+    plan: DynamicPlan,
+    observation: ObservationRecord,
+    reached: bool,
+    reached_sink: bool,
+    emulation_mode: str,
+) -> VerificationState:
+    """Fold this round's already-gathered structured facts
+    (`observation`/`reached`/`reached_sink`, all produced by harness code
+    earlier this SAME round — `collect_observation`/`reach_target`) into
+    the canonical `VerificationState`, WITHOUT going through `fvvw.
+    supervisor.apply_event`. These facts were not delivered as a live
+    monitor event — they are the SAME per-round facts every dynamic-track
+    node already computes deterministically — so this is the synchronous
+    equivalent of `apply_events(state, ctx.drain_pending_events())` for
+    exactly what the existing (pre-T3-L-monitor-wiring) call chain already
+    produces; a future revision wiring T3-L's concurrent monitors directly
+    into this node would REPLACE most of this function's body with a
+    drain+`apply_events` call, not add a second, competing mechanism.
+
+    Never re-derives a fact this function doesn't have positive evidence
+    for — `sink_addr` is only updated when `plan.sink_addr` is actually
+    set (never cleared once known); `sink_reachable` only ever advances to
+    `True` (never forced back to `False`, since "not reached THIS round"
+    is not proof of permanent unreachability — that absence is what
+    `fvvw.supervisor.propose_action`'s `resolve_address` branch itself
+    reasons about); `breakpoint_status`/`process_status` only advance when
+    the round's own `reached`/`observation.process_exited_before_bp` facts
+    say so. `process_status` defaults to `"running"` once this function is
+    reached at all (Node 8 only ever runs AFTER Node 5/6 already attempted
+    to execute the target this round) UNLESS the round's own facts show
+    otherwise (`process_exited_before_bp` -> `"exited"`) — leaving it at
+    `VerificationState`'s bare `"not_started"` default here would
+    incorrectly make `propose_action`'s OWN "startup failure observed
+    before the target ever ran" branch fire for an ordinary "reached the
+    breakpoint stage but the exact hit didn't happen yet" round."""
+    updates: dict = {
+        "current_strategy": emulation_mode or state.current_strategy,
+        "reached": reached,
+        "process_exited_before_bp": (
+            state.process_exited_before_bp or observation.process_exited_before_bp
+        ),
+        "oracle_match": observation.oracle_match,
+        "process_status": "running",
+    }
+    if reached:
+        updates["breakpoint_status"] = "hit"
+    elif observation.process_exited_before_bp:
+        updates["process_status"] = "exited"
+        if state.breakpoint_status != "hit":
+            updates["breakpoint_status"] = "missed"
+    elif state.breakpoint_status == "unset":
+        updates["breakpoint_status"] = "missed"
+
+    if observation.signal and observation.signal not in state.signals:
+        updates["signals"] = [*state.signals, observation.signal]
+    if observation.filesystem_artifacts:
+        merged = list(
+            dict.fromkeys([*state.filesystem_artifacts, *observation.filesystem_artifacts])
+        )
+        updates["filesystem_artifacts"] = merged
+    if observation.memory_diff_detected:
+        note = "memory_diff_detected"
+        if note not in state.memory_observations:
+            updates["memory_observations"] = [*state.memory_observations, note]
+    if plan.sink_addr.strip():
+        updates["sink_addr"] = plan.sink_addr
+    if reached_sink:
+        updates["sink_reachable"] = True
+
+    if updates.get("process_exited_before_bp"):
+        updates["failure_reason"] = (
+            "process exited before the entry/sink breakpoint was ever hit"
+        )
+    elif not reached and updates.get("breakpoint_status") in ("unset", "missed"):
+        updates["failure_reason"] = "breakpoint not hit this round"
+    else:
+        updates["failure_reason"] = ""
+
+    return state.model_copy(update=updates)
+
+
 async def _run_evaluate_route(
     *,
     deps: DynamicGraphDeps,
@@ -386,91 +525,153 @@ async def _run_evaluate_route(
     reached: bool,
     reached_sink: bool,
     iteration: int,
+    emulation_mode: str = "",
+    verification_state: VerificationState | None = None,
 ) -> dict:
-    """spec Node 8 body: the deterministic oracle-match first pass, then
-    the LLM router only when that doesn't settle the round. Always returns
-    a `RouteDecision`, appended to `iteration_history` either way — the
-    spec's "Iteration history" report requirement covers BOTH the cheap
-    deterministic matches and the LLM-diagnosed ones, not just the latter.
+    """spec Node 8 body: the deterministic oracle-match first pass
+    (unchanged, still authoritative for `confirmed` — T1-A/T1-B), the hard
+    iteration-budget cutoff (unchanged, still checked before ANY LLM
+    call), then the Tier 3 Continuous Verification Supervisor
+    (`fvvw.supervisor.propose_action`/`validate_action`) BEFORE falling
+    through to the LLM router — the supervisor SUBSUMES the pre-Tier-3
+    inline `elif not reached`/disconfirm-shape branches (moved into
+    `fvvw.supervisor.propose_action`), and every route — whether the
+    supervisor's own deterministic proposal or the LLM router's choice —
+    passes through `validate_action`'s no-repeat/bounded-recovery gate
+    before it is ever acted on. Always returns a `RouteDecision`, appended
+    to `iteration_history` either way — the spec's "Iteration history"
+    report requirement covers every kind of round, not just the
+    LLM-diagnosed ones.
+
+    `verification_state`, when given, is the canonical state accumulated
+    across every PRIOR round this run (`BringupContext.verification_state`
+    — see T3-O); `None` (every existing caller/test that predates Tier 3)
+    starts a fresh, empty one for just this call — the SAME single-round
+    behavior every pre-Tier-3 test already exercises, since a fresh state
+    carries no prior `attempt_history` to escalate against.
     """
     async with aphase("evaluate_route"):
         oracle = plan.oracle or plan.decisive_observable
         max_iterations = deps.settings.stage5_dynamic_max_iterations
-        if match_oracle(observation, oracle):
+
+        oracle_hit = match_oracle(observation, plan)
+        # T1-B: write the check result back onto the record IMMEDIATELY —
+        # the record, the route, and the eventual report can never
+        # silently disagree about what the deterministic gate decided.
+        observation = observation.model_copy(update={"oracle_match": oracle_hit})
+        has_evidence = _has_positive_evidence(observation, reached_sink=reached_sink)
+
+        state = (
+            verification_state if verification_state is not None
+            else VerificationState(global_id=global_id)
+        )
+        state = _update_state_for_round(
+            state,
+            plan=plan,
+            observation=observation,
+            reached=reached,
+            reached_sink=reached_sink,
+            emulation_mode=emulation_mode,
+        )
+
+        if oracle_hit and has_evidence:
             decision = RouteDecision(
                 route="confirmed",
                 diagnosis=f"deterministic oracle match: {oracle!r}",
                 confidence="HIGH",
             )
         elif iteration >= max_iterations:
-            # Hard deterministic cutoff — never trust the LLM router alone
-            # to stop looping (spec's "a stuck run terminates INCONCLUSIVE,
-            # never loops forever"; see this module's risk note). The
-            # router is still given max_iterations/iteration in its own
-            # prompt so it can choose to converge early, but once the
-            # budget is actually spent this branch overrides whatever the
-            # router would have said.
+            # Hard deterministic cutoff — never trust the LLM router (or
+            # the Tier 3 supervisor) alone to stop looping (spec's "a
+            # stuck run terminates INCONCLUSIVE, never loops forever"; see
+            # this module's risk note). Checked BEFORE the supervisor is
+            # even consulted — a spent budget always wins.
             decision = RouteDecision(
                 route="inconclusive",
                 diagnosis=f"dynamic_iteration budget exhausted ({iteration}/{max_iterations}) "
                 "without a decisive oracle match.",
                 confidence="HIGH",
             )
-        elif observation.memory_diff_detected is False and reached_sink and (
-            "safe" in plan.disconfirm_condition.lower()
-            or "bounds" in plan.disconfirm_condition.lower()
-        ) and observation.signal is None:
-            # A conservative, purely deterministic refutation shape: sink
-            # reached, no crash, no memory corruption observed, AND the
-            # plan's own disconfirm_condition text already describes a
-            # "safely handled" scenario — still requires the LLM router to
-            # confirm/diagnose rather than auto-refuting from this alone
-            # (spec's "no crash" is not automatically proof of safety);
-            # falls through to the router below like every other
-            # non-oracle-matching case.
-            decision = await route_observation(
-                llm=deps.dynamic_evaluator_llm,
-                settings=deps.settings,
-                global_id=global_id,
-                oracle=oracle,
-                disconfirm_condition=plan.disconfirm_condition,
-                observation=observation,
-                reached_sink=reached_sink,
-                breakpoint_hit=reached,
-                iteration=iteration,
-                max_iterations=max_iterations,
-                command_log=deps.command_log,
-            )
-        elif not reached:
-            decision = RouteDecision(
-                route="retry_gdb_attach",
-                diagnosis="breakpoint never hit this round — wrong sink location, "
-                "missing symbol, or input never reached that code path.",
-                confidence="MEDIUM",
-            )
         else:
-            decision = await route_observation(
-                llm=deps.dynamic_evaluator_llm,
-                settings=deps.settings,
-                global_id=global_id,
-                oracle=oracle,
-                disconfirm_condition=plan.disconfirm_condition,
-                observation=observation,
-                reached_sink=reached_sink,
-                breakpoint_hit=reached,
-                iteration=iteration,
-                max_iterations=max_iterations,
-                command_log=deps.command_log,
-            )
+            if oracle_hit and not has_evidence:
+                # T1-B: a bug-shaped contradiction — the deterministic
+                # gate fired but nothing structured backs it. NEVER
+                # confirm on this; record the contradiction as this
+                # round's failure_reason so it is visible in the audit
+                # trail, then fall into the SAME supervisor/router
+                # pipeline every other non-confirming round uses (never a
+                # bespoke ad-hoc route here, so the no-repeat protection
+                # still applies uniformly).
+                state = state.model_copy(
+                    update={
+                        "failure_reason": (
+                            "deterministic oracle match fired but the observation carries "
+                            "no positive evidence (no signal/filesystem_artifacts/captured "
+                            "argument/memory diff) — refusing to confirm on an empty "
+                            "observation."
+                        )
+                    }
+                )
+
+            proposed = propose_action(state)
+            if proposed is not None:
+                decision = proposed
+            elif observation.memory_diff_detected is False and reached_sink and (
+                "safe" in plan.disconfirm_condition.lower()
+                or "bounds" in plan.disconfirm_condition.lower()
+            ) and observation.signal is None:
+                # A conservative, purely deterministic refutation SHAPE:
+                # sink reached, no crash, no memory corruption observed,
+                # AND the plan's own disconfirm_condition text already
+                # describes a "safely handled" scenario — still requires
+                # the LLM router to confirm/diagnose rather than
+                # auto-refuting from this alone (spec's "no crash" is not
+                # automatically proof of safety).
+                decision = await route_observation(
+                    llm=deps.dynamic_evaluator_llm,
+                    settings=deps.settings,
+                    global_id=global_id,
+                    oracle=oracle,
+                    disconfirm_condition=plan.disconfirm_condition,
+                    observation=observation,
+                    reached_sink=reached_sink,
+                    breakpoint_hit=reached,
+                    iteration=iteration,
+                    max_iterations=max_iterations,
+                    command_log=deps.command_log,
+                )
+            else:
+                decision = await route_observation(
+                    llm=deps.dynamic_evaluator_llm,
+                    settings=deps.settings,
+                    global_id=global_id,
+                    oracle=oracle,
+                    disconfirm_condition=plan.disconfirm_condition,
+                    observation=observation,
+                    reached_sink=reached_sink,
+                    breakpoint_hit=reached,
+                    iteration=iteration,
+                    max_iterations=max_iterations,
+                    command_log=deps.command_log,
+                )
+            # T3-M: every non-terminal-by-construction decision — whether
+            # the supervisor's own deterministic proposal or the LLM
+            # router's choice — passes through the SAME no-repeat/bounded
+            # recovery gate before it is ever acted on.
+            decision = validate_action(decision, state, deps.settings)
+
+        state = record_attempt(state, decision)
 
         result: dict = {
             "route": decision,
             "iteration_history": [decision],
             "dynamic_iteration": iteration,
+            "observation": observation,
+            "verification_state": state,
         }
         if decision.route in _TERMINAL_ROUTES:
             result["dynamic_result"] = _build_track_result(
-                decision, observation, iteration=iteration
+                decision, observation, iteration=iteration, reached_sink=reached_sink
             )
         return result
 
@@ -483,12 +684,20 @@ _TERMINAL_ROUTES: dict[str, tuple[VerificationVerdict, str]] = {
 """Maps a terminal `RouteDecision.route` to the `(verdict, proved_hypothesis)`
 pair `_build_track_result` stamps onto the final `TrackResult` — the same
 three-way split `dynamic_track._terminal` used pre-rewrite, now keyed off
-the LLM router's/oracle-match's route instead of the old rule engine's own
-branches."""
+the LLM router's/oracle-match's/the Tier 3 supervisor's route instead of
+the old rule engine's own branches. `resolve_address`/`restart_execution`
+are deliberately ABSENT — both are repair routes, never terminal;
+`"escalate"` is likewise absent — `fvvw.supervisor.validate_action`
+resolves it into a concrete route before a `RouteDecision` carrying it can
+ever reach here."""
 
 
 def _build_track_result(
-    decision: RouteDecision, observation: ObservationRecord, *, iteration: int
+    decision: RouteDecision,
+    observation: ObservationRecord,
+    *,
+    iteration: int,
+    reached_sink: bool | None = None,
 ) -> TrackResult:
     """Node 8's terminal-route case: turn a `confirmed`/`refuted`/
     `inconclusive` `RouteDecision` (which itself carries no verdict, only a
@@ -497,8 +706,42 @@ def _build_track_result(
     `fvvw.joint.joint_evaluate` need. Mirrors `dynamic_track._terminal`'s
     evidence shape (`reason`, `budget_exhausted` for INCONCLUSIVE) so
     `write_report`/HITL's budget-exhaustion trigger keep working unchanged
-    against the new graph's output."""
+    against the new graph's output.
+
+    T1-B defense in depth: even if some future bug lets a `confirmed`
+    route reach this function with an observation carrying NO positive
+    evidence (the SAME `_has_positive_evidence` test `_run_evaluate_route`
+    already applies upstream — this is a SECOND, independent check of the
+    identical condition, mirroring `fvvw.joint.collect_residual_unknowns`'
+    own "REFUTED without a proved B" defense-in-depth caveat), the verdict
+    is downgraded to INCONCLUSIVE here rather than ever persisting a
+    CONFIRMED `TrackResult` built on an empty observation.
+
+    `reached_sink`, when given, is the SAME already-computed fact
+    `_run_evaluate_route` passes through (a genuinely reached sink with a
+    captured argument — `observation.faulting_pc is not None or
+    filesystem_artifacts` for the agentic path, `captured is not None`
+    for the deterministic path — see `_run_trigger`); `None` (every
+    caller/test that predates this parameter) derives a best-effort proxy
+    from the observation's own `faulting_pc`/`filesystem_artifacts`
+    fields, sufficient for every case that doesn't depend on a bare
+    captured-argument-with-no-crash outcome."""
     verdict, proved_hypothesis = _TERMINAL_ROUTES[decision.route]
+    effective_reached_sink = (
+        reached_sink
+        if reached_sink is not None
+        else bool(observation.faulting_pc is not None or observation.filesystem_artifacts)
+    )
+    if verdict == VerificationVerdict.CONFIRMED and not _has_positive_evidence(
+        observation, reached_sink=effective_reached_sink
+    ):
+        verdict, proved_hypothesis = VerificationVerdict.INCONCLUSIVE, "none"
+        decision = RouteDecision(
+            route="inconclusive",
+            diagnosis="confirmed route with an empty observation — refused. Original "
+            f"diagnosis: {decision.diagnosis}",
+            confidence="LOW",
+        )
     evidence: dict = {"reason": decision.diagnosis} if decision.diagnosis else {}
     if observation.faulting_pc:
         evidence["faulting_pc"] = observation.faulting_pc
@@ -508,6 +751,8 @@ def _build_track_result(
         evidence["filesystem_artifacts"] = observation.filesystem_artifacts
     if observation.memory_diff_detected:
         evidence["memory_diff_detected"] = observation.memory_diff_detected
+    if observation.oracle_match is not None:
+        evidence["oracle_match"] = observation.oracle_match
     if verdict == VerificationVerdict.INCONCLUSIVE:
         # Same explicit fact-tag `dynamic_track._terminal` sets — HITL's
         # `is_budget_exhausted` trigger (`fvvw.hitl`) reads this key, not
@@ -554,7 +799,9 @@ def route_after_trigger(state: dict) -> Literal["evaluate_route", "bringup"]:
 
 def route_after_evaluate(
     state: dict,
-) -> Literal["bringup", "gdb_attach", "trigger", "plan_emulation_escalate", "__end__"]:
+) -> Literal[
+    "bringup", "gdb_attach", "trigger", "plan_emulation_escalate", "resolve_address", "__end__"
+]:
     decision: RouteDecision | None = state.get("route")
     if decision is None:
         return "__end__"
@@ -594,6 +841,17 @@ def build_dynamic_graph(
         return result
 
     async def bringup_node(state: FVVWState) -> dict:
+        # T3-N: `restart_execution` (unlike `retry_bringup`) means "tear
+        # down the CURRENT session before repairing" — the supervisor's
+        # own signal that repeated in-place repair against this session
+        # has already been tried and exhausted (see `fvvw.supervisor`'s
+        # `_ESCALATION_CHAIN`). Checked here, not as a separate graph
+        # node, since `bringup_node`'s own body is otherwise identical
+        # either way — the only difference is whether a fresh session is
+        # forced first.
+        incoming_route: RouteDecision | None = state.get("route")
+        if incoming_route is not None and incoming_route.route == "restart_execution":
+            await restart_session(ctx)
         return await _run_bringup(ctx, deps=deps)
 
     async def health_gate_node(state: FVVWState) -> dict:
@@ -604,6 +862,24 @@ def build_dynamic_graph(
         result = await _run_gdb_attach(ctx, transcript_so_far=transcript_so_far)
         ctx._last_reached = result.get("_reached", False)  # type: ignore[attr-defined]
         return result
+
+    async def resolve_address_node(state: FVVWState) -> dict:
+        """T3-N's `resolve_address` repair route: re-derive `plan.
+        sink_addr` from the best already-known fact
+        (`target.func_offset`) when it is still unresolved, record the
+        attempt, then hand off to Node 5 (`gdb_attach`) for another try.
+        Never FABRICATES an address — an unresolvable sink stays empty,
+        and the Tier 1 positive-evidence gate (T1-B) already ensures an
+        empty sink can never produce a false CONFIRMED (no meaningful
+        sink breakpoint -> no captured argument -> no evidence)."""
+        async with aphase("resolve_address"):
+            if not plan.sink_addr.strip() and target.func_offset.strip():
+                plan.sink_addr = target.func_offset
+                ctx.applied_fixes.append(
+                    f"resolve_address: fell back sink_addr to target.func_offset="
+                    f"{target.func_offset!r} (T2-F resolution had no better answer)"
+                )
+        return {}
 
     async def trigger_node(state: FVVWState) -> dict:
         transcript_so_far = state.get("gdb_transcript", "") or ""
@@ -622,7 +898,7 @@ def build_dynamic_graph(
         observation = state.get("observation") or ObservationRecord()
         reached = getattr(ctx, "_last_reached", False)
         reached_sink = state.get("_reached_sink", reached)
-        return await _run_evaluate_route(
+        result = await _run_evaluate_route(
             deps=deps,
             global_id=candidate.global_id,
             plan=plan,
@@ -630,7 +906,17 @@ def build_dynamic_graph(
             reached=reached,
             reached_sink=bool(reached_sink),
             iteration=iteration,
+            emulation_mode=ctx.emulation_plan.get("mode", ""),
+            verification_state=ctx.verification_state,
         )
+        # T3-O: persist the updated canonical state back onto the
+        # long-lived BringupContext — the SAME instance every node
+        # closure shares — so the NEXT round (and, ultimately, `fvvw.
+        # graph.run_dynamic_track_only`'s `dynamic_extras`) sees the
+        # accumulated events/attempt_history rather than a fresh state
+        # each round.
+        ctx.verification_state = result.get("verification_state") or ctx.verification_state
+        return result
 
     graph = StateGraph(FVVWState)
     graph.add_node("plan_emulation", plan_emulation_node)
@@ -638,12 +924,14 @@ def build_dynamic_graph(
     graph.add_node("bringup", bringup_node)
     graph.add_node("health_gate", health_gate_node)
     graph.add_node("gdb_attach", gdb_attach_node)
+    graph.add_node("resolve_address", resolve_address_node)
     graph.add_node("trigger", trigger_node)
     graph.add_node("evaluate_route", evaluate_route_node)
 
     graph.set_entry_point("plan_emulation")
     graph.add_edge("plan_emulation", "bringup")
     graph.add_edge("plan_emulation_escalate", "bringup")
+    graph.add_edge("resolve_address", "gdb_attach")
     graph.add_conditional_edges(
         "bringup",
         route_after_bringup,
@@ -672,6 +960,7 @@ def build_dynamic_graph(
             "gdb_attach": "gdb_attach",
             "trigger": "trigger",
             "plan_emulation_escalate": "plan_emulation_escalate",
+            "resolve_address": "resolve_address",
             "__end__": END,
         },
     )

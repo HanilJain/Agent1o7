@@ -848,6 +848,33 @@ class Settings(BaseSettings):
     static track, `stage5_dynamic_max_iterations` for the dynamic track)
     the exhausted track was using."""
 
+    # ---- Stage 5 FVVW v3 Tier 3: Continuous Verification Supervisor ------
+    stage5_supervisor_max_same_action: int = Field(
+        default=2, ge=1, validation_alias="FWA_STAGE5_SUPERVISOR_MAX_SAME_ACTION"
+    )
+    """`fvvw.supervisor.validate_action`'s no-repeat bound: how many times
+    the SAME recovery action may be proposed against the SAME underlying
+    `VerificationState` condition (`fvvw.supervisor._attempt_signature`)
+    before it is rejected and rewritten to the next tier in
+    `fvvw.supervisor._ESCALATION_CHAIN` — the direct fix for the
+    dead-daemon `retry_gdb_attach` loop the DIR-825 incident exposed
+    (see Tier 1's T1-E and Tier 3's T3-M). A value of 2 means: the action
+    may be tried, then tried ONCE more against an unchanged condition,
+    before the third identical proposal is escalated instead of repeated.
+    """
+    stage5_monitor_poll_seconds: float = Field(
+        default=1.0, gt=0, validation_alias="FWA_STAGE5_MONITOR_POLL_SECONDS"
+    )
+    """T3-L: the poll cadence `fvvw.monitors`' bounded async pollers use
+    when watching QEMU/process health, the GDB transcript, and filesystem
+    artifacts concurrently with the main dynamic-track step — "detected
+    immediately" in this design means "detected at the next poll tick",
+    bounded by this value. Kept deliberately coarse-grained (1s default)
+    since every monitor round-trips through `exec_in_session` (one-shot
+    command execution, not an interactive stream) — a much tighter poll
+    would just multiply session round-trips for no real gain in detection
+    latency given that floor."""
+
     # ---- LLM usage tracking & rate limiting ----------------------------
     llm_usage_tracking: bool = Field(default=True, validation_alias="FWA_LLM_USAGE_TRACKING")
     """Attach a `UsageTrackingCallbackHandler` to every constructed chat

@@ -268,20 +268,53 @@ def normalize_hex_addr(addr: str) -> str:
     return a
 
 
+STOPPED_MARKER_PREFIX = "FVVW:STOPPED:PC="
+"""T1-D's unambiguous "the inferior is actually stopped, not exited" tag —
+printed via a `printf` that only ever executes if GDB is looking at a live
+stopped inferior (any command after the target has exited errors instead
+of running). Its ABSENCE in a round's combined transcript, after the
+first `continue`, is exactly what T1-D's `_parse_process_exit`/T1-E's
+`process_exited_before_bp` fact is built from — never inferred from the
+mere presence of a breakpoint SET confirmation, which (per `reach_target`'s
+own docstring) fires even when the process later dies before ever hitting
+that breakpoint."""
+
+
 def render_gdb_recipe(
     *,
     architecture: str,
     gdb_port: int,
     entry_addr: str,
     breakpoint_commands: list[str],
+    pre_continue_commands: list[str] | None = None,
 ) -> str:
     """Render the shared GDB-recipe preamble (connect + pagination/confirm
-    settings + break at the functional entry) followed by
-    `breakpoint_commands` — the caller-supplied per-node body (guard
-    forcing, trigger instrumentation, signal capture). This is the ONE
-    place the `target remote`/`set architecture`/`set pagination off`/
-    `set confirm off` boilerplate FVVW §7's recipe describes lives, so
+    settings + signal-handling disposition + break at the functional
+    entry) followed by `breakpoint_commands` — the caller-supplied per-node
+    body (guard forcing, trigger instrumentation, signal capture). This is
+    the ONE place the `target remote`/`set architecture`/`set pagination
+    off`/`set confirm off` boilerplate FVVW §7's recipe describes lives, so
     every dynamic-track node's recipe shares it instead of re-deriving it.
+
+    `pre_continue_commands` (T1-D fix #1): commands that must run BEFORE
+    the first `continue` — chiefly `handle SIGSEGV/SIGABRT/SIGILL stop`
+    (`render_crash_capture_commands()`, the default when this argument is
+    omitted/`None`). `handle` sets signal DISPOSITION and needs no running
+    inferior, so it belongs between `target remote` and the first
+    `continue` — emitting it as part of the CALLER's `breakpoint_commands`
+    body instead (the historical bug) put it AFTER that first `continue`,
+    so a crash on the very first continue was never caught by the handler
+    meant to catch it. Pass `pre_continue_commands=[]` explicitly to opt
+    out (no caller in this codebase currently needs to).
+
+    After the first `continue`, a tagged marker line
+    (`STOPPED_MARKER_PREFIX` + `$pc`) is always emitted — T1-D fix #2: this
+    line only PRINTS if the inferior is actually stopped (any GDB command
+    issued against an already-exited inferior errors instead of running),
+    so its ABSENCE in the combined transcript is the mechanical signal
+    that the process exited before ever reaching the entry breakpoint —
+    see `common.verification.ObservationRecord.process_exited_before_bp`/
+    `fvvw.dynamic_track._parse_process_exit`.
 
     Raises `ValueError` if `entry_addr` is empty/unresolved — an unresolved
     functional entry is a genuine bring-up/plan fault (there is nothing to
@@ -298,13 +331,18 @@ def render_gdb_recipe(
             "render_gdb_recipe: entry_addr is empty — cannot emit 'break *' with no "
             "operand (GDB rejects it and aborts the whole recipe)."
         )
+    pre_continue = (
+        render_crash_capture_commands() if pre_continue_commands is None else pre_continue_commands
+    )
     lines = [
         f"set architecture {architecture}",
         "set pagination off",
         "set confirm off",
         f"target remote localhost:{gdb_port}",
+        *pre_continue,
         f"break *{normalize_hex_addr(entry_addr)}",
         "continue",
+        f'printf "{STOPPED_MARKER_PREFIX}%p\\n", $pc',
         *breakpoint_commands,
     ]
     return "\n".join(lines) + "\n"
