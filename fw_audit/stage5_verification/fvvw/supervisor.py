@@ -182,37 +182,65 @@ def propose_action(state: VerificationState) -> RouteDecision | None:
     the caller then falls back to the existing LLM router. Checked in
     priority order; the FIRST matching case wins.
 
-    1. `process_exited_before_bp` (T1-E): the process died before the
+    1. `instrumentation_failures >= 2` (P1-2): GDB has failed to
+       INSTRUMENT the target (set a real breakpoint) for two or more
+       consecutive rounds — a harness/recipe-level problem (bad break
+       operand, stripped symbol, ...), never an ordinary "not yet hit"
+       miss. This is the DIR-825 incident's exact root cause: without
+       this case, `instrumentation_ok=False` rounds fell straight through
+       to case #7 below and were repeatedly diagnosed as "breakpoint never
+       hit — wrong sink location, missing symbol, or input never reached
+       that code path" for 9 rounds running. On the FIRST such failure
+       (`instrumentation_failures == 1`), fall through instead — a single
+       bad round could still be `resolve_address`'s job (case #6, checked
+       after) or a genuinely transient GDB hiccup the LLM router should
+       see once before this case forces an escalation. Routes to
+       `escalate_direct_call`.
+    2. `process_exited_before_bp` (T1-E): the process died before the
        entry/sink breakpoint was ever reached — re-attaching to the SAME
        dead process cannot succeed no matter how many times it is
        retried (the dead-daemon `retry_gdb_attach` loop the DIR-825
        incident exposed). Routes to `escalate_direct_call`.
-    2. A daemon/startup-unreachable signal in `failure_reason` (T2-G —
+    3. A daemon/startup-unreachable signal in `failure_reason` (T2-G —
        `plan_emulation` already prefers `direct_call` mode UP FRONT for
        such a target; this is the supervisor's own defense-in-depth
        check for when bring-up nonetheless keeps failing against one,
        mirroring `joint.py::collect_residual_unknowns`'s existing
        "shouldn't happen, but flagged rather than silently trusted"
        posture): `escalate_direct_call`.
-    3. `process_status == "not_started"` with a `failure_reason` already
+    4. `process_status == "not_started"` with a `failure_reason` already
        set (a startup failure the harness observed before the target
        ever ran at all): `retry_bringup`.
-    4. `current_trigger_type` set and `failure_reason` names a trigger
+    5. `current_trigger_type` set and `failure_reason` names a trigger
        problem: `retry_trigger`.
-    5. No `sink_addr` resolved yet, and the round hasn't reached it any
+    6. No `sink_addr` resolved yet, and the round hasn't reached it any
        other way: `resolve_address` (T2-F) — never honestly proceed to
        gdb_attach with no real sink location.
-    6. `breakpoint_status` not yet `"hit"` and the process hasn't exited:
+    7. `breakpoint_status` not yet `"hit"` and the process hasn't exited:
        `retry_gdb_attach` — the ordinary "not yet hit, try again" case
        (this SUBSUMES `_run_evaluate_route`'s pre-Tier-3 inline `elif not
        reached` branch, moved here per the plan).
-    7. A stall/timeout signal in `failure_reason`: `retry_bringup` once;
+    8. A stall/timeout signal in `failure_reason`: `retry_bringup` once;
        a SECOND stall recorded in `attempt_history` for the identical
        reason escalates straight to `inconclusive` rather than retrying
        an execution that has already demonstrably stalled twice.
-    8. Nothing above applies: `None` — genuinely ambiguous, defer to the
+    9. Nothing above applies: `None` — genuinely ambiguous, defer to the
        LLM router.
     """
+    if state.instrumentation_failures >= 2:
+        return RouteDecision(
+            route="escalate_direct_call",
+            diagnosis=(
+                f"instrumentation has failed {state.instrumentation_failures} consecutive "
+                f"rounds in a row ({state.failure_reason or 'no further detail captured'}) — "
+                "this is a harness/recipe-level failure (GDB never successfully set a "
+                "breakpoint), not an ordinary 'breakpoint not yet hit' miss; retrying the "
+                "identical broken instrumentation cannot succeed, escalating to a direct-call "
+                "invocation instead."
+            ),
+            confidence="HIGH",
+        )
+
     if state.process_exited_before_bp:
         return RouteDecision(
             route="escalate_direct_call",
@@ -357,11 +385,25 @@ def _attempt_signature(decision: RouteDecision, state: VerificationState) -> str
     underlying condition differently each round, which would defeat a
     prose-based dedup; comparing the raw facts instead makes the
     "unchanged condition" detection robust to how any one round happens
-    to describe it."""
+    to describe it.
+
+    Deliberately EXCLUDES `state.failure_reason` (fixed in the DIR-825
+    incident's fix — the docstring above already promised "never decision.
+    diagnosis prose", but `failure_reason` is itself free text populated
+    from an LLM router's own diagnosis/an `instrumentation_error` string in
+    some rounds, so leaving it IN the signature let every round's slightly
+    different phrasing count as a "new" condition and defeated this exact
+    dedup — a round-tripped LLM-produced `failure_reason` string could vary
+    on every call even against an IDENTICAL underlying failure). Includes
+    `instrumentation_failures > 0` instead (a coarse boolean bucket, not
+    the raw count — the raw count itself increments every round and would
+    reintroduce the same "always looks new" problem) so a repeated
+    instrumentation failure is still recognized as the unchanged condition
+    it is."""
     return (
         f"{state.process_status}:{state.gdb_status}:{state.breakpoint_status}:"
         f"{state.process_exited_before_bp}:{state.reached}:{bool(state.sink_addr.strip())}:"
-        f"{state.failure_reason}"
+        f"{state.instrumentation_failures > 0}"
     )
 
 

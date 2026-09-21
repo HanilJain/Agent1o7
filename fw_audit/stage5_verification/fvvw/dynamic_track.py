@@ -49,6 +49,7 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     STOPPED_MARKER_PREFIX,
     build_gdb_batch_command,
     build_qemu_user_launch_command,
+    is_resolved_addr,
     lint_gdb_recipe,
     render_crash_report_commands,
     render_gdb_recipe,
@@ -903,6 +904,30 @@ class DynamicFault(RuntimeError):
     setting `mem.repair.return_to` to the node that raised."""
 
 
+class UnresolvedPlanFault(DynamicFault):
+    """A narrower `DynamicFault`: the recipe could not be built because an
+    address the PLAN was supposed to supply (`entry_addr`/`target_addr`/
+    `sink_addr`) is unresolved (empty, or a placeholder token like
+    `"unspecified"` — see `tools.qemu_gdb_tool.is_resolved_addr`), not
+    because QEMU/GDB itself failed to connect or crashed.
+
+    This distinction matters for routing (see `dynamic_graph._run_gdb_
+    attach`/`_run_trigger`): a genuine connection/timeout `DynamicFault`
+    means "the environment is broken, repair bring-up and try again"
+    (`retry_bringup`) — but re-running bring-up can never conjure an
+    address the strategy agent never resolved, so retrying it against an
+    `UnresolvedPlanFault` would just repeat the identical failure forever
+    (the DIR-825 incident's root cause). Callers instead route THIS
+    exception to `resolve_address` (fall back to `target.func_offset`) and,
+    if that has no better answer either, straight to `escalate_direct_call`
+    / `inconclusive` — never `retry_bringup`.
+
+    Raised by `_build_and_lint_recipe` when the underlying `ValueError` came
+    from an unresolved-address check (`render_gdb_recipe`/`render_guard_
+    breakpoint_commands`/`render_trigger_breakpoint_commands`, all of which
+    now validate via `is_resolved_addr` — see `tools.qemu_gdb_tool`)."""
+
+
 def _render_all_guard_commands(
     guards, *, global_id: str, register: str, marker_prefix: str = "GUARD"
 ) -> list[str]:
@@ -947,11 +972,26 @@ def _build_and_lint_recipe(
     (`render_gdb_recipe`'s own empty-entry_addr/invalid-forced_value
     `ValueError`s, and `lint_gdb_recipe`'s whole-script pre-flight check)
     are both guaranteed to run before ANY recipe this module builds is
-    ever written to disk and handed to `gdb-multiarch -batch -x` — and so
-    a caught `ValueError` from either layer is translated into the
-    `DynamicFault` each node's docstring already documents raising on a
-    "GDB batch call itself errors" condition, rather than an uncaught
-    `ValueError` breaking that contract."""
+    ever written to disk and handed to `gdb-multiarch -batch -x`.
+
+    Raises `UnresolvedPlanFault` (a narrower `DynamicFault`) specifically
+    when `entry_addr` itself is unresolved (empty, or a placeholder token
+    like `"unspecified"` — see `tools.qemu_gdb_tool.is_resolved_addr`) —
+    checked HERE, before calling `render_gdb_recipe`, so callers can route
+    this distinctly from a genuine QEMU/GDB connection fault (see
+    `UnresolvedPlanFault`'s own docstring for why that distinction matters:
+    `retry_bringup` can never fix an address the plan never resolved).
+    Every OTHER `ValueError` from either `render_gdb_recipe` or `lint_gdb_
+    recipe` (an invalid `forced_value`, a bad line assembled some other
+    way, ...) is translated into the plain `DynamicFault` each node's
+    docstring already documents raising on a "GDB batch call itself
+    errors" condition, rather than an uncaught `ValueError` breaking that
+    contract."""
+    if not is_resolved_addr(entry_addr):
+        raise UnresolvedPlanFault(
+            f"{global_id}: entry_addr={entry_addr!r} is empty or an unresolved placeholder — "
+            "refusing to build a recipe with no real 'break *' operand."
+        )
     try:
         recipe = render_gdb_recipe(
             architecture=architecture,
@@ -1217,6 +1257,12 @@ async def instrument_trigger(
     )
     crash_marker = "CRASH"
     sink_addr = ctx.plan.sink_addr or ctx.target.func_offset
+    if not is_resolved_addr(sink_addr):
+        raise UnresolvedPlanFault(
+            f"{ctx.candidate.global_id}: sink_addr={sink_addr!r} (and target.func_offset "
+            f"={ctx.target.func_offset!r}) is empty or an unresolved placeholder — cannot "
+            "instrument the sink with no real breakpoint operand."
+        )
     trigger_commands = render_trigger_breakpoint_commands(
         sink_addr=sink_addr,
         argument_register=register,
@@ -1454,7 +1500,26 @@ def _looks_like_setup_fault(stderr: str) -> bool:
     problem (routes to `bringup_stabilize`) rather than the target simply
     not reaching a breakpoint (a normal, non-fault outcome `dynamic_evaluate`
     handles)? Conservative — only recognizable connection/launch failures
-    trigger a repair; an empty or merely-unexpected stderr does not."""
+    trigger a repair; an empty or merely-unexpected stderr does not.
+
+    Includes GDB *instrumentation* failures (a recipe that connected fine
+    but whose `break *` line itself was invalid/unresolvable) alongside the
+    original QEMU/connection markers — the DIR-825 incident's actual
+    failure (`break *unspecified` -> "No symbol table is loaded") produced
+    NEITHER a connection error nor a crash signal, so it fell through every
+    existing marker and was silently treated as an ordinary "breakpoint
+    not hit" round. `is_resolved_addr` (P0-1, `tools.qemu_gdb_tool`) is the
+    primary fix — it stops such a recipe from ever being built — but this
+    is the backstop for any OTHER GDB-level setup error that still slips
+    through (a stripped-symbol binary, a malformed hand-edited/injected
+    recipe, ...).
+
+    Guarded against over-matching: an instrumentation-error marker is only
+    honored when the transcript does NOT also contain a real breakpoint-hit
+    line (`Breakpoint N, ` — note the comma, matching `reach_target`'s own
+    hit-detection regex) — a recipe that hit its breakpoint and ALSO
+    printed one of these strings incidentally (e.g. in captured target
+    stdout) must never be misclassified as a setup fault."""
     if not stderr:
         return False
     fault_markers = (
@@ -1468,9 +1533,19 @@ def _looks_like_setup_fault(stderr: str) -> bool:
         "sigill",
         "sigsegv",
         "exec format error",
+        # Instrumentation/recipe-level GDB errors (see docstring above).
+        "no symbol table",
+        "argument required",
+        "invalid number",
+        "error in sourced command file",
     )
     lowered = stderr.lower()
-    return any(marker in lowered for marker in fault_markers)
+    if not any(marker in lowered for marker in fault_markers):
+        return False
+    # A real hit happened somewhere in this transcript — do not let an
+    # incidental marker substring (e.g. echoed target output) override
+    # actual positive evidence of a working breakpoint.
+    return not re.search(r"breakpoint \d+, ", lowered)
 
 
 # --------------------------------------------------------------------- #
@@ -1606,65 +1681,90 @@ async def health_gate(ctx: BringupContext) -> None:
         # it runs to completion/exits on disconnect, same discipline every
         # other node in this module already follows via _launch_qemu_and_
         # wait before its own batch).
+        #
+        # `entry_addr` must be a REALLY resolved address/symbol
+        # (`is_resolved_addr`, not merely non-empty after `.strip()`) for
+        # this probe to mean anything — the DIR-825 incident's plan carried
+        # `entry_addr="unspecified"`, which is non-empty (so the OLD
+        # `if entry_addr.strip():` check let this probe run) but is not a
+        # real GDB operand: `_build_and_lint_recipe` would raise
+        # `UnresolvedPlanFault` for it. Silently SKIPPING the probe in that
+        # case (the old behavior) is exactly how a dead-on-arrival target
+        # (hostapd exiting during startup with no config argv) passed
+        # health_gate as healthy — the probe never ran at all, so the gate
+        # degraded back to "QEMU is waiting" (checks 2-3) with no real
+        # liveness advance evidence. An unresolved entry_addr must instead
+        # be treated as an outright health-gate FAILURE: there is no way to
+        # prove the target executes at all without a real breakpoint to
+        # advance to.
         entry_addr = ctx.plan.entry_addr or ctx.target.func_offset
-        if entry_addr.strip():
-            await _launch_qemu_and_wait(ctx)
-            recipe = _build_and_lint_recipe(
-                global_id=ctx.candidate.global_id,
-                architecture=arch,
-                gdb_port=1234,
-                entry_addr=entry_addr,
-                breakpoint_commands=[],
-            )
-            recipe_path = f"{CONTAINER_SCRATCH}/recipe_health_advance.gdb"
-            target_relpath = _target_relpath_in_workspace(ctx.candidate)
-            await ctx.session_executor.exec_in_session(
-                ctx.handle,
-                f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n"
-                f"{recipe}FVVWEOF",
-                timeout=ctx.settings.stage5_gdb_timeout_seconds,
-            )
-            advance_result = await ctx.session_executor.exec_in_session(
-                ctx.handle,
-                f"cd {CONTAINER_WORKDIR} && "
-                + build_gdb_batch_command(recipe_path, target_relpath),
-                timeout=ctx.settings.stage5_gdb_timeout_seconds,
-            )
-            combined = advance_result.stdout + advance_result.stderr
-            stopped = _parse_reached_marker(combined) is not None
-            exit_code = _parse_process_exit(combined)
-            if not stopped and exit_code is not None:
-                if run is not None:
-                    run.end(
-                        outputs={
-                            "passed": False,
-                            "reason": "process exits during startup",
-                            "exit_code": exit_code,
-                        }
-                    )
-                raise HealthGateFailure(
-                    f"target process exits during startup (before ever reaching the entry "
-                    f"breakpoint at {entry_addr!r}) — exit_code={exit_code}; this is a "
-                    "dispatch/startup-reachability problem (daemon config parse, missing "
-                    "interface/NVRAM, ...), NOT a transient QEMU/GDB stub problem — repeatedly "
-                    "retrying bring-up against the SAME dead process cannot fix it; see T2-G/"
-                    "T2-H for the direct-call escalation path this should route toward."
+        if not is_resolved_addr(entry_addr):
+            if run is not None:
+                run.end(
+                    outputs={"passed": False, "reason": "entry_addr unresolved"}
                 )
-            if not stopped:
-                # Neither the STOPPED marker nor a recognizable exit
-                # line — a genuine transient stub/connection problem
-                # (distinct from the "process exits during startup"
-                # case above), diagnosed honestly rather than silently
-                # treated as a pass.
-                if run is not None:
-                    run.end(
-                        outputs={"passed": False, "reason": "advance probe inconclusive"}
-                    )
-                raise HealthGateFailure(
-                    "health-gate advance probe neither confirmed the inferior stopped at "
-                    f"the entry breakpoint nor observed a clean process exit — transcript "
-                    f"excerpt: {combined[-500:]!r}"
+            raise HealthGateFailure(
+                f"cannot run the liveness-advance probe: entry_addr={entry_addr!r} is empty "
+                "or an unresolved placeholder — refusing to treat the session as healthy "
+                "with no real breakpoint to prove the target actually executes."
+            )
+        await _launch_qemu_and_wait(ctx)
+        recipe = _build_and_lint_recipe(
+            global_id=ctx.candidate.global_id,
+            architecture=arch,
+            gdb_port=1234,
+            entry_addr=entry_addr,
+            breakpoint_commands=[],
+        )
+        recipe_path = f"{CONTAINER_SCRATCH}/recipe_health_advance.gdb"
+        target_relpath = _target_relpath_in_workspace(ctx.candidate)
+        await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            f"mkdir -p {CONTAINER_SCRATCH} && cat > {recipe_path} << 'FVVWEOF'\n"
+            f"{recipe}FVVWEOF",
+            timeout=ctx.settings.stage5_gdb_timeout_seconds,
+        )
+        advance_result = await ctx.session_executor.exec_in_session(
+            ctx.handle,
+            f"cd {CONTAINER_WORKDIR} && "
+            + build_gdb_batch_command(recipe_path, target_relpath),
+            timeout=ctx.settings.stage5_gdb_timeout_seconds,
+        )
+        combined = advance_result.stdout + advance_result.stderr
+        stopped = _parse_reached_marker(combined) is not None
+        exit_code = _parse_process_exit(combined)
+        if not stopped and exit_code is not None:
+            if run is not None:
+                run.end(
+                    outputs={
+                        "passed": False,
+                        "reason": "process exits during startup",
+                        "exit_code": exit_code,
+                    }
                 )
+            raise HealthGateFailure(
+                f"target process exits during startup (before ever reaching the entry "
+                f"breakpoint at {entry_addr!r}) — exit_code={exit_code}; this is a "
+                "dispatch/startup-reachability problem (daemon config parse, missing "
+                "interface/NVRAM, ...), NOT a transient QEMU/GDB stub problem — repeatedly "
+                "retrying bring-up against the SAME dead process cannot fix it; see T2-G/"
+                "T2-H for the direct-call escalation path this should route toward."
+            )
+        if not stopped:
+            # Neither the STOPPED marker nor a recognizable exit
+            # line — a genuine transient stub/connection problem
+            # (distinct from the "process exits during startup"
+            # case above), diagnosed honestly rather than silently
+            # treated as a pass.
+            if run is not None:
+                run.end(
+                    outputs={"passed": False, "reason": "advance probe inconclusive"}
+                )
+            raise HealthGateFailure(
+                "health-gate advance probe neither confirmed the inferior stopped at "
+                f"the entry breakpoint nor observed a clean process exit — transcript "
+                f"excerpt: {combined[-500:]!r}"
+            )
 
         # Check 5: network-facing target — best-effort port-open check.
         if _target_needs_network(ctx.plan):
@@ -1780,6 +1880,38 @@ def _parse_process_exit(combined: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+_INSTRUMENTATION_ERROR_MARKERS: tuple[str, ...] = (
+    "no symbol table",
+    "argument required",
+    "invalid number",
+    "error in sourced command file",
+)
+"""The instrumentation-specific subset of `_looks_like_setup_fault`'s
+marker list (excludes the QEMU-connection-only markers like "connection
+refused", which are a bring-up/environment problem, not a GDB
+instrumentation problem) — used by `_parse_instrumentation_error` to
+populate `ObservationRecord.instrumentation_error` with the SPECIFIC
+matched marker, so a reader (or the report writer) sees which failure mode
+actually occurred rather than a generic "something failed" flag."""
+
+
+def _parse_instrumentation_error(combined: str) -> str | None:
+    """The short instrumentation-failure reason for THIS round's transcript,
+    or `None` if instrumentation looks like it succeeded (or the transcript
+    is inconclusive either way). Mirrors `_looks_like_setup_fault`'s own
+    "don't override a real breakpoint hit" guard — a transcript containing
+    a real `Breakpoint N, ` hit line is never classified as an
+    instrumentation failure, even if an error string also appears in it
+    (e.g. from echoed target stdout)."""
+    lowered = combined.lower()
+    if re.search(r"breakpoint \d+, ", lowered):
+        return None
+    for marker in _INSTRUMENTATION_ERROR_MARKERS:
+        if marker in lowered:
+            return f"gdb: {marker} (recipe/instrumentation error, not a breakpoint miss)"
+    return None
+
+
 def _parse_reached_marker(combined: str) -> str | None:
     """The faulting/stopped PC from `render_gdb_recipe`'s own
     `STOPPED_MARKER_PREFIX` tag (T1-D fix #2), or `None` if the marker
@@ -1842,6 +1974,13 @@ async def collect_observation(
     reached: bool | None = reached_marker is not None
     process_exited_before_bp = exit_code is not None and reached_marker is None
 
+    # P1-1: was GDB even able to INSTRUMENT the target this round (attach,
+    # set a real breakpoint) — as opposed to instrumenting fine and simply
+    # not hitting it yet? See ObservationRecord.instrumentation_ok's own
+    # docstring for why this is a distinct fact from `reached=False`.
+    instrumentation_error = _parse_instrumentation_error(combined)
+    instrumentation_ok = instrumentation_error is None
+
     if not memory_before and not memory_after:
         blocks = _parse_memory_dump_blocks(result_stdout)
         if len(blocks) >= 2:
@@ -1878,6 +2017,8 @@ async def collect_observation(
         reached=reached,
         process_exited_before_bp=process_exited_before_bp,
         transcript=combined,
+        instrumentation_ok=instrumentation_ok,
+        instrumentation_error=instrumentation_error,
     )
 
 

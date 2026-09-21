@@ -306,6 +306,178 @@ async def test_debug_dynamic_runs_only_dynamic_track(monkeypatch, tmp_path: Path
     assert len(strategy_llm.calls) == 1
 
 
+class _HealthySessionButUnresolvedGdbExecutor:
+    """Faithfully reproduces the DIR-825 incident's actual session
+    behavior: pgrep reports ALIVE and the gdbstub port is BOUND (bring-up
+    genuinely stood the process up), but a recipe containing `break
+    *unspecified` would fail with GDB's real "No symbol table is loaded"
+    error — exactly the transcript text captured in the incident's
+    `5.run.log`. Unlike the generic `_FakeSessionExecutor` (whose default
+    `ok=True, stdout=""` fallback would mask this fix entirely), this
+    double records every recipe TEXT written via the `cat > ... <<
+    'FVVWEOF'` heredoc convention every dynamic-track node uses
+    (`_build_and_lint_recipe`'s callers), so the test can assert directly
+    on what recipe text was ever produced — the most precise possible
+    check that `break *unspecified` never reaches disk, regardless of
+    which node would have run it."""
+
+    def __init__(self) -> None:
+        self.recipe_texts: list[str] = []
+
+    async def start(self, *, image=None, files=None, network=None):
+        return SessionHandle(container_name="fake-session", workspace_dir=files)
+
+    async def exec_in_session(self, handle, command, *, timeout=None, user=None):
+        if "pgrep" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
+        if "cat >" in command and "FVVWEOF" in command and ".gdb" in command:
+            self.recipe_texts.append(command)
+        if "gdb-multiarch" in command:
+            # If any recipe ever written so far contains the unresolved
+            # placeholder operand, simulate GDB's REAL failure mode
+            # (should never be reachable once the fix is in place, since
+            # _build_and_lint_recipe raises UnresolvedPlanFault before any
+            # recipe containing it is ever written to disk at all).
+            if any("break *unspecified" in text for text in self.recipe_texts):
+                return ExecutionResult(
+                    command=command,
+                    returncode=1,
+                    stdout='The target architecture is set to "mips".\n',
+                    stderr='Error in sourced command file:\nNo symbol table is loaded.  '
+                    'Use the "file" command.\n',
+                    timed_out=False,
+                )
+            return ExecutionResult(
+                command=command, returncode=1, stdout="", stderr="", timed_out=False,
+            )
+        return ExecutionResult(command=command, returncode=0, stdout="", stderr="", timed_out=False)
+
+    async def stop(self, handle):
+        pass
+
+
+async def test_debug_dynamic_unresolved_entry_addr_never_reaches_trigger(
+    monkeypatch, tmp_path: Path
+):
+    """DIR-825 end-to-end regression: a strategy plan whose `entry_addr`
+    is the exact incident value (`"unspecified"`) — with no resolvable
+    `target.func_offset` fallback (this fixture's fake ELF never resolves
+    one) — must terminate quickly (well under the 10-iteration budget the
+    real incident exhausted) WITHOUT ever invoking the trigger agent. Before
+    this fix, the identical scenario burned the full iteration budget
+    (`retry_gdb_attach` repeated every round) and made 56 trigger-agent
+    LLM calls with no working instrumentation channel at all."""
+    from fw_audit.config.llm_config import AgentRole
+
+    db_subfolder, _rootfs = _setup(tmp_path)
+    unresolved_plan_json = json.dumps(
+        {
+            "threat_model": {},
+            "hypotheses": {
+                "a": "A",
+                "b": "B",
+                "decisive_observable": "obs",
+                "oracle": "a file is written to /tmp/claim_001_proof containing "
+                "OVERFLOW_CONFIRMED",
+                "disconfirm_condition": "the path is provably unreachable from any "
+                "attacker input",
+            },
+            "static_plan": {
+                "target_function": "FUN_1",
+                "expected_intermediate_calls": [],
+                "sanitizer_patterns": [],
+                "crosscheck_required": True,
+                "decisive_observable": "obs",
+            },
+            "dynamic_plan": {
+                "reach_strategy": "inferior_call",
+                # The exact DIR-825 incident value — an unresolved
+                # placeholder, not a real address. This fixture's
+                # `target.func_offset` is also unresolved (the fake ELF
+                # never resolves a real entry point), so there is no
+                # fallback available and the run must escalate/end
+                # quickly rather than loop.
+                "entry_addr": "unspecified",
+                "target_addr": "0x1000",
+                "sink_addr": "",
+                "guards": [],
+                "argv_template": [],
+                "payload_marker": ";touch /tmp/claim_001_proof;",
+                "required_signals": ["a", "b", "c"],
+                "decisive_observable": "obs",
+                "oracle": "a file is written to /tmp/claim_001_proof containing "
+                "OVERFLOW_CONFIRMED",
+                "disconfirm_condition": "the path is provably unreachable from any "
+                "attacker input",
+            },
+            "static_runnable": True,
+            "dynamic_runnable": True,
+        }
+    )
+    strategy_llm = _ScriptedLLM([unresolved_plan_json])
+    trigger_llm = _CyclingScriptedLLM(_trigger_craft_observe_done_jsons())
+    roles = {
+        AgentRole.STAGE5_STRATEGY_AGENT: strategy_llm,
+        AgentRole.STAGE5_SCRIPT_GENERATOR: _ScriptedLLM([]),
+        AgentRole.STAGE5_RESULT_EVALUATOR: _ScriptedLLM([]),
+        AgentRole.STAGE5_REPORT_WRITER: _ScriptedLLM([]),
+        AgentRole.STAGE5_BRINGUP_AGENT: _CyclingScriptedLLM([_bringup_done_json()]),
+        AgentRole.STAGE5_TRIGGER_AGENT: trigger_llm,
+        AgentRole.STAGE5_DYNAMIC_EVALUATOR: _CyclingScriptedLLM([_router_inconclusive_json()]),
+    }
+
+    def fake_get_llm_for_agent(role, *, settings=None):
+        return roles[role]
+
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.get_llm_for_agent", fake_get_llm_for_agent
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.joern_executor", lambda settings: None
+    )
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_executor", lambda settings: None
+    )
+    session_executor = _HealthySessionButUnresolvedGdbExecutor()
+    monkeypatch.setattr(
+        "fw_audit.stage5_verification.fvvw.graph.verification_session_executor",
+        lambda settings: session_executor,
+    )
+
+    result = await fvvw_debug.debug_dynamic(
+        db_subfolder,
+        "vulnbin#0000::c1",
+        # A generous budget (well above the real incident's 10) — the
+        # assertion is that the run converges FAR before exhausting it,
+        # not that a tight budget forces an early stop.
+        settings=Settings(_env_file=None, FWA_STAGE5_DYNAMIC_MAX_ITERATIONS=10),
+    )
+
+    assert result.result is not None
+    iters_used = result.result.iters_used
+    assert iters_used <= 3, (
+        f"expected the unresolved-plan-address scenario to converge (resolve_address -> "
+        f"escalate/inconclusive) in a couple of rounds, not iters_used={iters_used}"
+    )
+    assert len(trigger_llm.calls) == 0, (
+        "the trigger agent must never be invoked when instrumentation could not be "
+        f"established at all — got {len(trigger_llm.calls)} calls"
+    )
+    # The most direct possible assertion: no recipe containing the
+    # unresolved placeholder operand was EVER written to disk, regardless
+    # of which node would have run it — the exact DIR-825 fingerprint
+    # (`break *unspecified`) must never be producible again.
+    assert not any(
+        "break *unspecified" in text for text in session_executor.recipe_texts
+    ), "a recipe containing 'break *unspecified' was written to disk — the P0-1 fix regressed"
+
+
 async def test_debug_fvvw_raises_without_source_path(tmp_path: Path):
     db_subfolder = tmp_path / "db"
     (db_subfolder / "stage3" / "findings").mkdir(parents=True)

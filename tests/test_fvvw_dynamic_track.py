@@ -40,8 +40,12 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BringupExhausted,
     DynamicFault,
     HealthGateFailure,
+    UnresolvedPlanFault,
     _bringup_exec_user,
+    _build_and_lint_recipe,
     _classify_bringup_fault,
+    _looks_like_setup_fault,
+    _parse_instrumentation_error,
     _parse_process_exit,
     _parse_reached_marker,
     bringup_stabilize,
@@ -525,6 +529,119 @@ async def test_collect_observation_reached_true_when_stopped_marker_present(tmp_
 
 
 # ---------------------------------------------------------------------- #
+# P0-1/P0-2/P0-3/P1-1 — DIR-825 regression: an unresolved plan address
+# (`entry_addr="unspecified"`) must never reach a `break *` line, and a
+# GDB instrumentation error must never collapse into an ordinary
+# "breakpoint not hit" observation.
+# ---------------------------------------------------------------------- #
+
+
+def test_looks_like_setup_fault_recognizes_no_symbol_table():
+    """The EXACT DIR-825 transcript text — `break *unspecified` -> 'No
+    symbol table is loaded' — must be classified as a setup fault, not
+    silently treated as an ordinary 'breakpoint not hit' round."""
+    transcript = (
+        'The target architecture is set to "mips".\n'
+        "0x3ffbba90 in _start () from /work/lib/ld-uClibc-0.9.28.so\n"
+        "warning: remote target does not support file transfer, attempting to access "
+        "files from local filesystem.\n"
+        "/tmp/fvvw/recipe_reach.gdb:5: Error in sourced command file:\n"
+        'No symbol table is loaded.  Use the "file" command.\n'
+    )
+    assert _looks_like_setup_fault(transcript) is True
+
+
+def test_looks_like_setup_fault_ignores_ordinary_miss():
+    """A transcript with no connection/instrumentation error text at all
+    — the ordinary 'connected fine, breakpoint just never fired' case —
+    must NOT be classified as a setup fault."""
+    transcript = "Continuing.\n[Inferior 1 (process 1) exited with code 00]\n"
+    assert _looks_like_setup_fault(transcript) is False
+
+
+def test_looks_like_setup_fault_never_overrides_a_real_hit():
+    """A transcript containing a real breakpoint hit line must never be
+    misclassified as a setup fault, even if an instrumentation-error
+    marker string also appears in it (e.g. echoed target output) —
+    positive evidence of a working breakpoint always wins."""
+    transcript = "Breakpoint 1, 0x00445688 in wps_nvram_set ()\nsome text mentioning no symbol table\n"
+    assert _looks_like_setup_fault(transcript) is False
+
+
+def test_parse_instrumentation_error_matches_no_symbol_table():
+    transcript = 'Error in sourced command file:\nNo symbol table is loaded.  Use the "file" command.\n'
+    error = _parse_instrumentation_error(transcript)
+    assert error is not None
+    assert "no symbol table" in error.lower()
+
+
+def test_parse_instrumentation_error_none_on_clean_transcript():
+    assert _parse_instrumentation_error("Continuing.\nBreakpoint 1, 0x1000 in main ()\n") is None
+
+
+async def test_collect_observation_flags_instrumentation_failure(tmp_path: Path):
+    """P1-1: an observation built from a transcript showing a GDB
+    instrumentation error must set `instrumentation_ok=False` and populate
+    `instrumentation_error` — this is the field the DIR-825 incident's
+    ObservationRecord was missing (an empty record with `oracle_match=None,
+    signal=None, filesystem_artifacts=[]` was indistinguishable from
+    'ran cleanly, nothing happened')."""
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor())
+    combined_stdout = (
+        'The target architecture is set to "mips".\n'
+        "warning: remote target does not support file transfer.\n"
+        "/tmp/fvvw/recipe_trigger.gdb:5: Error in sourced command file:\n"
+        'No symbol table is loaded.  Use the "file" command.\n'
+    )
+    observation = await collect_observation(ctx, result_stdout=combined_stdout, result_stderr="")
+    assert observation.instrumentation_ok is False
+    assert observation.instrumentation_error is not None
+    assert "no symbol table" in observation.instrumentation_error.lower()
+
+
+async def test_collect_observation_instrumentation_ok_on_clean_hit(tmp_path: Path):
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor())
+    combined_stdout = f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n"
+    observation = await collect_observation(ctx, result_stdout=combined_stdout, result_stderr="")
+    assert observation.instrumentation_ok is True
+    assert observation.instrumentation_error is None
+
+
+def test_build_and_lint_recipe_raises_unresolved_plan_fault_for_unspecified():
+    """The exact DIR-825 value must raise `UnresolvedPlanFault` (a
+    `DynamicFault` subclass, so every existing `except DynamicFault` catch
+    site still catches it) — never reach `render_gdb_recipe` at all, so a
+    `break *unspecified` line can never even be constructed."""
+    with pytest.raises(UnresolvedPlanFault):
+        _build_and_lint_recipe(
+            global_id="test", architecture="mips", gdb_port=1234,
+            entry_addr="unspecified", breakpoint_commands=[],
+        )
+
+
+def test_build_and_lint_recipe_accepts_resolved_entry_addr():
+    recipe = _build_and_lint_recipe(
+        global_id="test", architecture="mips", gdb_port=1234,
+        entry_addr="0x00445688", breakpoint_commands=[],
+    )
+    assert "break *0x00445688" in recipe.splitlines()
+
+
+async def test_reach_target_raises_unresolved_plan_fault_when_entry_addr_unspecified(
+    tmp_path: Path,
+):
+    """End-to-end: a plan carrying `entry_addr="unspecified"` with no
+    resolvable `target.func_offset` fallback must make `reach_target`
+    raise `UnresolvedPlanFault` BEFORE ever issuing a GDB batch call —
+    the fast-fail fix for the DIR-825 incident's root cause."""
+    plan = _dynamic_plan(entry_addr="unspecified", sink_addr="0x2000")
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor(), plan=plan)
+    ctx.handle = SessionHandle(container_name="fake-session")
+    with pytest.raises(UnresolvedPlanFault):
+        await reach_target(ctx)
+
+
+# ---------------------------------------------------------------------- #
 # health_gate — T1-C: a real liveness ADVANCE, not just "QEMU is waiting"
 # ---------------------------------------------------------------------- #
 
@@ -562,6 +679,46 @@ async def test_health_gate_fails_when_target_exits_on_continue(tmp_path: Path):
     with pytest.raises(HealthGateFailure) as excinfo:
         await health_gate(ctx)
     assert "process exits during startup" in str(excinfo.value).lower()
+
+
+async def test_health_gate_fails_when_entry_addr_unresolved_instead_of_silently_skipping(
+    tmp_path: Path,
+):
+    """DIR-825 bug #2 regression: before this fix, an unresolved
+    `entry_addr` (`"unspecified"`, non-empty so the OLD `if entry_addr.
+    strip():` check let the advance probe run — but not a real address)
+    made the T1-C advance probe SILENTLY SKIP, degrading health_gate back
+    to "QEMU is waiting" (pgrep ALIVE + port BOUND) with no real liveness
+    evidence — exactly how a dead-on-arrival hostapd (exiting during
+    startup with no config argv) passed health_gate as healthy. An
+    unresolved entry_addr must now be an outright HealthGateFailure."""
+
+    def on_exec(command: str):
+        if "pgrep" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
+        if "gdb-multiarch" in command and "recipe_health_advance" in command:
+            pytest.fail(
+                "the advance-probe GDB batch must never run with an unresolved "
+                "entry_addr — health_gate must fail BEFORE attempting to build a "
+                "recipe with no real break operand"
+            )
+        return None
+
+    plan = _dynamic_plan(entry_addr="unspecified", sink_addr="0x2000")
+    session = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=session, plan=plan)
+    ctx.target = TargetMeta(arch="arm", endianness="little", func_offset="")
+    ctx.handle = SessionHandle(container_name="fake-session")
+
+    with pytest.raises(HealthGateFailure) as excinfo:
+        await health_gate(ctx)
+    assert "unresolved" in str(excinfo.value).lower()
 
 
 async def test_health_gate_passes_when_target_advances_past_entry(tmp_path: Path):

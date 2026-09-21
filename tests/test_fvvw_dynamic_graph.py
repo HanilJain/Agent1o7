@@ -31,6 +31,7 @@ from fw_audit.common.verification import (
     DynamicPlan,
     ObservationRecord,
     RouteDecision,
+    VerificationState,
     VerificationVerdict,
 )
 from fw_audit.config.settings import Settings
@@ -39,10 +40,12 @@ from fw_audit.stage5_verification.fvvw.dynamic_graph import (
     DynamicGraphDeps,
     _build_track_result,
     _run_evaluate_route,
+    _update_state_for_round,
     route_after_bringup,
     route_after_evaluate,
     route_after_gdb_attach,
     route_after_health_gate,
+    route_after_resolve_address,
     route_after_trigger,
 )
 
@@ -88,6 +91,146 @@ def test_route_after_trigger_fault_goes_to_bringup():
 def test_route_after_trigger_success_goes_to_evaluate_route():
     assert route_after_trigger({"_trigger_fault": False}) == "evaluate_route"
     assert route_after_trigger({}) == "evaluate_route"
+
+
+# ---------------------------------------------------------------------- #
+# P0-2 regression: an UnresolvedPlanFault-shaped fault must route to
+# resolve_address, never bringup — retry_bringup can never fix an address
+# the strategy agent never resolved (the DIR-825 incident's actual failure
+# mode). route_after_gdb_attach/route_after_trigger now follow the ACTUAL
+# route `_run_gdb_attach`/`_run_trigger` set on state["route"], instead of
+# hardcoding every fault to "bringup".
+# ---------------------------------------------------------------------- #
+
+
+def test_route_after_gdb_attach_unresolved_plan_fault_goes_to_resolve_address():
+    decision = RouteDecision(
+        route="resolve_address", diagnosis="unresolved entry_addr", confidence="HIGH"
+    )
+    assert (
+        route_after_gdb_attach({"_gdb_fault": True, "route": decision}) == "resolve_address"
+    )
+
+
+def test_route_after_gdb_attach_genuine_setup_fault_still_goes_to_bringup():
+    decision = RouteDecision(
+        route="retry_bringup", diagnosis="connection refused", confidence="HIGH"
+    )
+    assert route_after_gdb_attach({"_gdb_fault": True, "route": decision}) == "bringup"
+
+
+def test_route_after_gdb_attach_fault_with_no_route_falls_back_to_bringup():
+    # Defensive fallback — should never happen in practice (every fault
+    # branch sets "route"), but must not crash if it does.
+    assert route_after_gdb_attach({"_gdb_fault": True}) == "bringup"
+
+
+def test_route_after_gdb_attach_blocked_by_prior_instrumentation_failure():
+    """P1-3: when a PRIOR round already demonstrated instrumentation is
+    broken, this round must skip the expensive trigger loop and go
+    straight to evaluate_route instead — even though THIS round's
+    gdb_attach itself didn't raise a fault."""
+    assert (
+        route_after_gdb_attach({"_gdb_fault": False, "_instrumentation_blocked": True})
+        == "evaluate_route"
+    )
+
+
+def test_route_after_gdb_attach_not_blocked_proceeds_to_trigger():
+    assert (
+        route_after_gdb_attach({"_gdb_fault": False, "_instrumentation_blocked": False})
+        == "trigger"
+    )
+
+
+def test_route_after_trigger_unresolved_plan_fault_goes_to_resolve_address():
+    decision = RouteDecision(
+        route="resolve_address", diagnosis="unresolved sink_addr", confidence="HIGH"
+    )
+    assert route_after_trigger({"_trigger_fault": True, "route": decision}) == "resolve_address"
+
+
+def test_route_after_trigger_genuine_setup_fault_still_goes_to_bringup():
+    decision = RouteDecision(
+        route="retry_bringup", diagnosis="connection refused", confidence="HIGH"
+    )
+    assert route_after_trigger({"_trigger_fault": True, "route": decision}) == "bringup"
+
+
+def test_route_after_resolve_address_unresolvable_escalates():
+    assert (
+        route_after_resolve_address({"_entry_addr_unresolvable": True})
+        == "plan_emulation_escalate"
+    )
+
+
+def test_route_after_resolve_address_resolved_proceeds_to_gdb_attach():
+    assert route_after_resolve_address({"_entry_addr_unresolvable": False}) == "gdb_attach"
+    assert route_after_resolve_address({}) == "gdb_attach"
+
+
+# ---------------------------------------------------------------------- #
+# _update_state_for_round — P1-1/P1-2: an instrumentation failure must
+# never be conflated with an ordinary breakpoint miss.
+# ---------------------------------------------------------------------- #
+
+
+def _plan(**overrides) -> DynamicPlan:
+    defaults = dict(reach_strategy="inferior_call", decisive_observable="obs")
+    defaults.update(overrides)
+    return DynamicPlan(**defaults)
+
+
+def test_update_state_for_round_instrumentation_failure_leaves_breakpoint_unset():
+    state = VerificationState(global_id="t")
+    observation = ObservationRecord(
+        instrumentation_ok=False,
+        instrumentation_error="gdb: no symbol table is loaded",
+    )
+    new_state = _update_state_for_round(
+        state, plan=_plan(), observation=observation, reached=False,
+        reached_sink=False, emulation_mode="user",
+    )
+    # Never "missed" — that implies GDB successfully set the breakpoint
+    # and the process ran past it; instrumentation never got that far.
+    assert new_state.breakpoint_status == "unset"
+    assert new_state.instrumentation_failures == 1
+    assert "no symbol table" in new_state.failure_reason.lower()
+
+
+def test_update_state_for_round_instrumentation_failures_accumulate_and_reset():
+    state = VerificationState(global_id="t")
+    failing_observation = ObservationRecord(instrumentation_ok=False)
+    state = _update_state_for_round(
+        state, plan=_plan(), observation=failing_observation, reached=False,
+        reached_sink=False, emulation_mode="user",
+    )
+    state = _update_state_for_round(
+        state, plan=_plan(), observation=failing_observation, reached=False,
+        reached_sink=False, emulation_mode="user",
+    )
+    assert state.instrumentation_failures == 2
+
+    ok_observation = ObservationRecord(instrumentation_ok=True)
+    state = _update_state_for_round(
+        state, plan=_plan(), observation=ok_observation, reached=False,
+        reached_sink=False, emulation_mode="user",
+    )
+    assert state.instrumentation_failures == 0
+
+
+def test_update_state_for_round_ordinary_miss_still_sets_missed():
+    """A round where instrumentation WORKED but the breakpoint just wasn't
+    hit yet must still advance breakpoint_status to 'missed' — the
+    ordinary case this fix must not disturb."""
+    state = VerificationState(global_id="t")
+    observation = ObservationRecord(instrumentation_ok=True)
+    new_state = _update_state_for_round(
+        state, plan=_plan(), observation=observation, reached=False,
+        reached_sink=False, emulation_mode="user",
+    )
+    assert new_state.breakpoint_status == "missed"
+    assert new_state.instrumentation_failures == 0
 
 
 @pytest.mark.parametrize(

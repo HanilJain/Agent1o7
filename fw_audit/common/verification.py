@@ -732,6 +732,27 @@ class ObservationRecord(BaseModel):
         default="", description="Every GDB command executed and its output for this round, "
         "verbatim — the spec's Node 7 'full transcript capture' requirement."
     )
+    instrumentation_ok: bool = Field(
+        default=True, description="Whether GDB actually managed to INSTRUMENT the target this "
+        "round (attach, connect, set a real breakpoint) — as distinct from 'attached fine but "
+        "the breakpoint wasn't hit'. False when the transcript shows a recipe/setup-level GDB "
+        "error (see `fvvw.dynamic_track._looks_like_setup_fault`'s instrumentation markers, "
+        "e.g. 'No symbol table is loaded' from an unresolved break operand) with no "
+        "corresponding real breakpoint hit. This is the field the DIR-825 incident's "
+        "ObservationRecord was missing: an empty record with `oracle_match=None, signal=None, "
+        "filesystem_artifacts=[]` was indistinguishable from 'ran cleanly, nothing happened' — "
+        "`instrumentation_ok=False` preserves the much more important fact that instrumentation "
+        "itself failed before any meaningful observation was even possible. Defaults to `True` "
+        "so every existing caller/test that predates this field is unaffected.",
+    )
+    instrumentation_error: str | None = Field(
+        default=None, description="The short, human-readable reason `instrumentation_ok` is "
+        "False (e.g. \"gdb: no symbol table is loaded (unresolved break operand)\") — `None` "
+        "when instrumentation succeeded or was never assessed. Surfaced verbatim in the "
+        "disclosure report (`fvvw.report`) and the evidence dict (`dynamic_graph._build_track_"
+        "result`) so a reader never mistakes 'the harness never worked' for 'the code path was "
+        "never reached'.",
+    )
 
 
 class RouteDecision(BaseModel):
@@ -1093,6 +1114,20 @@ class VerificationState(BaseModel):
     breakpoint_status: Literal["unset", "set", "hit", "missed"] = "unset"
     reached: bool | None = None
     process_exited_before_bp: bool = False
+
+    instrumentation_failures: int = Field(
+        default=0, description="Count of consecutive rounds whose "
+        "`ObservationRecord.instrumentation_ok` was False — i.e. GDB itself never managed to "
+        "instrument the target (a bad break operand, a stripped-symbol failure, ...), as "
+        "opposed to instrumenting fine and simply not hitting the breakpoint yet. Reset to 0 "
+        "the moment a round DOES successfully instrument (`instrumentation_ok=True`), so this "
+        "tracks a currently-ongoing streak, not a lifetime total. `propose_action` (T3-M) "
+        "checks this BEFORE its ordinary `breakpoint_status`-based `retry_gdb_attach` case — a "
+        "harness/instrumentation failure must never be diagnosed as an ordinary breakpoint "
+        "miss (the DIR-825 incident's root cause: 'breakpoint never hit — wrong sink location, "
+        "missing symbol, or input never reached that code path' was reported 9 times in a row "
+        "against a recipe that never successfully instrumented AT ALL).",
+    )
 
     sink_addr: str = ""
     sink_reachable: bool | None = None

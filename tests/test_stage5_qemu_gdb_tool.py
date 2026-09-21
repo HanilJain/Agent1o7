@@ -13,6 +13,7 @@ from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     build_qemu_system_launch_command,
     build_qemu_user_launch_command,
     gdb_binary,
+    is_resolved_addr,
     lint_gdb_recipe,
     normalize_hex_addr,
     render_gdb_recipe,
@@ -301,9 +302,60 @@ def test_render_gdb_recipe_rejects_empty_entry_addr():
     """An unresolved functional entry is a genuine setup fault — must
     raise rather than emit a bare `break *` that would abort the recipe
     at the very first breakpoint, before anything else in it ever runs."""
-    with pytest.raises(ValueError, match="entry_addr is empty"):
+    with pytest.raises(ValueError, match="is empty or an unresolved placeholder"):
         render_gdb_recipe(
             architecture="mips", gdb_port=1234, entry_addr="", breakpoint_commands=[]
+        )
+
+
+# ---------------------------------------------------------------------- #
+# is_resolved_addr / DIR-825 regression — "unspecified" and other
+# placeholder tokens must never reach a `break *` line as if they were a
+# real symbol. See fw_audit/stage5_verification/CLAUDE.md / the FVVW
+# dynamic-track hardening plan for the incident this guards against.
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "addr",
+    ["unspecified", "none", "None", "unknown", "UNKNOWN", "null", "n/a", "N/A", "?", "tbd", "", "   "],
+)
+def test_is_resolved_addr_rejects_known_placeholder_tokens(addr):
+    assert is_resolved_addr(addr) is False
+
+
+@pytest.mark.parametrize(
+    "addr", ["main", "wps_nvram_set", "wps_nvram_set+12", "0x00445688", "00445688", "fn+4"]
+)
+def test_is_resolved_addr_accepts_real_operands(addr):
+    assert is_resolved_addr(addr) is True
+
+
+def test_render_gdb_recipe_rejects_unspecified_placeholder_entry_addr():
+    """The EXACT DIR-825 incident value — the strategy agent's
+    `dynamic_plan.entry_addr: "unspecified"` must be rejected here, not
+    silently accepted as a symbol lookup (which is what previously let
+    `break *unspecified` reach GDB and fail at RUN time with 'No symbol
+    table is loaded', aborting the whole recipe before the useful
+    breakpoint after it)."""
+    with pytest.raises(ValueError, match="is empty or an unresolved placeholder"):
+        render_gdb_recipe(
+            architecture="mips", gdb_port=1234, entry_addr="unspecified", breakpoint_commands=[]
+        )
+
+
+def test_render_trigger_breakpoint_commands_rejects_unresolved_sink_addr():
+    """Unlike a guard (optional — skipped when unresolved), the sink
+    breakpoint IS the whole point of the trigger recipe body: an
+    unresolved `sink_addr` must raise, never silently produce a recipe
+    with no real sink instrumentation."""
+    with pytest.raises(ValueError, match="is empty or an unresolved placeholder"):
+        render_trigger_breakpoint_commands(
+            sink_addr="unspecified", argument_register="$a0", capture_marker="TRIGGER:t"
+        )
+    with pytest.raises(ValueError, match="is empty or an unresolved placeholder"):
+        render_trigger_breakpoint_commands(
+            sink_addr="", argument_register="$a0", capture_marker="TRIGGER:t"
         )
 
 
@@ -334,6 +386,26 @@ def test_lint_gdb_recipe_rejects_bare_break_star():
         "continue\n"
     )
     with pytest.raises(ValueError, match="no address operand"):
+        lint_gdb_recipe(bad_recipe)
+
+
+def test_lint_gdb_recipe_rejects_unresolved_placeholder_break_operand():
+    """DIR-825 regression: `break *unspecified` has an operand (so
+    `_BARE_BREAK_STAR_RE` alone would NOT catch it), but the operand is an
+    unresolved-placeholder token, not a real address/symbol — GDB accepts
+    the syntax and only fails at RUN time with 'No symbol table is
+    loaded', aborting the rest of the recipe. `lint_gdb_recipe` must catch
+    this at build time regardless of how the recipe text was assembled
+    (defense in depth, same posture as the bare-`break *` check above)."""
+    bad_recipe = (
+        "set architecture mips\n"
+        "set pagination off\n"
+        "set confirm off\n"
+        "target remote localhost:1234\n"
+        "break *unspecified\n"
+        "continue\n"
+    )
+    with pytest.raises(ValueError, match="unresolved placeholder"):
         lint_gdb_recipe(bad_recipe)
 
 

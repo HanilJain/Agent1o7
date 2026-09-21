@@ -200,6 +200,45 @@ def test_apply_events_concurrent_arrival_order_is_deterministic():
 # --------------------------------------------------------------------- #
 
 
+def test_supervisor_repeated_instrumentation_failure_routes_to_escalate():
+    """DIR-825 regression, P1-2: two or more consecutive instrumentation
+    failures (GDB never successfully set a breakpoint — a harness/recipe
+    problem) must escalate straight to a direct-call invocation, NEVER
+    `retry_gdb_attach` — the exact loop the incident exposed (`retry_gdb_
+    attach` proposed 9 times in a row against a recipe that never
+    successfully instrumented at all). This case is checked BEFORE
+    `process_exited_before_bp` (priority #1)."""
+    state = VerificationState(
+        global_id="g1",
+        instrumentation_failures=2,
+        process_status="running",
+        failure_reason="gdb: no symbol table is loaded (recipe/instrumentation error, "
+        "not a breakpoint miss)",
+    )
+    decision = propose_action(state)
+    assert decision is not None
+    assert decision.route == "escalate_direct_call"
+    assert "instrumentation" in decision.diagnosis.lower()
+
+
+def test_supervisor_single_instrumentation_failure_does_not_escalate_yet():
+    """A SINGLE instrumentation failure falls through to the ordinary
+    priority-ordered cases below (giving a transient GDB hiccup one more
+    round before forcing escalation) — only >=2 consecutive failures
+    trigger the dedicated escalation case."""
+    state = VerificationState(
+        global_id="g1",
+        instrumentation_failures=1,
+        process_status="not_started",
+        failure_reason="gdb: no symbol table is loaded",
+    )
+    decision = propose_action(state)
+    assert decision is not None
+    assert decision.route != "escalate_direct_call" or "instrumentation" not in (
+        decision.diagnosis.lower()
+    )
+
+
 def test_supervisor_process_exit_routes_to_escalate():
     state = VerificationState(global_id="g1", process_exited_before_bp=True)
     decision = propose_action(state)
@@ -388,6 +427,55 @@ def test_validate_action_rejects_repeated_failed_action():
     assert all(
         d != "retry_gdb_attach" for d in decisions[first_escalated_index:]
     ), f"retry_gdb_attach oscillated back in: {decisions}"
+
+
+def test_no_repeat_ladder_not_defeated_by_llm_varied_failure_reason_prose():
+    """DIR-825 regression: the LLM router's `route_observation` produced a
+    slightly different diagnosis EVERY round even against the identical
+    underlying harness failure (e.g. "breakpoint never hit this round —
+    wrong sink location..." with cosmetic wording differences). Before
+    this fix, `_attempt_signature` included the raw `failure_reason`
+    STRING, so each round's differently-worded diagnosis counted as a
+    "new" condition and the no-repeat ladder never escalated — this is
+    exactly why `retry_gdb_attach` repeated for all 10 iterations in the
+    incident. The signature must be built from STATE FACTS only, so
+    identical facts with varying prose still escalate correctly."""
+    settings = Settings(_env_file=None, FWA_STAGE5_SUPERVISOR_MAX_SAME_ACTION=2)
+    state = VerificationState(
+        global_id="g1", breakpoint_status="unset", process_status="running"
+    )
+
+    varied_diagnoses = [
+        "breakpoint never hit this round — wrong sink location, missing symbol, or "
+        "input never reached that code path.",
+        "the breakpoint was not hit — possibly an incorrect sink address or the "
+        "input did not reach the vulnerable path.",
+        "no breakpoint hit observed; sink location may be wrong or symbol missing.",
+        "breakpoint miss — reconsider sink address or verify input reachability.",
+        "still no breakpoint hit; sink location, symbol resolution, or input path "
+        "may all need review.",
+        "breakpoint not triggered this round for undetermined reasons.",
+    ]
+
+    decisions = []
+    for diagnosis_text in varied_diagnoses:
+        proposed = RouteDecision(
+            route="retry_gdb_attach", diagnosis=diagnosis_text, confidence="MEDIUM"
+        )
+        validated = validate_action(proposed, state, settings)
+        decisions.append(validated.route)
+        state = record_attempt(state, validated)
+
+    retry_count = decisions.count("retry_gdb_attach")
+    assert retry_count <= settings.stage5_supervisor_max_same_action + 1, (
+        f"retry_gdb_attach was proposed {retry_count} times despite varied diagnosis "
+        f"prose — the no-repeat ladder must key off state facts, not LLM phrasing: "
+        f"{decisions}"
+    )
+    assert retry_count < len(decisions), (
+        "the ladder never escalated at all across 6 rounds of varied-wording "
+        f"diagnoses for an unchanged underlying condition: {decisions}"
+    )
 
 
 def test_recovery_budget_exhaustion_ends_inconclusive():

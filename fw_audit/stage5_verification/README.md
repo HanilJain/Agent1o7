@@ -153,7 +153,7 @@ fw-verify run --db-subfolder data/db/<stem> --benign-only              # restore
 fw-verify run --db-subfolder data/db/<stem> --dynamic-wall-clock 900   # cap the whole dynamic graph's real elapsed time (min 60s)
 
 # Token usage / cost controls
-fw-verify run --db-subfolder data/db/<stem> --rate-limit 2 --max-cost 5.00 --no-usage
+fw-verify --rate-limit 2 --max-cost 5.00 run --db-subfolder data/db/<stem>  --no-usage
 
 # Verify Stage 3b's externally-sourced PDF report claims instead of
 # Stage 3's own findings (see fw_audit/stage3b_claims/README.md)

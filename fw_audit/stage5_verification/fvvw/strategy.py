@@ -26,6 +26,8 @@ for an LLM node (see the FVVW v3 design doc's script-first principle).
 
 from __future__ import annotations
 
+import logging
+
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import ValidationError
@@ -37,6 +39,9 @@ from fw_audit.stage5_verification.agent.cleaning import clean_json_payload
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.cmdlog import CommandLog
 from fw_audit.stage5_verification.errors import Stage5InputError
+from fw_audit.stage5_verification.tools.qemu_gdb_tool import is_resolved_addr
+
+logger = logging.getLogger("fw_audit.stage5_verification.fvvw")
 
 STRATEGY_SYSTEM_PROMPT = """\
 You are a firmware vulnerability verification strategist. You are given one \
@@ -290,17 +295,66 @@ def validate_decisive_observable(plan: StrategyPlan) -> bool:
     return all(observables) and all(oracles) and all(disconfirms)
 
 
+def _normalize_unresolved_addr_fields(plan: StrategyPlan) -> StrategyPlan:
+    """P2-1 (model-agnostic hygiene, not a model-specific prompt patch): a
+    weaker LLM may write a placeholder WORD (`"unspecified"`, `"none"`,
+    `"unknown"`, ...) into an address field instead of leaving it empty —
+    observed in production as `dynamic_plan.entry_addr: "unspecified"`
+    (DIR-825 incident). Left as-is, that string is non-empty, so every
+    downstream `x or target.func_offset` fallback (`reach_target`/
+    `satisfy_guards`/`instrument_trigger`/`health_gate`) never kicks in,
+    and the placeholder reaches `is_resolved_addr`'s hard rejection as a
+    `DynamicFault` instead of the graceful "field was empty, fall back"
+    path those call sites already have.
+
+    This function maps any such placeholder token straight to `""` for
+    `dynamic_plan.entry_addr`/`target_addr`/`sink_addr` — turning "the
+    model wrote a word" into the ALREADY-HANDLED "field is empty" case,
+    with a WARNING logged so the substitution is never silent. Deliberately
+    NOT a pydantic field validator on `DynamicPlan` itself: that schema is
+    also used to construct plans directly in tests/tooling where a
+    caller's own literal `"unspecified"` may be an intentional test
+    fixture, not a model artifact — this normalization is strategy-agent-
+    output-specific, applied once, right after parsing THIS agent's
+    response, never retroactively reinterpreting a plan built any other
+    way. Model-agnostic: it fires identically regardless of which LLM
+    produced the response, and is a no-op for any well-formed plan."""
+    dynamic_plan = plan.dynamic_plan
+    replacements: dict[str, str] = {}
+    for field_name in ("entry_addr", "target_addr", "sink_addr"):
+        value = getattr(dynamic_plan, field_name)
+        if value.strip() and not is_resolved_addr(value):
+            replacements[field_name] = ""
+    if not replacements:
+        return plan
+    for field_name, original in (
+        (name, getattr(dynamic_plan, name)) for name in replacements
+    ):
+        logger.warning(
+            "strategy_agent: dynamic_plan.%s=%r is an unresolved placeholder, not a real "
+            "address — normalizing to '' so the existing empty-field fallback "
+            "(target.func_offset) applies instead of a poisoned recipe.",
+            field_name,
+            original,
+        )
+    updated_dynamic_plan = dynamic_plan.model_copy(update=replacements)
+    return plan.model_copy(update={"dynamic_plan": updated_dynamic_plan})
+
+
 def parse_strategy_response(raw: object) -> StrategyPlan | None:
     """Clean + parse one strategy LLM response into a `StrategyPlan`.
     Returns `None` (never raises) on unparseable/invalid JSON — same
-    contract as `agent.graph.parse_evaluator_response`."""
+    contract as `agent.graph.parse_evaluator_response`. Additionally
+    normalizes unresolved-placeholder address tokens in `dynamic_plan`
+    (see `_normalize_unresolved_addr_fields`) before returning."""
     payload = clean_json_payload(raw)
     if payload is None:
         return None
     try:
-        return StrategyPlan.model_validate_json(payload)
+        plan = StrategyPlan.model_validate_json(payload)
     except (ValidationError, ValueError):
         return None
+    return _normalize_unresolved_addr_fields(plan)
 
 
 async def strategy_agent(

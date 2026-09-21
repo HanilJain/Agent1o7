@@ -84,6 +84,7 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BringupExhausted,
     DynamicFault,
     HealthGateFailure,
+    UnresolvedPlanFault,
     cleanup_marker_artifact,
     collect_observation,
     health_gate,
@@ -100,6 +101,7 @@ from fw_audit.stage5_verification.fvvw.supervisor import (
     validate_action,
 )
 from fw_audit.stage5_verification.llm_logging import LoggingChatModel
+from fw_audit.stage5_verification.tools.qemu_gdb_tool import is_resolved_addr
 
 # Terminal routes health_gate_node/evaluate_route_node can produce, sharing
 # the same vocabulary `common.verification.RouteDecision.route` declares —
@@ -301,6 +303,27 @@ async def _run_gdb_attach(
         try:
             transcript, reached = await reach_target(ctx, gdb_transcript_so_far=transcript_so_far)
             return {"gdb_transcript": transcript, "_reached": reached, "_gdb_fault": False}
+        except UnresolvedPlanFault as exc:
+            # An unresolved entry_addr is a PLAN problem, not an
+            # environment problem — retry_bringup can never fix an address
+            # the strategy agent never resolved (the DIR-825 incident's
+            # actual failure mode: `entry_addr="unspecified"` retried
+            # against `retry_gdb_attach`/`retry_bringup` for 10 rounds with
+            # no possible resolution). Route to `resolve_address` instead,
+            # which falls `entry_addr` back to `target.func_offset` — if
+            # THAT is also unresolved, `resolve_address_node` itself routes
+            # onward to escalation rather than bouncing back here forever.
+            decision = RouteDecision(
+                route="resolve_address",
+                diagnosis=f"gdb_attach: unresolved plan address, cannot instrument: {exc}",
+                confidence="HIGH",
+            )
+            return {
+                "route": decision,
+                "iteration_history": [decision],
+                "_gdb_fault": True,
+                "gdb_transcript": transcript_so_far,
+            }
         except DynamicFault as exc:
             decision = RouteDecision(
                 route="retry_bringup",
@@ -335,6 +358,18 @@ async def _run_trigger(
             transcript, guard_logs = await satisfy_guards(
                 ctx, gdb_transcript_so_far=transcript_so_far
             )
+        except UnresolvedPlanFault as exc:
+            decision = RouteDecision(
+                route="resolve_address",
+                diagnosis=f"satisfy_guards: unresolved plan address, cannot instrument: {exc}",
+                confidence="HIGH",
+            )
+            return {
+                "route": decision,
+                "iteration_history": [decision],
+                "_trigger_fault": True,
+                "gdb_transcript": transcript_so_far,
+            }
         except DynamicFault as exc:
             decision = RouteDecision(
                 route="retry_bringup",
@@ -388,6 +423,19 @@ async def _run_trigger(
                     ctx, result_stdout=trig_transcript, result_stderr=""
                 )
                 reached_sink = captured is not None
+        except UnresolvedPlanFault as exc:
+            decision = RouteDecision(
+                route="resolve_address",
+                diagnosis=f"instrument_trigger: unresolved plan address, cannot instrument: "
+                f"{exc}",
+                confidence="HIGH",
+            )
+            return {
+                "route": decision,
+                "iteration_history": [decision],
+                "_trigger_fault": True,
+                "gdb_transcript": transcript,
+            }
         except DynamicFault as exc:
             decision = RouteDecision(
                 route="retry_bringup",
@@ -469,7 +517,20 @@ def _update_state_for_round(
     `VerificationState`'s bare `"not_started"` default here would
     incorrectly make `propose_action`'s OWN "startup failure observed
     before the target ever ran" branch fire for an ordinary "reached the
-    breakpoint stage but the exact hit didn't happen yet" round."""
+    breakpoint stage but the exact hit didn't happen yet" round.
+
+    P1-1/P1-2: when `observation.instrumentation_ok` is False (GDB never
+    managed to set a real breakpoint this round — a recipe/setup error,
+    NOT an ordinary miss), `breakpoint_status` is deliberately left at
+    `"unset"` rather than advanced to `"missed"` — "missed" means "GDB set
+    it, the process ran past it, it just didn't fire"; an instrumentation
+    failure never got that far. `instrumentation_failures` increments (and
+    is reset to 0 the moment instrumentation DOES succeed), and
+    `failure_reason` carries the specific `instrumentation_error` text
+    instead of the generic "breakpoint not hit this round" — this is the
+    exact distinction whose absence let the DIR-825 incident's `break
+    *unspecified` failure collapse into an ordinary "breakpoint never hit"
+    diagnosis for 9 consecutive rounds."""
     updates: dict = {
         "current_strategy": emulation_mode or state.current_strategy,
         "reached": reached,
@@ -478,6 +539,9 @@ def _update_state_for_round(
         ),
         "oracle_match": observation.oracle_match,
         "process_status": "running",
+        "instrumentation_failures": (
+            0 if observation.instrumentation_ok else state.instrumentation_failures + 1
+        ),
     }
     if reached:
         updates["breakpoint_status"] = "hit"
@@ -485,6 +549,13 @@ def _update_state_for_round(
         updates["process_status"] = "exited"
         if state.breakpoint_status != "hit":
             updates["breakpoint_status"] = "missed"
+    elif not observation.instrumentation_ok:
+        # Instrumentation itself failed — never advance breakpoint_status
+        # to "missed" (that implies GDB successfully set it and the
+        # process simply ran past without hitting it, which did not
+        # happen here). Leave it at whatever it already was (typically
+        # "unset").
+        pass
     elif state.breakpoint_status == "unset":
         updates["breakpoint_status"] = "missed"
 
@@ -507,6 +578,12 @@ def _update_state_for_round(
     if updates.get("process_exited_before_bp"):
         updates["failure_reason"] = (
             "process exited before the entry/sink breakpoint was ever hit"
+        )
+    elif not observation.instrumentation_ok:
+        updates["failure_reason"] = (
+            observation.instrumentation_error
+            or "instrumentation failed this round — GDB did not successfully set a "
+            "breakpoint (setup/recipe error, not a breakpoint miss)"
         )
     elif not reached and updates.get("breakpoint_status") in ("unset", "missed"):
         updates["failure_reason"] = "breakpoint not hit this round"
@@ -753,6 +830,20 @@ def _build_track_result(
         evidence["memory_diff_detected"] = observation.memory_diff_detected
     if observation.oracle_match is not None:
         evidence["oracle_match"] = observation.oracle_match
+    if not observation.instrumentation_ok:
+        # P2-2: preserve the much more important fact that instrumentation
+        # itself failed before any meaningful observation was possible —
+        # without this, an INCONCLUSIVE verdict's evidence is
+        # indistinguishable from "genuinely tried and found nothing",
+        # which is exactly how the DIR-825 incident's report/route
+        # diagnosis language ("breakpoint never hit — wrong sink location,
+        # missing symbol, or input never reached that code path") implied
+        # a normal miss instead of a harness failure. Surfaced here so
+        # both the persisted evidence dict AND the report writer (which
+        # reads `TrackResult.evidence`) can state the distinction plainly.
+        evidence["instrumentation_ok"] = False
+        if observation.instrumentation_error:
+            evidence["instrumentation_error"] = observation.instrumentation_error
     if verdict == VerificationVerdict.INCONCLUSIVE:
         # Same explicit fact-tag `dynamic_track._terminal` sets — HITL's
         # `is_budget_exhausted` trigger (`fvvw.hitl`) reads this key, not
@@ -782,9 +873,50 @@ def route_after_health_gate(state: dict) -> Literal["gdb_attach", "bringup"]:
     return "gdb_attach" if state.get("_health_ok") else "bringup"
 
 
-def route_after_gdb_attach(state: dict) -> Literal["trigger", "bringup", "evaluate_route"]:
+def route_after_resolve_address(
+    state: dict,
+) -> Literal["gdb_attach", "plan_emulation_escalate"]:
+    """`resolve_address_node` sets `_entry_addr_unresolvable=True` when
+    `plan.entry_addr` is STILL unresolved even after falling back to
+    `target.func_offset` — meaning there is genuinely no address to reach
+    with under the current strategy. Bouncing back to `gdb_attach` in that
+    case would just raise the identical `UnresolvedPlanFault` again
+    (`resolve_address` -> `gdb_attach` -> `resolve_address` -> ... — no
+    worse than before this fix, since `validate_action`'s no-repeat ladder
+    would eventually break it, but wasteful and slower to converge).
+    Escalate directly to `plan_emulation_escalate` instead — the same
+    last-resort `direct_call` mode the router's own `escalate_direct_call`
+    route already reaches for a repeatedly-failing bring-up."""
+    return (
+        "plan_emulation_escalate"
+        if state.get("_entry_addr_unresolvable")
+        else "gdb_attach"
+    )
+
+
+def route_after_gdb_attach(
+    state: dict,
+) -> Literal["trigger", "bringup", "resolve_address", "evaluate_route"]:
     if state.get("_gdb_fault"):
-        return "bringup"
+        # `_run_gdb_attach` sets the ACTUAL target route on `state["route"]`
+        # (`retry_bringup` for a genuine QEMU/GDB setup fault,
+        # `resolve_address` for an `UnresolvedPlanFault` — see that
+        # function's own docstring) — follow it via the same `_ROUTE_TO_
+        # NODE` table `route_after_evaluate` uses, rather than hardcoding
+        # every fault to `bringup`. An unresolved plan address can never be
+        # fixed by re-running bring-up, so collapsing both fault kinds into
+        # the same edge would recreate the DIR-825 infinite-retry loop this
+        # fix exists to break.
+        decision: RouteDecision | None = state.get("route")
+        target = _ROUTE_TO_NODE.get(decision.route, "bringup") if decision else "bringup"
+        return target if target in ("bringup", "resolve_address") else "bringup"  # type: ignore[return-value]
+    if state.get("_instrumentation_blocked"):
+        # P1-3: a PRIOR round already demonstrated instrumentation is
+        # broken (see `gdb_attach_node`'s own comment) — skip the
+        # expensive trigger loop and let Node 8/the supervisor diagnose
+        # and escalate instead of spending an LLM trigger round with no
+        # working observation channel.
+        return "evaluate_route"
     # Even when the breakpoint never hit (_reached is False), proceed to
     # trigger/evaluate rather than looping locally — Node 8 is the ONLY
     # place that decides whether "not reached" means retry_gdb_attach vs.
@@ -793,8 +925,19 @@ def route_after_gdb_attach(state: dict) -> Literal["trigger", "bringup", "evalua
     return "trigger"
 
 
-def route_after_trigger(state: dict) -> Literal["evaluate_route", "bringup"]:
-    return "bringup" if state.get("_trigger_fault") else "evaluate_route"
+def route_after_trigger(
+    state: dict,
+) -> Literal["evaluate_route", "bringup", "resolve_address"]:
+    if state.get("_trigger_fault"):
+        # Same reasoning as `route_after_gdb_attach`: follow the ACTUAL
+        # route `_run_trigger` set (`resolve_address` for an
+        # `UnresolvedPlanFault`, `retry_bringup` for a genuine setup
+        # fault) instead of collapsing every trigger-stage fault into
+        # `bringup`.
+        decision: RouteDecision | None = state.get("route")
+        target = _ROUTE_TO_NODE.get(decision.route, "bringup") if decision else "bringup"
+        return target if target in ("bringup", "resolve_address") else "bringup"  # type: ignore[return-value]
+    return "evaluate_route"
 
 
 def route_after_evaluate(
@@ -861,25 +1004,68 @@ def build_dynamic_graph(
         transcript_so_far = state.get("gdb_transcript", "") or ""
         result = await _run_gdb_attach(ctx, transcript_so_far=transcript_so_far)
         ctx._last_reached = result.get("_reached", False)  # type: ignore[attr-defined]
+        # P1-3: if the harness demonstrably failed to INSTRUMENT the
+        # target in a PRIOR round (verification_state.instrumentation_
+        # failures — accumulated by _update_state_for_round, persisted
+        # across rounds on this same long-lived ctx), do not let the
+        # expensive trigger loop run again this round even when THIS
+        # round's gdb_attach itself didn't raise a fault — entering
+        # Node 6 (`trigger`, the agentic payload-crafting loop) with no
+        # working instrumentation channel is exactly how the DIR-825
+        # incident burned 56 trigger-agent calls / ~120k tokens
+        # inventing payloads and unverified function names against a
+        # target that was never actually instrumented. Route straight to
+        # evaluate_route instead, where Node 8/the supervisor already
+        # knows how to escalate a repeated instrumentation failure
+        # (`propose_action`'s new case #1).
+        result["_instrumentation_blocked"] = (
+            not result.get("_gdb_fault")
+            and ctx.verification_state.instrumentation_failures >= 1
+        )
         return result
 
     async def resolve_address_node(state: FVVWState) -> dict:
         """T3-N's `resolve_address` repair route: re-derive `plan.
-        sink_addr` from the best already-known fact
-        (`target.func_offset`) when it is still unresolved, record the
-        attempt, then hand off to Node 5 (`gdb_attach`) for another try.
-        Never FABRICATES an address — an unresolvable sink stays empty,
+        sink_addr`/`plan.entry_addr` from the best already-known fact
+        (`target.func_offset`) when either is still unresolved, record the
+        attempt, then hand off to Node 5 (`gdb_attach`) for another try —
+        UNLESS `entry_addr` is still unresolved even after the fallback
+        (`target.func_offset` itself unresolved too), in which case there
+        is nothing left to reach with and this node signals `_unresolvable`
+        so the router escalates straight to `plan_emulation_escalate`
+        rather than bouncing back to `gdb_attach` only to raise the
+        identical `UnresolvedPlanFault` again.
+
+        `entry_addr` resolution (added alongside the pre-existing `sink_
+        addr` handling): before this fix, only `sink_addr` was ever
+        repaired here, so an unresolved `entry_addr` (the DIR-825
+        incident's actual failure — `entry_addr="unspecified"`) reaching
+        this node would fall back to `target.func_offset` INSIDE `reach_
+        target`/`_build_and_lint_recipe` every round but never get WRITTEN
+        onto `plan.entry_addr` itself — meaning a resolvable func_offset
+        would silently keep re-resolving each round instead of the plan
+        converging on it once, and an UNRESOLVABLE one would keep raising
+        `UnresolvedPlanFault` from `gdb_attach` every round with no exit.
+
+        Never FABRICATES an address — an unresolvable field stays empty,
         and the Tier 1 positive-evidence gate (T1-B) already ensures an
         empty sink can never produce a false CONFIRMED (no meaningful
         sink breakpoint -> no captured argument -> no evidence)."""
         async with aphase("resolve_address"):
-            if not plan.sink_addr.strip() and target.func_offset.strip():
+            if not is_resolved_addr(plan.sink_addr) and is_resolved_addr(target.func_offset):
                 plan.sink_addr = target.func_offset
                 ctx.applied_fixes.append(
                     f"resolve_address: fell back sink_addr to target.func_offset="
                     f"{target.func_offset!r} (T2-F resolution had no better answer)"
                 )
-        return {}
+            if not is_resolved_addr(plan.entry_addr) and is_resolved_addr(target.func_offset):
+                plan.entry_addr = target.func_offset
+                ctx.applied_fixes.append(
+                    f"resolve_address: fell back entry_addr to target.func_offset="
+                    f"{target.func_offset!r} (strategy agent left entry_addr unresolved)"
+                )
+            still_unresolvable = not is_resolved_addr(plan.entry_addr)
+        return {"_entry_addr_unresolvable": still_unresolvable}
 
     async def trigger_node(state: FVVWState) -> dict:
         transcript_so_far = state.get("gdb_transcript", "") or ""
@@ -931,7 +1117,14 @@ def build_dynamic_graph(
     graph.set_entry_point("plan_emulation")
     graph.add_edge("plan_emulation", "bringup")
     graph.add_edge("plan_emulation_escalate", "bringup")
-    graph.add_edge("resolve_address", "gdb_attach")
+    graph.add_conditional_edges(
+        "resolve_address",
+        route_after_resolve_address,
+        {
+            "gdb_attach": "gdb_attach",
+            "plan_emulation_escalate": "plan_emulation_escalate",
+        },
+    )
     graph.add_conditional_edges(
         "bringup",
         route_after_bringup,
@@ -945,12 +1138,21 @@ def build_dynamic_graph(
     graph.add_conditional_edges(
         "gdb_attach",
         route_after_gdb_attach,
-        {"trigger": "trigger", "bringup": "bringup", "evaluate_route": "evaluate_route"},
+        {
+            "trigger": "trigger",
+            "bringup": "bringup",
+            "resolve_address": "resolve_address",
+            "evaluate_route": "evaluate_route",
+        },
     )
     graph.add_conditional_edges(
         "trigger",
         route_after_trigger,
-        {"evaluate_route": "evaluate_route", "bringup": "bringup"},
+        {
+            "evaluate_route": "evaluate_route",
+            "bringup": "bringup",
+            "resolve_address": "resolve_address",
+        },
     )
     graph.add_conditional_edges(
         "evaluate_route",
@@ -975,5 +1177,6 @@ __all__ = [
     "route_after_evaluate",
     "route_after_gdb_attach",
     "route_after_health_gate",
+    "route_after_resolve_address",
     "route_after_trigger",
 ]

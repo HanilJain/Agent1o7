@@ -268,6 +268,65 @@ def normalize_hex_addr(addr: str) -> str:
     return a
 
 
+_UNRESOLVED_ADDR_TOKENS: frozenset[str] = frozenset(
+    {"unspecified", "none", "unknown", "null", "n/a", "na", "?", "tbd", ""}
+)
+"""Placeholder words a (typically small/weaker) LLM strategy agent emits in
+an address field when it could not actually resolve one — observed in
+production as `dynamic_plan.entry_addr: "unspecified"` (DIR-825 incident).
+These are NOT valid GDB break operands, but before `is_resolved_addr`
+existed nothing distinguished them from a genuine symbol name: `normalize_
+hex_addr` treats any non-hex string as "symbolic, leave it alone", and
+`render_gdb_recipe`/`lint_gdb_recipe` only rejected an EMPTY string. GDB
+itself accepts `break *unspecified` as a symbol lookup, fails with "No
+symbol table is loaded", and aborts the entire batch script at that line —
+silently skipping every command queued after it. This set is deliberately
+small and literal (never a heuristic on word shape) so a genuine symbol
+name is never misclassified — the real backstop is `is_resolved_addr`'s
+symbol-shape check below, this set only makes the common placeholder
+words fail fast and legibly."""
+
+_SYMBOL_SHAPED_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*([+-]\d+)?$")
+"""A plausible GDB symbol operand: a C-identifier-shaped name, optionally
+with a `+N`/`-N` offset (e.g. `main`, `wps_nvram_set+12`). Used by
+`is_resolved_addr` to accept genuine symbols while still rejecting
+prose-shaped placeholder tokens that happen not to be in
+`_UNRESOLVED_ADDR_TOKENS` (defense in depth, not the primary check)."""
+
+
+def is_resolved_addr(addr: str) -> bool:
+    """Is `addr` an address/symbol GDB can actually break at — as opposed
+    to an unresolved-placeholder token a strategy agent emits when it
+    couldn't determine a real address (`"unspecified"`, `"none"`, empty
+    after stripping, ...)? This is the ONE place that distinguishes "a real
+    operand for `break *<addr>`" from "a word that merely isn't a hex
+    literal", which `normalize_hex_addr` alone cannot do (it only
+    normalizes hex form; anything non-hex is assumed to already be a valid
+    symbol). Every recipe-building call site
+    (`render_gdb_recipe`/`render_guard_breakpoint_commands`/
+    `render_trigger_breakpoint_commands`) and `lint_gdb_recipe` route
+    through this function so an unresolved address can never reach a
+    `break *` line — see `fvvw.dynamic_track._build_and_lint_recipe`'s
+    `ValueError` -> `DynamicFault`/`UnresolvedPlanFault` translation for
+    what happens instead.
+
+    Accepts: `0x`-prefixed hex, bare hex digits, and symbol-shaped names
+    (optionally with a `+N`/`-N` offset) not in `_UNRESOLVED_ADDR_TOKENS`.
+    Rejects: empty/whitespace-only, and any of the known placeholder
+    tokens (case-insensitive).
+    """
+    a = addr.strip()
+    if a.lower() in _UNRESOLVED_ADDR_TOKENS:
+        return False
+    if not a:
+        return False
+    if a.lower().startswith("0x"):
+        return len(a) > 2 and all(c in "0123456789abcdefABCDEF" for c in a[2:])
+    if all(c in "0123456789abcdefABCDEF" for c in a):
+        return True
+    return bool(_SYMBOL_SHAPED_RE.match(a))
+
+
 STOPPED_MARKER_PREFIX = "FVVW:STOPPED:PC="
 """T1-D's unambiguous "the inferior is actually stopped, not exited" tag —
 printed via a `printf` that only ever executes if GDB is looking at a live
@@ -326,10 +385,13 @@ def render_gdb_recipe(
     documented "raises DynamicFault if the GDB batch call itself errors"
     contract each node already carries.
     """
-    if not entry_addr.strip():
+    if not is_resolved_addr(entry_addr):
         raise ValueError(
-            "render_gdb_recipe: entry_addr is empty — cannot emit 'break *' with no "
-            "operand (GDB rejects it and aborts the whole recipe)."
+            f"render_gdb_recipe: entry_addr={entry_addr!r} is empty or an unresolved "
+            "placeholder — cannot emit 'break *' with no real operand (GDB rejects an "
+            "empty operand outright, and a placeholder word like 'unspecified' is "
+            "treated as a symbol lookup that fails with 'No symbol table is loaded' — "
+            "either way the whole recipe aborts at that line)."
         )
     pre_continue = (
         render_crash_capture_commands() if pre_continue_commands is None else pre_continue_commands
@@ -384,7 +446,7 @@ def render_guard_breakpoint_commands(
       pydantic validation were somehow bypassed upstream. Defense in depth,
       not a substitute for the schema-level check.
     """
-    if not addr.strip():
+    if not is_resolved_addr(addr):
         return []
     commands = [
         f"break *{normalize_hex_addr(addr)}",
@@ -409,6 +471,18 @@ _BARE_BREAK_STAR_RE = re.compile(r"^\s*break\s*\*\s*$")
 `Argument required (expression to compute).` this project hit in
 production (see `render_gdb_recipe`/`render_guard_breakpoint_commands`'s
 empty-addr guards). A trailing `*<addr>` or `*<symbol>` does not match."""
+
+_BREAK_STAR_OPERAND_RE = re.compile(r"^\s*break\s*\*\s*(\S+)\s*$")
+"""Matches `break *<operand>` and captures the operand — the counterpart to
+`_BARE_BREAK_STAR_RE` for the DIR-825 incident's actual failure mode:
+`break *unspecified` has an operand (so `_BARE_BREAK_STAR_RE` does not
+match it) but the operand is an unresolved-placeholder token, not a real
+address/symbol. GDB accepts the syntax, then fails at RUN time with "No
+symbol table is loaded" — a failure `lint_gdb_recipe`'s syntax-only checks
+would otherwise never catch before the recipe is written to disk. Checked
+via `is_resolved_addr` below, the SAME check every render_* helper already
+applies — this is the whole-recipe-level defense-in-depth backstop for a
+recipe assembled some other way (see `lint_gdb_recipe`'s own docstring)."""
 
 _SET_REGISTER_LINE_RE = re.compile(r"^\s*set\s+(\$[a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$")
 """Matches a `set $reg = <rhs>` line and captures the right-hand side, so
@@ -446,6 +520,14 @@ def lint_gdb_recipe(recipe: str) -> None:
         if _BARE_BREAK_STAR_RE.match(line):
             problems.append(f"line {lineno}: 'break *' has no address operand: {line!r}")
             continue
+        operand_match = _BREAK_STAR_OPERAND_RE.match(line)
+        if operand_match and not is_resolved_addr(operand_match.group(1)):
+            problems.append(
+                f"line {lineno}: 'break *{operand_match.group(1)}' operand is an unresolved "
+                f"placeholder, not a real address/symbol (GDB will fail at run time with "
+                f"'No symbol table is loaded' and abort the rest of the recipe): {line!r}"
+            )
+            continue
         set_match = _SET_REGISTER_LINE_RE.match(line)
         if set_match and not GDB_FORCED_VALUE_RE.match(set_match.group(2)):
             problems.append(
@@ -466,7 +548,25 @@ def render_trigger_breakpoint_commands(
     """The `instrument_trigger` recipe body: break at the sink, print the
     actual sink argument (as a C string) verbatim — this is the direct
     sink-argument-capture signal `collect_signals`/`dynamic_evaluate` reads
-    to test the decisive observable."""
+    to test the decisive observable.
+
+    Raises `ValueError` if `sink_addr` is empty/unresolved — unlike a guard
+    (which is simply skipped when unresolved, since a guard is optional
+    reinforcement), the sink breakpoint IS the whole point of this recipe
+    body: emitting `break *unspecified`/`break *` here would abort the
+    batch script with no sink instrumentation at all, silently producing an
+    empty `ObservationRecord` that looks identical to "reached but nothing
+    happened" instead of "never actually instrumented". Callers
+    (`fvvw.dynamic_track.instrument_trigger` via `_build_and_lint_recipe`)
+    already translate a `ValueError` here into a `DynamicFault`/
+    `UnresolvedPlanFault`, matching every other recipe-building call site.
+    """
+    if not is_resolved_addr(sink_addr):
+        raise ValueError(
+            f"render_trigger_breakpoint_commands: sink_addr={sink_addr!r} is empty or an "
+            "unresolved placeholder — cannot instrument the sink with no real breakpoint "
+            "operand."
+        )
     return [
         f"break *{normalize_hex_addr(sink_addr)}",
         "continue",
