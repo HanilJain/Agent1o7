@@ -949,6 +949,15 @@ class FVVWReport(BaseModel):
     started_at: datetime
     finished_at: datetime | None = None
     trace_url: str | None = None
+    dep_report_path: str = ""
+    """Relative path (from ``db_subfolder``) to the ``DependencyReport`` JSON
+    produced by ``dep_resolver.resolve_dependencies`` for this candidate's
+    binary.  Empty when ``Settings.stage5_dep_resolution`` was ``False`` or
+    ``rootfs_dir`` was unavailable."""
+    readiness_level: str = ""
+    """``ReadinessLevel`` value (e.g. ``"static_ready"`` / ``"uncertain"`` /
+    ``"blocked"``) from the pre-execution assessment, for downstream consumers
+    and Stage 6 reporting.  Empty when dep resolution was skipped."""
 
 
 class DynamicOnlyReport(BaseModel):
@@ -986,6 +995,13 @@ class DynamicOnlyReport(BaseModel):
     command_log_path: str = ""
     """Where the dynamic track's `cmdlog.CommandLog` JSONL landed for this
     run — empty when `Settings.stage5_command_log` was `False`."""
+    dep_report_path: str = ""
+    """Relative path (from ``db_subfolder``) to the ``DependencyReport`` JSON.
+    Empty when ``Settings.stage5_dep_resolution`` was ``False`` or
+    ``rootfs_dir`` was unavailable."""
+    readiness_level: str = ""
+    """``ReadinessLevel`` value from the pre-execution assessment. Empty when
+    dep resolution was skipped."""
     started_at: datetime
     finished_at: datetime | None = None
 

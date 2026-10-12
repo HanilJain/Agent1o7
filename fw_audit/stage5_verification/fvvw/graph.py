@@ -77,6 +77,7 @@ from fw_audit.stage5_verification.tools.crosscheck_tool import (
     resolve_sink_addresses,
     static_crosscheck,
 )
+from fw_audit.stage5_verification.tools.dep_resolver import resolve_or_load_cached
 from fw_audit.stage5_verification.tools.joern_tool import joern_executor
 from fw_audit.stage5_verification.tools.verification_sandbox import (
     verification_executor,
@@ -322,6 +323,8 @@ async def run_dynamic_track_only(
     settings_override: Settings | None = None,
     raw_recipe_override: str | None = None,
     stop_after: str | None = None,
+    dep_report: object | None = None,
+    readiness: object | None = None,
 ) -> tuple[TrackResult, list[dict], bool | None, str, dict]:
     """The dynamic track's full run: compiles and `ainvoke`s the 9-node
     agentic `StateGraph` (`fvvw.dynamic_graph.build_dynamic_graph` — spec
@@ -379,6 +382,8 @@ async def run_dynamic_track_only(
         settings=settings,
         session_executor=deps.dynamic_session_executor,
         raw_recipe_override=raw_recipe_override,
+        dep_report=dep_report,
+        readiness=readiness,
     )
 
     graph_deps = DynamicGraphDeps(
@@ -712,6 +717,74 @@ async def run_fvvw(
     shutil.copyfile(candidate.source_path, layout.source_path(deps.static_workspace_dir))
 
     target = await characterize_target(candidate)
+
+    # Proactive dependency resolution — runs between characterize_target and
+    # strategy_agent so the bringup agent receives a structured dep brief.
+    # Gated by settings.stage5_dep_resolution; skipped silently when
+    # candidate.rootfs_dir is None (e.g. Stage 2 couldn't resolve the rootfs).
+    _dep_report = None
+    _readiness = None
+    if settings.stage5_dep_resolution and candidate.rootfs_dir is not None:
+        from fw_audit.stage5_verification.readiness import assess_readiness
+        _dep_rpt_path = layout.dep_report_path(
+            layout.stage5_dir(db_subfolder), target.binary_path or ""
+        )
+        # Use sha256 from the binary path for the cache key
+        import contextlib
+        import hashlib as _hashlib
+        _bin_sha = ""
+        if candidate.binary_path is not None:
+            with contextlib.suppress(OSError):
+                _bin_sha = _hashlib.sha256(candidate.binary_path.read_bytes()).hexdigest()
+        _dep_rpt_path = layout.dep_report_path(
+            layout.stage5_dir(db_subfolder), _bin_sha or "unknown"
+        )
+        _dep_report = await resolve_or_load_cached(
+            candidate.binary_path,  # type: ignore[arg-type]
+            candidate.rootfs_dir,
+            _dep_rpt_path,
+            interpreter=target.libc and candidate.elf.interpreter if candidate.elf else None,
+            calls=[c for fn in candidate.functions for c in fn.calls],
+            use_cache=settings.stage5_dep_cache,
+        )
+        _readiness = assess_readiness(_dep_report, target)
+        if settings.stage5_skip_blocked:
+            from fw_audit.stage5_verification.readiness import should_skip_candidate
+            if should_skip_candidate(_readiness):
+                from fw_audit.common.verification import TrackResult, VerificationVerdict
+                _blocked_tr = TrackResult(
+                    verdict=VerificationVerdict.ERROR,
+                    proved_hypothesis="none",
+                    evidence={"reason": f"BLOCKED by dep resolver: {_readiness.blocking_reasons}"},
+                )
+                import logging as _logging
+                _logging.getLogger("fw_audit.stage5_verification.fvvw.graph").warning(
+                    "%s: skipping BLOCKED candidate (%s)",
+                    candidate.global_id,
+                    _readiness.blocking_reasons,
+                )
+                # Return a minimal error result; the driver will record it as failed.
+                return {
+                    "static_result": _blocked_tr,
+                    "dynamic_result": _blocked_tr,
+                    "agreement": "error",
+                    "mechanism_confidence": "unknown",
+                    "reachability_confidence": "unknown",
+                    "residual_unknowns": list(_readiness.blocking_reasons),
+                    "report_markdown": "",
+                    "guard_logs": [],
+                    "dynamic_gdb_transcript": "",
+                    "crosscheck_evidence": {},
+                    "command_log_paths": {},
+                    "human_review": None,
+                    "emulation_mode": "blocked",
+                    "arbitration_log": {},
+                    "observation": {},
+                    "iteration_history": [],
+                    "readiness_level": _readiness.level.value,
+                    "dep_report_path": str(_dep_rpt_path),
+                }
+
     plan = await strategy_agent(
         candidate,
         target,
@@ -758,7 +831,14 @@ async def run_fvvw(
         )
     )
     dynamic_task = asyncio.ensure_future(
-        run_dynamic_track_only(candidate, plan.dynamic_plan, target, deps=deps)
+        run_dynamic_track_only(
+            candidate,
+            plan.dynamic_plan,
+            target,
+            deps=deps,
+            dep_report=_dep_report,
+            readiness=_readiness,
+        )
     )
 
     # ---- await_both_tracks: the hard barrier ----------------------------
@@ -900,6 +980,8 @@ async def run_fvvw(
         "observation": dynamic_extras.get("observation"),
         "iteration_history": dynamic_extras.get("iteration_history") or [],
         "emulation_mode": dynamic_extras.get("emulation_mode", ""),
+        "readiness_level": _readiness.level.value if _readiness is not None else "",
+        "dep_report_path": str(_dep_rpt_path) if _dep_report is not None else "",
     }
 
 
@@ -940,6 +1022,33 @@ async def run_dynamic_only(
         db_subfolder=db_subfolder, candidate=candidate, settings=settings, live=live
     )
     target = await characterize_target(candidate)
+
+    # Same proactive dep resolution as run_fvvw — same gate, same logic.
+    _dyn_dep_report = None
+    _dyn_readiness = None
+    _dyn_dep_rpt_path = layout.dep_report_path(layout.stage5_dir(db_subfolder), "unknown")
+    if settings.stage5_dep_resolution and candidate.rootfs_dir is not None:
+        import contextlib
+        import hashlib as _hashlib
+
+        from fw_audit.stage5_verification.readiness import assess_readiness
+        _bin_sha = ""
+        if candidate.binary_path is not None:
+            with contextlib.suppress(OSError):
+                _bin_sha = _hashlib.sha256(candidate.binary_path.read_bytes()).hexdigest()
+        _dyn_dep_rpt_path = layout.dep_report_path(
+            layout.stage5_dir(db_subfolder), _bin_sha or "unknown"
+        )
+        _dyn_dep_report = await resolve_or_load_cached(
+            candidate.binary_path,  # type: ignore[arg-type]
+            candidate.rootfs_dir,
+            _dyn_dep_rpt_path,
+            interpreter=candidate.elf.interpreter if candidate.elf else None,
+            calls=[c for fn in candidate.functions for c in fn.calls],
+            use_cache=settings.stage5_dep_cache,
+        )
+        _dyn_readiness = assess_readiness(_dyn_dep_report, target)
+
     plan = await strategy_agent(
         candidate,
         target,
@@ -967,7 +1076,13 @@ async def run_dynamic_only(
         gdb_transcript,
         dynamic_extras,
     ) = await run_dynamic_track_only(
-        candidate, plan.dynamic_plan, target, deps=deps, stop_after=stop_after
+        candidate,
+        plan.dynamic_plan,
+        target,
+        deps=deps,
+        stop_after=stop_after,
+        dep_report=_dyn_dep_report,
+        readiness=_dyn_readiness,
     )
 
     return {
@@ -982,6 +1097,8 @@ async def run_dynamic_only(
         "emulation_mode": dynamic_extras.get("emulation_mode", ""),
         "sink_resolution_evidence": sink_resolution_evidence,
         "deps": deps,
+        "readiness_level": _dyn_readiness.level.value if _dyn_readiness is not None else "",
+        "dep_report_path": str(_dyn_dep_rpt_path) if _dyn_dep_report is not None else "",
     }
 
 

@@ -199,6 +199,8 @@ async def _process_one_fvvw(candidate: VerificationCandidate, *, ctx: _FVVWRunCo
         human_review=outcome.get("human_review"),
         emulation_mode=outcome.get("emulation_mode", ""),
         iteration_history=outcome.get("iteration_history") or [],
+        readiness_level=outcome.get("readiness_level", ""),
+        dep_report_path=outcome.get("dep_report_path", ""),
         started_at=started_at,
         finished_at=datetime.now(UTC),
         **report_kwargs,
@@ -340,6 +342,18 @@ async def run_fvvw_queue(
     if only_global_ids is not None:
         candidates = [c for c in candidates if c.global_id in only_global_ids]
 
+    # Lightweight pre-sort: candidates with a resolved binary_path + rootfs_dir
+    # (can attempt dynamic emulation) first; those without go last.  The full
+    # ReadinessLevel assessment runs inside run_fvvw per-candidate — this is
+    # only a cheap proxy so obviously-unrunnable candidates don't block the
+    # queue while runnable ones wait.  Stable sort preserves original order
+    # within each group.
+    if settings.stage5_dep_resolution:
+        candidates = sorted(
+            candidates,
+            key=lambda c: (0 if (c.binary_path is not None and c.rootfs_dir is not None) else 1),
+        )
+
     stage5_dir_ = layout.stage5_dir(db_subfolder)
     if not candidates:
         summary = VerificationRunSummary(
@@ -471,6 +485,8 @@ async def _process_one_dynamic_only(
         emulation_mode=outcome.get("emulation_mode", ""),
         report_markdown=report_markdown,
         command_log_path=str(deps.dynamic_command_log.path or ""),
+        readiness_level=outcome.get("readiness_level", ""),
+        dep_report_path=outcome.get("dep_report_path", ""),
         started_at=started_at,
         finished_at=datetime.now(UTC),
     )

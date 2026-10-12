@@ -875,6 +875,43 @@ class Settings(BaseSettings):
     would just multiply session round-trips for no real gain in detection
     latency given that floor."""
 
+    # ---- Stage 5 dependency resolution (FVVW v3 proactive dep discovery) ----
+    stage5_dep_resolution: bool = Field(
+        default=True, validation_alias="FWA_STAGE5_DEP_RESOLUTION"
+    )
+    """Master switch for pre-execution dependency discovery.  When ``True``
+    (the default), ``resolve_dependencies`` runs before the strategy agent so
+    the bringup agent receives a structured list of missing libraries/config
+    files instead of rediscovering them via strace.  Set ``False`` to restore
+    the exact pre-feature behavior (the whole dependency resolver is bypassed
+    entirely — useful for a controlled A/B or when rootfs_dir is unavailable)."""
+    stage5_dep_max_depth: int = Field(
+        default=10, ge=1, le=30, validation_alias="FWA_STAGE5_DEP_MAX_DEPTH"
+    )
+    """Maximum BFS recursion depth for transitive shared-library resolution.
+    A depth of 10 is enough to cover every known firmware binary in practice
+    (real firmware rarely exceeds 4-5 levels); higher values only add work
+    for pathological circular-dependency chains that the visited-set already
+    handles correctly regardless."""
+    stage5_dep_cache: bool = Field(
+        default=True, validation_alias="FWA_STAGE5_DEP_CACHE"
+    )
+    """Cache ``DependencyReport`` JSON files to ``stage5/deps/<sha256[:16]>.json``.
+    Multiple findings from the same binary share the identical report so
+    resolution only runs once per binary per firmware run.  Set ``False`` to
+    force re-resolution on every run (useful when rootfs contents change
+    between runs on the same ``db_subfolder``)."""
+    stage5_skip_blocked: bool = Field(
+        default=False, validation_alias="FWA_STAGE5_SKIP_BLOCKED"
+    )
+    """When ``True``, candidates assessed at ``ReadinessLevel.BLOCKED``
+    (interpreter absent, ABI-incompatible library, or >50% libraries missing)
+    are skipped entirely rather than attempted.  Default ``False`` — BLOCKED
+    candidates are still attempted, with the bringup agent receiving the
+    dependency brief to guide its repair attempts.  Set ``True`` for
+    resource-constrained runs where spending a full dynamic-track budget on an
+    unrunnable binary is never worthwhile."""
+
     # ---- LLM usage tracking & rate limiting ----------------------------
     llm_usage_tracking: bool = Field(default=True, validation_alias="FWA_LLM_USAGE_TRACKING")
     """Attach a `UsageTrackingCallbackHandler` to every constructed chat

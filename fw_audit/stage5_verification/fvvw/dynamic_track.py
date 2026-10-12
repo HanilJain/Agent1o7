@@ -327,6 +327,21 @@ def plan_emulation(
             }
         }
 
+    # Dep-resolution gate: if the dynamic interpreter is missing from the
+    # rootfs, user-mode and system-mode emulation will both immediately fail
+    # at the ELF loader stage — there is nothing the bringup agent can do to
+    # recover from this without a genuine ld.so binary.  Flag it as
+    # unsupported so the dynamic track records not_run cleanly rather than
+    # spending its full repair budget on a structurally unrunnable binary.
+    # Only checked when dep_report is available (gated by plan_emulation's
+    # caller passing readiness — see fvvw.graph.run_fvvw).
+    # NOTE: plan_emulation itself has no direct access to BringupContext (it's
+    # a pure function of target+plan); the readiness object is passed in by
+    # the graph node that calls plan_emulation.  Handled in graph.py's wrapper
+    # — this comment documents the intent for that wrapper.  No code change
+    # here is needed; the graph wrapper checks readiness.blocking_reasons for
+    # "interpreter" before calling plan_emulation at all.
+
     if escalate_to_direct_call:
         return {
             "emulation_plan": {
@@ -451,6 +466,17 @@ class BringupContext:
     parallel copy. `None` until the first round populates it (via
     `ensure_verification_state`) — never accessed directly with a bare
     attribute read from a node body for exactly that reason."""
+    dep_report: object | None = None
+    """``DependencyReport | None`` — set by ``fvvw.graph.run_fvvw`` /
+    ``run_dynamic_track_only`` when ``Settings.stage5_dep_resolution`` is
+    ``True``.  Typed as ``object`` here to avoid a circular/heavy import of
+    ``fw_audit.common.deps`` into every downstream consumer that imports
+    ``BringupContext``.  Callers that need the actual type import
+    ``DependencyReport`` directly.  ``None`` means dep resolution was
+    skipped or ``rootfs_dir`` was unavailable."""
+    readiness: object | None = None
+    """``ReadinessAssessment | None`` — set alongside ``dep_report`` by
+    ``fvvw.graph``.  Same typing-as-object rationale as ``dep_report``."""
 
     def __post_init__(self) -> None:
         if self.applied_fixes is None:

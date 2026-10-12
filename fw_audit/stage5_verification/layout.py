@@ -202,3 +202,25 @@ def fvvw_dynamic_only_summary_path(stage5_dir_: Path) -> Path:
     against the same `db_subfolder` without overwriting each other's
     run-level bookkeeping."""
     return stage5_dir_ / "fvvw_dynamic_only_summary.json"
+
+
+# --------------------------------------------------------------------- #
+# Dependency resolution cache — one JSON file per binary (keyed by
+# sha256[:16]), under stage5/deps/.  Multiple findings from the same
+# binary share the identical DependencyReport so resolution only runs once
+# per binary per firmware run.
+# --------------------------------------------------------------------- #
+
+
+def deps_dir(stage5_dir_: Path) -> Path:
+    """Where cached ``DependencyReport`` JSON files live.  Each file's name
+    is ``<binary_sha256[:16]>.json`` — see ``dep_report_path``."""
+    return stage5_dir_ / "deps"
+
+
+def dep_report_path(stage5_dir_: Path, binary_sha256: str) -> Path:
+    """Path to the cached ``DependencyReport`` for one binary.  Uses the
+    first 16 hex characters of the SHA-256 as the filename — long enough to
+    be collision-resistant across the ~dozens of binaries in a typical
+    firmware extraction, short enough to stay within Windows MAX_PATH."""
+    return deps_dir(stage5_dir_) / f"{binary_sha256[:16]}.json"

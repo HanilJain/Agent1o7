@@ -68,6 +68,7 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     validate_benign_marker,
     validate_real_payload,
 )
+from fw_audit.stage5_verification.readiness import format_bringup_brief
 from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     CONTAINER_WORKDIR,
     build_qemu_strace_command,
@@ -172,11 +173,18 @@ async def bringup_agent(
     arch, endianness = ctx.emulation_plan.get("arch_spec_key", ("unknown", ""))
     arch_spec = resolve_qemu_arch_spec(arch, endianness)
 
+    _dep_brief = ""
+    if ctx.dep_report is not None and ctx.readiness is not None:
+        _dep_brief = format_bringup_brief(
+            assessment=ctx.readiness,  # type: ignore[arg-type]
+            dep_report=ctx.dep_report,  # type: ignore[arg-type]
+        )
     brief = render_bringup_brief(
         global_id=ctx.candidate.global_id,
         target_arch=arch,
         target_endianness=endianness,
         launch_cmd=ctx.launch_cmd,
+        dep_brief=_dep_brief,
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=BRINGUP_AGENT_SYSTEM_PROMPT),
