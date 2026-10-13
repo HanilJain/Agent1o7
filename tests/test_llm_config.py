@@ -33,13 +33,19 @@ def test_resolve_spec_stage1_binary_identifier_is_high_reasoning():
     # output feeds Stage 2 directly. Production default is HIGH_REASONING
     # (Anthropic Claude Sonnet) — see the ROLE_TO_TIER comment in
     # llm_config.py for the offline-testing override (FWA_LLM_MODEL).
-    spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER)
+    #
+    # `_env_file=None` bypasses this machine's real `.env` (which may set
+    # FWA_STAGE1_IDENTIFIER_MODEL for actual local runs) so the test sees
+    # the tier-table default, not whatever a developer's own `.env`
+    # happens to override that role to.
+    spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER, settings=Settings(_env_file=None))
     assert spec.provider == ModelProvider.ANTHROPIC
     assert spec.model == "claude-sonnet-4-5"
 
 
 def test_resolve_spec_stage3_vuln_analyst_is_high_reasoning():
-    spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST)
+    # Same `.env`-isolation rationale as the Stage 1 test above.
+    spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST, settings=Settings(_env_file=None))
     assert spec.provider == ModelProvider.ANTHROPIC
     assert spec.model == "claude-sonnet-4-5"
 
@@ -54,10 +60,17 @@ def test_resolve_spec_unknown_role_falls_back_to_balanced():
 
 
 def test_resolve_spec_global_llm_model_override(monkeypatch):
+    # `_env_file=None` below means this monkeypatched FWA_LLM_MODEL is the
+    # ONLY override `settings` can see — without it, `.env`'s own
+    # FWA_STAGE1_IDENTIFIER_MODEL (a per-role override, which `resolve_spec`
+    # checks BEFORE the global `llm_model` this test sets) would win
+    # instead, defeating the assertion below regardless of this monkeypatch.
     monkeypatch.setenv("FWA_LLM_MODEL", "ollama:qwen2.5-coder:1.5b")
     _clear_settings_cache()
     try:
-        spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER)
+        spec = resolve_spec(
+            AgentRole.STAGE1_BINARY_IDENTIFIER, settings=Settings(_env_file=None)
+        )
         assert spec.provider == ModelProvider.OLLAMA
         assert spec.model == "qwen2.5-coder:1.5b"
     finally:
@@ -69,13 +82,16 @@ def test_resolve_spec_per_role_override_takes_precedence_over_global(monkeypatch
     monkeypatch.setenv("FWA_STAGE3_ANALYST_MODEL", "ollama:qwen2.5-coder:1.5b")
     _clear_settings_cache()
     try:
+        settings = Settings(_env_file=None)
         # The per-role override wins for STAGE3_VULN_ANALYST specifically.
-        analyst_spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST)
+        analyst_spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST, settings=settings)
         assert analyst_spec.provider == ModelProvider.OLLAMA
         assert analyst_spec.model == "qwen2.5-coder:1.5b"
 
-        # Other roles still see the global override, not the per-role one.
-        identifier_spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER)
+        # Other roles still see the global override, not the per-role one —
+        # true only when `.env`'s own FWA_STAGE1_IDENTIFIER_MODEL is also
+        # excluded via `_env_file=None`, or that would win here instead.
+        identifier_spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER, settings=settings)
         assert identifier_spec.provider == ModelProvider.ANTHROPIC
     finally:
         _clear_settings_cache()
@@ -123,12 +139,21 @@ def test_get_llm_missing_anthropic_credential_falls_back_to_local_ollama(monkeyp
     # to the local Ollama spec (always "available" since Ollama needs no
     # credential) rather than raising. See test_get_llm_no_fallback_when_*
     # below for the case where fallback is genuinely exhausted.
+    #
+    # `monkeypatch.delenv` alone cannot simulate "no credential" on a
+    # machine whose real `.env` sets ANTHROPIC_API_KEY: deleting an
+    # unrelated PROCESS env var does nothing to a value pydantic-settings
+    # reads straight from the `.env` FILE — `get_llm`'s default
+    # `settings or get_settings()` would still see the real key and this
+    # test would spuriously build a real ChatAnthropic instead of falling
+    # back. `_env_file=None` is the actual fix: it's the only thing that
+    # makes ANTHROPIC_API_KEY genuinely absent from `settings`.
     pytest.importorskip("langchain_ollama")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     _clear_settings_cache()
     try:
         spec = ModelSpec(provider=ModelProvider.ANTHROPIC, model="claude-sonnet-4-5")
-        llm = get_llm(spec)
+        llm = get_llm(spec, settings=Settings(_env_file=None))
         assert type(llm).__name__ == "ChatOllama"
     finally:
         _clear_settings_cache()
@@ -190,6 +215,11 @@ def test_get_llm_raises_when_both_preferred_and_fallback_unavailable(monkeypatch
 
 
 def test_resolve_usable_spec_prefers_api_and_falls_back_to_local(monkeypatch):
+    # Same `.env` ANTHROPIC_API_KEY issue as
+    # test_get_llm_missing_anthropic_credential_falls_back_to_local_ollama
+    # above — `monkeypatch.delenv` can't remove a `.env`-FILE-sourced
+    # credential, so `_env_file=None` is required for this assertion to
+    # mean what it says (no usable Anthropic credential -> Ollama).
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("FWA_STAGE3_ANALYST_MODEL", "")
     monkeypatch.setenv("FWA_LLM_MODEL", "")
@@ -197,17 +227,24 @@ def test_resolve_usable_spec_prefers_api_and_falls_back_to_local(monkeypatch):
     try:
         from fw_audit.config.llm_config import resolve_usable_spec
 
-        spec = resolve_usable_spec(AgentRole.STAGE3_VULN_ANALYST)
+        spec = resolve_usable_spec(
+            AgentRole.STAGE3_VULN_ANALYST, settings=Settings(_env_file=None)
+        )
         assert spec.provider == ModelProvider.OLLAMA
     finally:
         _clear_settings_cache()
 
 
 def test_settings_use_local_model_prefers_local_tier(monkeypatch):
+    # `use_local_model` is only consulted once BOTH the per-role and global
+    # overrides are empty (see `resolve_spec`'s own precedence-order
+    # docstring) — `.env`'s FWA_STAGE3_ANALYST_MODEL per-role override for
+    # this exact role would otherwise win first and this test would never
+    # actually exercise the use_local_model branch it's named for.
     monkeypatch.setenv("FWA_USE_LOCAL_MODEL", "true")
     _clear_settings_cache()
     try:
-        spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST)
+        spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST, settings=Settings(_env_file=None))
         assert spec.provider == ModelProvider.OLLAMA
         assert spec.model == "qwen2.5-coder:1.5b"
     finally:
@@ -274,12 +311,16 @@ def test_resolve_spec_stage1_identifier_model_override(monkeypatch):
     monkeypatch.setenv("FWA_STAGE1_IDENTIFIER_MODEL", "opencode_go:kimi-k3")
     _clear_settings_cache()
     try:
-        spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER)
+        settings = Settings(_env_file=None)
+        spec = resolve_spec(AgentRole.STAGE1_BINARY_IDENTIFIER, settings=settings)
         assert spec.provider == ModelProvider.OPENCODE_GO
         assert spec.model == "kimi-k3"
 
-        # Other roles are unaffected by this role-specific override.
-        analyst_spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST)
+        # Other roles are unaffected by this role-specific override — true
+        # only with `.env`'s own FWA_STAGE3_ANALYST_MODEL excluded via
+        # `_env_file=None`, or that would win here instead of the ANTHROPIC
+        # tier-table default this assertion is actually checking for.
+        analyst_spec = resolve_spec(AgentRole.STAGE3_VULN_ANALYST, settings=settings)
         assert analyst_spec.provider == ModelProvider.ANTHROPIC
     finally:
         _clear_settings_cache()

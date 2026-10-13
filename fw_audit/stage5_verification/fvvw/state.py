@@ -33,6 +33,7 @@ from fw_audit.common.verification import (
     StrategyPlan,
     TargetMeta,
     TrackResult,
+    VerificationState,
 )
 
 
@@ -91,6 +92,18 @@ class FVVWState(TypedDict, total=False):
     `Settings.stage5_dynamic_max_iterations` by the graph's router, the
     same iteration-budget role `dynamic_evaluate`'s own `iteration`
     parameter played before this rewrite."""
+    verification_state: VerificationState
+    """Tier 3 (T3-O): the Continuous Verification Supervisor's canonical
+    picture of this run — `fvvw.supervisor.propose_action`/`validate_
+    action`'s own input, read from `dynamic_graph.BringupContext.
+    verification_state` each round and written back here as a
+    serializable SNAPSHOT (never a live queue/object) so it flows into
+    `run_dynamic_track_only`'s `dynamic_extras` bag and, from there,
+    `FVVWReport`'s persisted event/attempt-history audit trail. Overwritten
+    each loop-back (like `observation`), not accumulated — the state
+    object ITSELF already carries its own internal `events`/
+    `attempt_history` lists, so this key holds the latest cumulative
+    snapshot, not a list of snapshots."""
 
     # ---- mem.repair.* — bringup_stabilize -----------------------------------
     repair_return_to: str
@@ -140,6 +153,7 @@ DYNAMIC_TRACK_WRITABLE_KEYS: tuple[str, ...] = (
     "route",
     "iteration_history",
     "dynamic_iteration",
+    "verification_state",
     "repair_return_to",
     "repair_applied_fixes",
     "repair_quirks_discovered",

@@ -14,6 +14,7 @@ from fw_audit.stage5_verification.tools.crosscheck_tool import (
     CrosscheckResult,
     objdump_disassemble_command,
     readelf_dynsym_command,
+    resolve_sink_addresses,
     static_crosscheck,
 )
 
@@ -203,3 +204,79 @@ def test_crosscheck_result_to_evidence_dict_shape():
     assert evidence["all_expected_calls_confirmed"] is True
     assert evidence["any_sanitizer_found"] is False
     assert len(evidence["disassembly_excerpt"]) == 4000
+
+
+# --------------------------------------------------------------------- #
+# resolve_sink_addresses — T2-F: real sink/PLT-GOT/call-site addresses
+# --------------------------------------------------------------------- #
+
+
+async def test_sink_addr_resolved_to_plt_call_site(fake_executor, tmp_path: Path):
+    """T2-F end-to-end: disassemble the real target ELF, resolve the
+    relocation table, and find the ACTUAL call-site address of the
+    `system` sink inside the target function — never the function's own
+    entry point (where `(char*)$a0` would read param_1, never the string
+    actually passed to `system()`)."""
+    binary_path = tmp_path / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+
+    reloc_output = (
+        "Relocation section '.rel.plt' at offset 0x2f0 contains 3 entries:\n"
+        " Offset     Info    Type            Sym.Value  Sym. Name\n"
+        "00026a30  00030016 R_ARM_JUMP_SLOT   00000000   system\n"
+    )
+
+    def on_run(command, files):
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout=_DISASSEMBLY, stderr="", timed_out=False
+            )
+        if command.startswith("readelf"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout=reloc_output, stderr="", timed_out=False
+            )
+        return ExecutionResult(command=command, returncode=0, stdout="", stderr="", timed_out=False)
+
+    executor = fake_executor(on_run)
+    result = await resolve_sink_addresses(
+        _candidate(binary_path=binary_path),
+        target_function="FUN_00026938",
+        sink_names=["system", "strcpy"],
+        executor=executor,
+        settings=Settings(_env_file=None),
+    )
+    assert result.resolved("system")
+    assert result.best_call_site("system") == "0x26940"
+    assert result.addresses["system"]["plt_addr"] == "0x00026a30"
+    # T2-F: the PLT address alone is NEVER an acceptable breakpoint
+    # location — best_call_site must return the CALL-SITE, not the stub.
+    assert result.best_call_site("system") != result.addresses["system"]["plt_addr"]
+
+
+async def test_sink_addr_unresolved_when_sink_not_called_in_target_function(
+    fake_executor, tmp_path: Path
+):
+    """An honest 'unresolved' outcome (never a guess) when the named sink
+    doesn't actually appear as a call inside the target function's own
+    disassembly slice — this is what lets the dynamic track refuse a
+    CONFIRMED verdict built on an unresolved sink (T1-B/T2-F)."""
+    binary_path = tmp_path / "vulnbin"
+    binary_path.write_bytes(b"\x7fELF")
+
+    def on_run(command, files):
+        if command.startswith("objdump"):
+            return ExecutionResult(
+                command=command, returncode=0, stdout=_DISASSEMBLY, stderr="", timed_out=False
+            )
+        return ExecutionResult(command=command, returncode=0, stdout="", stderr="", timed_out=False)
+
+    executor = fake_executor(on_run)
+    result = await resolve_sink_addresses(
+        _candidate(binary_path=binary_path),
+        target_function="FUN_00026938",
+        sink_names=["never_called_sink"],
+        executor=executor,
+        settings=Settings(_env_file=None),
+    )
+    assert result.resolved("never_called_sink") is False
+    assert result.best_call_site("never_called_sink") == ""

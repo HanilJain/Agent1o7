@@ -200,18 +200,33 @@ no <think> reasoning in your final answer) matching this shape exactly:
 
 
 def render_bringup_brief(
-    *, global_id: str, target_arch: str, target_endianness: str, launch_cmd: str
+    *,
+    global_id: str,
+    target_arch: str,
+    target_endianness: str,
+    launch_cmd: str,
+    dep_brief: str = "",
 ) -> str:
     """The bring-up agent's per-invocation context — kept deliberately
     small (this loop reasons over TOOL OUTPUT, not finding prose, unlike
     the strategy/trigger prompts) since the strace/inspection results
-    themselves are what get appended to the running transcript."""
-    return (
+    themselves are what get appended to the running transcript.
+
+    ``dep_brief`` is an optional pre-resolved dependency section produced by
+    ``stage5_verification.readiness.format_bringup_brief`` — when non-empty it
+    lists known missing libraries/config files/device nodes so the agent can
+    fix them proactively instead of rediscovering them via strace.  When empty
+    (``Settings.stage5_dep_resolution=False`` or ``rootfs_dir`` unavailable)
+    the output is identical to the pre-feature version."""
+    core = (
         f"global_id: {global_id}\n"
         f"target_arch: {target_arch}\n"
         f"target_endianness: {target_endianness}\n"
         f"current launch_cmd (before any fixes this invocation): {launch_cmd}\n"
     )
+    if dep_brief:
+        return core + "\n" + dep_brief
+    return core
 
 
 def render_trigger_brief(

@@ -65,14 +65,19 @@ def test_cli_argv_shape_allows_only_argv():
     assert allowed_delivery_tools_for_shape("cli_argv") == frozenset({"deliver_via_argv"})
 
 
-def test_unrecognized_shape_falls_back_to_permitting_all_known_tools():
-    """An unrecognized/empty shape is a plan-authoring gap, not evidence
-    that delivery should be blocked entirely."""
+def test_unrecognized_shape_falls_back_to_argv_and_direct_call_only():
+    """T2-I: an unrecognized/empty shape is a plan-authoring gap, not
+    evidence that delivery should be blocked entirely — but it must NEVER
+    fall back to permitting `deliver_via_network` either, since partial
+    emulation's default posture (`--network=none`) provides no reachable
+    listener for a shape this table doesn't even name. Only the two
+    delivery paths that are always at least POSSIBLE under partial
+    emulation (no live listener required) are permitted."""
     assert allowed_delivery_tools_for_shape("") == frozenset(
-        {"deliver_via_direct_call", "deliver_via_network", "deliver_via_argv"}
+        {"deliver_via_direct_call", "deliver_via_argv"}
     )
     assert allowed_delivery_tools_for_shape("some_future_shape") == frozenset(
-        {"deliver_via_direct_call", "deliver_via_network", "deliver_via_argv"}
+        {"deliver_via_direct_call", "deliver_via_argv"}
     )
 
 
@@ -80,6 +85,22 @@ def test_every_table_entry_maps_to_a_real_deliver_tool_name():
     known_tools = {"deliver_via_direct_call", "deliver_via_network", "deliver_via_argv"}
     for shape, tools in ALLOWED_DELIVERY_TOOLS_BY_SHAPE.items():
         assert tools <= known_tools, f"shape {shape!r} maps to an unknown tool: {tools}"
+
+
+def test_wps_shape_forbids_network_delivery():
+    """T2-I regression: a WPS/802.11/EAP protocol finding must NEVER be
+    permitted `deliver_via_network` — these protocols need a live
+    wireless-stack peer partial emulation cannot provide, and the
+    production incident this guards against saw exactly this: a WPS
+    finding labelled the closest-SOUNDING (but wrong) 'network_http'
+    shape, which then permitted a POST into an HTTP listener that simply
+    did not exist under `--network=none`. Only `deliver_via_direct_call`
+    is ever allowed for these shapes."""
+    for shape in ("network_wps", "network_80211", "network_eap"):
+        allowed = allowed_delivery_tools_for_shape(shape)
+        assert allowed == frozenset({"deliver_via_direct_call"}), (shape, allowed)
+        assert "deliver_via_network" not in allowed
+        assert "deliver_via_argv" not in allowed
 
 
 # ---------------------------------------------------------------------- #
@@ -305,6 +326,69 @@ async def test_trigger_agent_allows_in_shape_delivery(tmp_path: Path):
 
     assert result.delivery_channel == "deliver_via_direct_call"
     assert ctx.real_payload_override == "hostapd_wps_call(0x1000)"
+
+
+async def test_direct_call_path_invokes_render_direct_call_recipe_body(tmp_path: Path):
+    """T2-H regression: `deliver_via_direct_call` followed by
+    `observe_result` must call `dynamic_track.direct_call_trigger`
+    (which uses `render_direct_call_recipe_body` — `break <target
+    entry> / continue / call <expr>`), never `instrument_trigger` (a
+    sink-breakpoint capture that assumes natural execution already
+    reached the sink). Before this fix, `deliver_via_direct_call` only
+    ever stored `call_expression` into `ctx.real_payload_override`, and
+    `observe_result` ran `instrument_trigger` regardless — a direct-call
+    delivery produced NO actual invocation at all."""
+    exec_calls: list[str] = []
+
+    def on_exec(command: str):
+        exec_calls.append(command)
+        if "recipe_direct_call" in command and "cat >" in command:
+            return None  # the recipe-write step — just record it
+        if "gdb-multiarch" in command and "recipe_direct_call" in command:
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout="Breakpoint 1, 0x1000 in hostapd_wps_call ()\n"
+                "DIRECTCALL:result:done\n",
+                stderr="",
+                timed_out=False,
+            )
+        return None
+
+    llm = _ScriptedLLM(
+        [
+            _action("deliver_via_direct_call", call_expression="hostapd_wps_call(0x1000)"),
+            _action("observe_result"),
+            _action("done", summary="delivered and observed"),
+        ]
+    )
+    executor = _FakeSessionExecutor(on_exec)
+    plan = _dynamic_plan(trigger_shape="direct_call")
+    ctx = _ctx(tmp_path, session_executor=executor, plan=plan)
+
+    result = await trigger_agent(
+        ctx,
+        llm=llm,
+        settings=Settings(_env_file=None),
+        target=_target(),
+        plan=plan,
+        vuln_class="command_execution",
+        sink_expression="system(cmd)",
+    )
+
+    assert result.is_direct_call is True
+    recipe_writes = [c for c in exec_calls if "recipe_direct_call" in c]
+    assert recipe_writes, f"no recipe_direct_call command issued — exec_calls={exec_calls}"
+    gdb_batch_calls = [
+        c for c in exec_calls if "gdb-multiarch" in c and "recipe_direct_call" in c
+    ]
+    assert gdb_batch_calls, (
+        "direct_call_trigger's GDB batch (render_direct_call_recipe_body) was never run"
+    )
+    # instrument_trigger's OWN recipe path must NOT have been used for
+    # this delivery — never a sink-breakpoint capture assuming natural
+    # execution reached the sink.
+    assert not any("recipe_trigger.gdb" in c for c in gdb_batch_calls)
 
 
 async def test_trigger_agent_stops_early_after_unproductive_delivery_limit(tmp_path: Path):

@@ -62,11 +62,13 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     _launch_qemu_and_wait,
     _target_relpath_in_workspace,
     collect_observation,
+    direct_call_trigger,
     instrument_trigger,
     resolve_qemu_arch_spec,
     validate_benign_marker,
     validate_real_payload,
 )
+from fw_audit.stage5_verification.readiness import format_bringup_brief
 from fw_audit.stage5_verification.tools.qemu_gdb_tool import (
     CONTAINER_WORKDIR,
     build_qemu_strace_command,
@@ -171,11 +173,18 @@ async def bringup_agent(
     arch, endianness = ctx.emulation_plan.get("arch_spec_key", ("unknown", ""))
     arch_spec = resolve_qemu_arch_spec(arch, endianness)
 
+    _dep_brief = ""
+    if ctx.dep_report is not None and ctx.readiness is not None:
+        _dep_brief = format_bringup_brief(
+            assessment=ctx.readiness,  # type: ignore[arg-type]
+            dep_report=ctx.dep_report,  # type: ignore[arg-type]
+        )
     brief = render_bringup_brief(
         global_id=ctx.candidate.global_id,
         target_arch=arch,
         target_endianness=endianness,
         launch_cmd=ctx.launch_cmd,
+        dep_brief=_dep_brief,
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=BRINGUP_AGENT_SYSTEM_PROMPT),
@@ -393,6 +402,23 @@ ALLOWED_DELIVERY_TOOLS_BY_SHAPE: dict[str, frozenset[str]] = {
     "direct_call": frozenset({"deliver_via_direct_call"}),
     "network_http": frozenset({"deliver_via_network"}),
     "cli_argv": frozenset({"deliver_via_argv"}),
+    # T2-I: protocol shapes that are NOT socket-deliverable under partial
+    # (single-service, --network=none-by-default) emulation — a WPS/
+    # 802.11/EAP handshake needs a live wireless stack and a peer to
+    # actually negotiate with, neither of which exists in this sandbox
+    # regardless of `Settings.stage5_allow_network_grant`. The historical
+    # bug this fixes: such a target was previously labelled
+    # `network_http` (the closest-sounding entry), which PERMITTED
+    # `deliver_via_network` to an HTTP listener that simply does not
+    # exist under partial emulation — the production incident's actual
+    # POST `/eap-wsc/M7` request, sent into the void. The only tool that
+    # can ever produce a genuine observation for one of these shapes is
+    # `deliver_via_direct_call` (a direct GDB invocation of the handler
+    # function, honestly labelled a direct invocation per T2-H — never a
+    # realistic end-to-end trigger).
+    "network_wps": frozenset({"deliver_via_direct_call"}),
+    "network_80211": frozenset({"deliver_via_direct_call"}),
+    "network_eap": frozenset({"deliver_via_direct_call"}),
 }
 """Which `deliver_via_*` tool(s) the trigger agent may actually dispatch
 for a given `DynamicPlan.trigger_shape` — the enforceable half of what was
@@ -405,23 +431,27 @@ the LLM named regardless). A HITL `OVERRIDE_PLAN` decision that sets
 runs — so gating on `plan.trigger_shape` here makes an override
 structurally binding for free, with no separate override-plumbing needed.
 
-An unrecognized/empty shape intentionally falls back to allowing all three
-— see `allowed_delivery_tools_for_shape` — since a shape this table
-doesn't recognize is a plan-authoring gap, not evidence that no delivery
-mechanism should be allowed at all."""
+An unrecognized/empty shape falls back to `argv + direct_call ONLY` (T2-I
+— see `allowed_delivery_tools_for_shape`), NEVER `deliver_via_network`:
+partial emulation's default posture is `--network=none`, so silently
+permitting a network delivery tool for a shape this table doesn't
+recognize would repeat the exact `network_wps`-style false permission
+this table exists to close, just for an unnamed-instead-of-misnamed
+shape. `argv`/`direct_call` are always at least POSSIBLE to attempt under
+partial emulation (no live listener required), unlike a network send."""
 
 
 def allowed_delivery_tools_for_shape(trigger_shape: str) -> frozenset[str]:
     """The `deliver_via_*` tool names `trigger_agent` may dispatch for
-    `trigger_shape`. Falls back to permitting all three known delivery
-    tools for an empty or unrecognized shape (rather than allowing none),
-    since `ALLOWED_DELIVERY_TOOLS_BY_SHAPE` not having an entry means the
-    plan didn't specify a recognized shape — not that delivery should be
-    blocked entirely."""
-    all_known_tools = frozenset(
-        {"deliver_via_direct_call", "deliver_via_network", "deliver_via_argv"}
-    )
-    return ALLOWED_DELIVERY_TOOLS_BY_SHAPE.get(trigger_shape, all_known_tools)
+    `trigger_shape`. Falls back to `{deliver_via_argv, deliver_via_direct_
+    call}` (T2-I) for an empty or unrecognized shape — NEVER `deliver_via_
+    network`, since partial emulation's default posture provides no
+    reachable listener for an unrecognized/unstated shape to send into;
+    `ALLOWED_DELIVERY_TOOLS_BY_SHAPE` not having an entry means the plan
+    didn't specify a recognized shape, which is a plan-authoring gap to
+    diagnose, not license to assume a network delivery path exists."""
+    fallback_tools = frozenset({"deliver_via_argv", "deliver_via_direct_call"})
+    return ALLOWED_DELIVERY_TOOLS_BY_SHAPE.get(trigger_shape, fallback_tools)
 
 
 @dataclass
@@ -437,6 +467,15 @@ class TriggerAgentResult:
     observation: ObservationRecord
     gdb_transcript: str
     summary: str
+    is_direct_call: bool = False
+    """T2-H: `True` when the observation above was produced via
+    `dynamic_track.direct_call_trigger` (a direct GDB `call` invocation of
+    the target function, bypassing normal dispatch) rather than a
+    realistic end-to-end `instrument_trigger` capture. The CALLER
+    (`dynamic_graph._run_trigger`) must label a result derived from this
+    flag as a direct invocation in `FVVWReport.emulation_mode`, never as a
+    realistic end-to-end trigger — feeding reachability =
+    `FORCED_UNKNOWN`/`CONDITIONAL` in `fvvw.joint`, not `CONFIRMED`."""
 
 
 async def trigger_agent(
@@ -511,6 +550,7 @@ async def trigger_agent(
     gdb_transcript = ""
     summary = "step budget exhausted before the agent signaled done"
     consecutive_unproductive_deliveries = 0
+    is_direct_call_invocation = False
     delivery_pending_observation = False
     """Set when a `deliver_via_*` dispatched since the last `observe_result`
     — tells the `observe_result` handler whether THIS observation is the
@@ -619,16 +659,39 @@ async def trigger_agent(
             if tool == "observe_result":
                 if delivered_payload and settings.stage5_allow_real_payloads:
                     ctx.real_payload_override = delivered_payload
+                # T2-H: when the LAST delivery this loop actually used was
+                # deliver_via_direct_call, observe via the direct-call
+                # harness (break at the target FUNCTION's own entry,
+                # `call <expr>`) — never `instrument_trigger`, which
+                # assumes NATURAL execution reached the sink breakpoint on
+                # its own. Before this fix, `render_direct_call_recipe_
+                # body`/`direct_call_trigger` existed but had no caller:
+                # `deliver_via_direct_call` only stored `call_expression`
+                # into `ctx.real_payload_override`, and this handler ran
+                # `instrument_trigger` regardless — a direct-call delivery
+                # produced NO actual invocation at all, just a normal
+                # (and typically unreached) sink-breakpoint capture.
+                used_direct_call = delivery_channel == "deliver_via_direct_call"
                 try:
-                    transcript, captured = await instrument_trigger(
-                        ctx, gdb_transcript_so_far=gdb_transcript
-                    )
+                    if used_direct_call:
+                        call_expression = ctx.real_payload_override or delivered_payload
+                        transcript, captured = await direct_call_trigger(
+                            ctx,
+                            call_expression=call_expression,
+                            gdb_transcript_so_far=gdb_transcript,
+                        )
+                    else:
+                        transcript, captured = await instrument_trigger(
+                            ctx, gdb_transcript_so_far=gdb_transcript
+                        )
                     gdb_transcript = transcript
                     observation = await collect_observation(
                         ctx,
                         result_stdout=transcript,
                         result_stderr="",
                     )
+                    if used_direct_call:
+                        is_direct_call_invocation = True
                     if delivery_pending_observation:
                         productive = bool(
                             observation.signal
@@ -671,6 +734,7 @@ async def trigger_agent(
         observation=observation,
         gdb_transcript=gdb_transcript,
         summary=summary,
+        is_direct_call=is_direct_call_invocation,
     )
 
 

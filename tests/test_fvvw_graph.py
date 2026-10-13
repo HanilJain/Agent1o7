@@ -32,6 +32,7 @@ from fw_audit.config.settings import Settings
 from fw_audit.executors.base import ExecutionResult, SessionHandle
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
 from fw_audit.stage5_verification.fvvw.graph import resolve_checkpointer, run_fvvw
+from fw_audit.stage5_verification.tools.qemu_gdb_tool import STOPPED_MARKER_PREFIX
 
 
 class _ScriptedLLM:
@@ -96,23 +97,42 @@ class _FakeSessionExecutor:
             return ExecutionResult(
                 command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
             )
+        if "gdb-multiarch" in command and "recipe_health_advance" in command:
+            # T1-C's health-gate advance probe — a throwaway batch that
+            # must show the inferior actually STOPPED at the entry
+            # breakpoint (the STOPPED_MARKER_PREFIX tag render_gdb_recipe
+            # prints right after its own first `continue`), or health_gate
+            # raises HealthGateFailure and the graph loops back to
+            # bring-up forever instead of ever reaching gdb_attach.
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout=f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n",
+                stderr="",
+                timed_out=False,
+            )
         if "gdb-multiarch" in command and "recipe_reach" in command:
             return ExecutionResult(
                 command=command,
                 returncode=0,
-                stdout="Breakpoint 1, 0x1000 in main ()\n",
+                stdout=f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n",
                 stderr="",
                 timed_out=False,
             )
         if "gdb-multiarch" in command and "recipe_guards" in command:
             return ExecutionResult(
-                command=command, returncode=0, stdout="", stderr="", timed_out=False
+                command=command,
+                returncode=0,
+                stdout=f"{STOPPED_MARKER_PREFIX}0x1000\n",
+                stderr="",
+                timed_out=False,
             )
         if "gdb-multiarch" in command and "recipe_trigger" in command:
             return ExecutionResult(
                 command=command,
                 returncode=0,
-                stdout="TRIGGER:sink_arg:;touch /tmp/claim_001_proof;\n",
+                stdout=f"{STOPPED_MARKER_PREFIX}0x1000\n"
+                "TRIGGER:sink_arg:;touch /tmp/claim_001_proof;\n",
                 stderr="",
                 timed_out=False,
             )
@@ -329,6 +349,14 @@ def _patch_executors(monkeypatch, fake_executor_cls, *, script_outputs: list[str
         if command.startswith("objdump"):
             return ExecutionResult(
                 command=command, returncode=0, stdout="disasm\n", stderr="", timed_out=False
+            )
+        if command.startswith("readelf"):
+            # T2-F's resolve_sink_addresses relocation lookup — must NOT
+            # fall through to the generic branch below, which would
+            # silently consume one entry off `outputs` meant for the
+            # static track's OWN joern-script run.
+            return ExecutionResult(
+                command=command, returncode=0, stdout="", stderr="", timed_out=False
             )
         stdout = outputs.pop(0) if outputs else ""
         return ExecutionResult(
@@ -784,6 +812,23 @@ class _NeverReachesSessionExecutor(_FakeSessionExecutor):
         if "/proc/net/tcp" in command and "BOUND" in command:
             return ExecutionResult(
                 command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
+        if "gdb-multiarch" in command and "recipe_health_advance" in command:
+            # T1-C's health-gate advance probe checks a SEPARATE fact
+            # (does the process get PAST its own entry breakpoint at
+            # all?) from what this fixture models ("the SINK/trigger
+            # breakpoint never meaningfully fires") — the process here IS
+            # alive and DOES reach its entry point; only the sink-facing
+            # recipes ("recipe_reach"/"recipe_trigger", handled by the
+            # catch-all below) report no real hit, which is what keeps
+            # `reached=False` for gdb_attach/evaluate_route as this
+            # fixture's docstring describes.
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout=f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n",
+                stderr="",
+                timed_out=False,
             )
         return ExecutionResult(command=command, returncode=0, stdout="", stderr="", timed_out=False)
 

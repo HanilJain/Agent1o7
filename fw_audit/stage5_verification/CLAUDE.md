@@ -38,6 +38,20 @@ an LLM router only when that doesn't settle the round, and its
 3) instead of the old in-function retry loops. See "The 9 nodes" section
 below for the full node table and the architecture rationale.
 
+**The Continuous Verification Supervisor** (`fvvw/supervisor.py` +
+`fvvw/monitors.py`) sits INSIDE Node 8, between the deterministic
+oracle-match/hard-budget-cutoff checks (still first, still authoritative —
+unchanged) and the LLM router (still the final fallback, unchanged): it
+reduces structured, harness-sourced `VerificationEvent`s into one canonical
+`common.verification.VerificationState`, proposes a deterministic recovery
+route from it (`propose_action`), and gates every proposed route —
+deterministic or LLM-produced — through a bounded no-repeat/escalation
+check (`validate_action`) before `_run_evaluate_route` ever acts on it. It
+never decides `confirmed`/`refuted` itself and never becomes a second
+source of verdict-adjacent routing — see "Continuous Verification
+Supervisor" below for the full architecture, canonical-state fields, and
+recovery-tier vocabulary.
+
 ## Hard constraints — never violate
 
 - Never write into `stage2/`, `stage3/`, or `stage4/` — only into this
@@ -244,7 +258,7 @@ below for the full node table and the architecture rationale.
 | 5 | GDB Attach & Instrument | Deterministic | `dynamic_track.reach_target` (reused). Stripped-symbol → address agent fallback is NOT implemented in this revision (`reach_target` already resolves its entry address from `Settings`-independent facts supplied upstream) — flagged in `dynamic_graph.py`'s module docstring as a future extension point, not silently omitted. |
 | 6 | Trigger / PoC | **LLM agent** | `dynamic_agents.trigger_agent` (`craft_payload`/`apply_precondition`/`deliver_via_argv`/`deliver_via_network`/`deliver_via_direct_call`/`observe_result`/`done`) when `stage5_allow_real_payloads`, else the deterministic `instrument_trigger` (benign-marker) path — both live in `dynamic_graph._run_trigger`. Every crafted payload is validated (`validate_real_payload`/`validate_benign_marker`) BEFORE delivery; a rejection is reported back to the LLM as feedback, not silently downgraded. |
 | 7 | Run & Observe | Deterministic | `dynamic_track.collect_observation` (benign path) or `TriggerAgentResult.observation` (agentic path — the trigger agent calls `collect_observation` itself as part of `observe_result`) → `common.verification.ObservationRecord` (signal/faulting_pc/registers/memory diff/stdout/stderr/filesystem_artifacts). |
-| 8 | Evaluator + Router | **Deterministic first pass + LLM** | `dynamic_graph._run_evaluate_route`: `dynamic_track.match_oracle` (deterministic oracle-string match) first: HIT → `confirmed` with no LLM call. Else a hard `dynamic_iteration >= stage5_dynamic_max_iterations` cutoff → `inconclusive`, ALSO with no LLM call (never trust the router alone to stop looping). Else `dynamic_agents.route_observation` (the LLM router) diagnoses and picks one of the spec's seven routes. `_build_track_result` converts a terminal route into the actual `TrackResult`. |
+| 8 | Evaluator + Router | **Deterministic first pass + Supervisor + LLM** | `dynamic_graph._run_evaluate_route`: `dynamic_track.match_oracle` (deterministic, structured-field-only match — T1-A) first: HIT + positive evidence (T1-B) → `confirmed` with no LLM call. Else a hard `dynamic_iteration >= stage5_dynamic_max_iterations` cutoff → `inconclusive`, ALSO with no LLM call. Else the Continuous Verification Supervisor (`fvvw.supervisor.propose_action`, reading the canonical `VerificationState`) proposes a deterministic recovery route with NO LLM call; only when it returns `None` does `dynamic_agents.route_observation` (the LLM router) diagnose and pick a route. Either way, `fvvw.supervisor.validate_action` gates the chosen route (no-repeat/bounded escalation) before it is acted on. `_build_track_result` converts a terminal route into the actual `TrackResult`, refusing `CONFIRMED` a second time (defense in depth) if the observation carries no positive evidence. |
 | 9 | Report | Deterministic assembly | Outside this graph — `fvvw.graph.run_fvvw` assembles `common.verification.FVVWReport` (`arbitration_log`/`observation`/`iteration_history`/`emulation_mode` — Node 9's required contents #3/#4/#6/#7) from `run_dynamic_track_only`'s `dynamic_extras` bag; `fvvw.report.write_report` composes the disclosure Markdown, unchanged. |
 
 `fvvw/dynamic_graph.py::build_dynamic_graph` compiles Nodes 2-8 into one
@@ -258,6 +272,112 @@ dynamic_extras)` 5-tuple every caller (`fvvw.graph.run_fvvw`'s fork,
 HITL's dynamic-track retry, `fvvw.debug.debug_dynamic`) already expects —
 the fork-join, `joint_evaluate`, HITL, and both drivers are otherwise
 UNTOUCHED by the rewrite.
+
+## Continuous Verification Supervisor (Tier 3)
+
+Additive glue on top of the 9-node graph above — no new orchestration
+framework, no free-running multi-agent loop. The flow:
+
+```
+workers / monitors → structured events → VerificationState → Supervisor
+    → validated next action → existing harness → new observations ↺
+```
+
+**Separation of concerns (load-bearing):** Supervisor decides WHAT TO TRY
+NEXT (`fvvw.supervisor.propose_action`/`validate_action`, both pure
+functions over `VerificationState`, no LLM). Harness decides WHAT ACTUALLY
+HAPPENED (only node bodies/monitors ever construct a
+`common.verification.VerificationEvent` — never an agent/LLM). Deterministic
+verifier decides WHAT THE EVIDENCE PROVES (`dynamic_track.match_oracle` +
+`dynamic_graph._build_track_result`'s empty-observation refusal — both
+UNCHANGED by Tier 3). `propose_action` never proposes
+`confirmed`/`refuted`; `validate_action` passes those two (and
+`inconclusive`) straight through, never re-adjudicating them.
+
+**`common.verification.VerificationState`** (`mem.dynamic.verification_state`
+— lives on `dynamic_track.BringupContext.verification_state`, the SAME
+long-lived-object-shared-by-every-node-closure home `applied_fixes`/
+`fault_log` already use; snapshotted into `FVVWState["verification_state"]`
+each round, never a live queue) is the ONE place these facts live —
+`process_status`/`gdb_status`/`breakpoint_status`/`reached`/
+`process_exited_before_bp`/`sink_addr`/`sink_reachable`/`captured_argument`/
+`signals`/`filesystem_artifacts`/`memory_observations`/`oracle_match`/
+`current_strategy`/`current_trigger_type`/`attempt_history`/
+`failure_reason`/`evidence_history`, plus the full `events` audit trail
+and `last_applied_seq` dedup bookkeeping. Node bodies read these facts
+from here — never re-derive a parallel copy per call site.
+
+**`fvvw.supervisor.apply_event`** is the deterministic REDUCER: folds one
+`VerificationEvent` (kind ∈ `TARGET_STARTED`/`TARGET_EXITED`/
+`GDB_CONNECTED`/`BREAKPOINT_HIT`/`BREAKPOINT_MISSED`/`TRIGGER_DELIVERED`/
+`TRIGGER_FAILED`/`SINK_REACHED`/`ARTIFACT_CREATED`/`SIGNAL_RECEIVED`/
+`TIMEOUT`) into a NEW `VerificationState` (never mutates in place — this is
+what makes concurrent monitor delivery deterministic). Idempotent/
+monotonic: an event with `seq <=` the last-applied `seq` for its kind is
+dropped whole; `process_status`/`breakpoint_status` never regress.
+`_run_evaluate_route` also folds the SAME per-round facts
+(`observation`/`reached`/`reached_sink`) synchronously via
+`dynamic_graph._update_state_for_round` — the synchronous equivalent of
+draining T3-L's monitor queue through `apply_events`, for exactly what the
+existing per-round call chain already computes before every monitor is
+wired into every call site.
+
+**`fvvw.supervisor.propose_action`** reads `VerificationState` and proposes
+ONE `RouteDecision` (or `None`, falling back to the LLM router), in
+priority order: `process_exited_before_bp` → `escalate_direct_call`;
+daemon+unreachable-startup signal in `failure_reason` → `escalate_direct_call`
+(defense in depth alongside T2-G's own up-front `plan_emulation` choice);
+startup failure (`process_status=="not_started"` + a reason) →
+`retry_bringup`; a trigger-shaped failure → `retry_trigger`;
+`breakpoint_status` not yet `"hit"` → `retry_gdb_attach`; reached entry but
+no `sink_addr` → `resolve_address`; a stall/timeout signal → one bounded
+`retry_bringup`, then `inconclusive` on a repeat.
+
+**`fvvw.supervisor.validate_action`** gates every proposed route —
+supervisor or LLM router — before `_run_evaluate_route` acts on it:
+legality (unrecognized route → `inconclusive`), `"escalate"` resolution
+(→ `escalate_direct_call` if `current_strategy != "direct_call"`, else
+`inconclusive` — resolved HERE so `dynamic_graph`'s own routing tables
+never need a third meaning for the same disposition), and the no-repeat/
+bounded-recovery ladder (`_ESCALATION_CHAIN`): an action proposed
+`>= Settings.stage5_supervisor_max_same_action` times against the
+IDENTICAL underlying condition (`_attempt_signature`, built from state
+facts, never LLM prose) is rejected and escalated instead of repeated —
+the direct fix for a dead-daemon `retry_gdb_attach` loop. Every accepted
+action is recorded via `record_attempt` (outcome `"applied"` the first
+time a condition is addressed, `"no_progress"` every repeat against the
+same signature) so `validate_action`'s NEXT check has real history to
+read. The chain always converges on `inconclusive` — never an unbounded
+loop.
+
+**T3-N recovery routes** (beyond the original seven): `resolve_address`
+(`dynamic_graph.resolve_address_node` — falls back `plan.sink_addr` to
+`target.func_offset` when unresolved, then routes to `gdb_attach`;
+`_ROUTE_TO_NODE["resolve_address"] = "resolve_address"`), `restart_execution`
+(`dynamic_track.restart_session` tears down the current session BEFORE
+`bringup_node` repairs — distinct from `retry_bringup`'s repair-in-place;
+`_ROUTE_TO_NODE["restart_execution"] = "bringup"`, checked via `state.get
+("route")` inside `bringup_node` itself, no separate graph node needed).
+Neither is a `_TERMINAL_ROUTES` entry — both are repairs, never terminal.
+
+**`fvvw/monitors.py`** (T3-L): bounded, cancellable, finite async pollers
+(`process_health_monitor`, `parse_transcript_events` + a caller-driven
+poll, `artifact_monitor`, `stall_monitor`) — each round-trips through
+`SandboxExecutor.exec_in_session` on `Settings.stage5_monitor_poll_seconds`
+cadence and emits into a shared `asyncio.Queue`, drained once per round via
+`drain_queue`/`apply_events`. `run_monitors_until` drives a set of them
+CONCURRENTLY via `asyncio.gather`, bounded by BOTH a caller `stop_event`
+and a hard `deadline_seconds` ceiling (so a stuck monitor can never outlive
+its caller's step, transitively never outlive
+`stage5_dynamic_wall_clock_seconds`) — cancels every still-running task on
+exit either way. `EventSequencer` gives each event `kind` its own
+monotonic per-run counter (required for `apply_event`'s dedup to mean
+anything), shared across every monitor started together. Not yet wired
+into every node's own concurrent execution window — the synchronous
+`_update_state_for_round` path (above) already covers the facts every
+existing call chain computes; a future revision replacing that with a
+`run_monitors_until` call alongside each node's own step is the natural
+next increment, not a redesign.
 
 ## Files
 
@@ -297,7 +417,9 @@ tool-calling — both are plain text in/text out, for local-model reliability.
 | `fvvw/dynamic_track.py` | The dynamic track's reusable node bodies/helpers, now consumed by `fvvw/dynamic_graph.py` rather than called in a hand-written sequence: `plan_emulation` (Node 2, incl. `direct_call`), `ensure_session`/`bringup_stabilize`/`BringupContext`/`BringupExhausted`/`_launch_qemu_and_wait` (Node 3's session provisioning + deterministic underlayer), `health_gate`/`HealthGateFailure` (Node 4), `reach_target` (Node 5), `satisfy_guards`/`instrument_trigger` (Node 6's benign-marker path), `collect_observation`/`collect_signals` (Node 7), `match_oracle` (Node 8's deterministic first pass). `_bringup_exec_user` decides per-command session privilege (root only for a chroot-required launch, gated by `Settings.stage5_sandbox_allow_privileged`); `_classify_bringup_fault`/`_KNOWN_BRINGUP_ERRORS` turn a captured QEMU/chroot failure into a human-readable diagnosis, recorded via `BringupContext.record_bringup_fault`/`no_progress_since_last_fault` so a caller can stop retrying an unchanging fault early. `validate_benign_marker`/`BenignMarkerViolation` (the benign-only posture) and `validate_real_payload`/`PayloadContainmentViolation` (the default real-payload posture, deny-list-only) — both gated by `Settings.stage5_allow_real_payloads`. `validate_injected_recipe` — HITL-inject's own, unconditional GDB-escape-hatch gate. `direct_call_trigger` — the GDB `call` harness (spec's explicit last resort). The pre-rewrite `dynamic_evaluate()` rule engine is UNUSED by the graph (kept only for any code still calling it directly) — Node 8's verdict now comes from `dynamic_graph._build_track_result`. |
 | `fvvw/dynamic_agents.py` | The three agentic tool-calling loops: `bringup_agent` (Node 3), `trigger_agent` (Node 6), `route_observation` (Node 8's LLM router, called only when the deterministic first pass doesn't settle a round). Each is a bounded JSON-action ReAct loop (`_parse_action` via the SAME `agent.cleaning.clean_json_payload` discipline) whose dispatcher `await`s `ctx.session_executor.exec_in_session` directly — the "QEMU/GDB session driven async by the agents that need it" requirement. Command composition still lives entirely in `tools/qemu_gdb_tool.py`; these loops only call into it and into `dynamic_track.py`'s node functions. |
 | `fvvw/dynamic_prompts.py` | System prompts + the JSON action/observation contract for all four dynamic-track LLM roles (bring-up, trigger, router) — mirrors `fvvw/strategy.py`'s prompt+render shape. `render_bringup_brief`/`render_trigger_brief`/`render_router_brief`. |
-| `fvvw/dynamic_graph.py` | `build_dynamic_graph()` — the compiled `StateGraph(FVVWState)` for Nodes 2-8 (see "The 9 nodes" above for the full mapping). `DynamicGraphDeps` (the three new LLMs + session executor, narrower than `fvvw.graph.FVVWDeps`). `route_after_bringup`/`_health_gate`/`_gdb_attach`/`_trigger`/`_evaluate` — the pure conditional-edge functions implementing the spec's §10 decision table. `_build_track_result`/`_TERMINAL_ROUTES` — the ONLY place a dynamic-track `TrackResult` is constructed. |
+| `fvvw/dynamic_graph.py` | `build_dynamic_graph()` — the compiled `StateGraph(FVVWState)` for Nodes 2-8 plus T3-N's `resolve_address` repair node (see "The 9 nodes"/"Continuous Verification Supervisor" above for the full mapping). `DynamicGraphDeps` (the three new LLMs + session executor, narrower than `fvvw.graph.FVVWDeps`). `route_after_bringup`/`_health_gate`/`_gdb_attach`/`_trigger`/`_evaluate` — the pure conditional-edge functions implementing the spec's §10 decision table plus T3-N's additions. `_has_positive_evidence`/`_update_state_for_round` — T1-B's shared evidence test and the per-round canonical-state fold. `_build_track_result`/`_TERMINAL_ROUTES` — the ONLY place a dynamic-track `TrackResult` is constructed (T1-B's empty-observation refusal lives here). |
+| `fvvw/supervisor.py` | Tier 3's Continuous Verification Supervisor: `apply_event`/`apply_events` (the deterministic canonical-state reducer, T3-K), `propose_action` (the deterministic recovery-route proposer, T3-M — never proposes `confirmed`/`refuted`), `validate_action` (the no-repeat/bounded-escalation gate, T3-M — also resolves `"escalate"`), `record_attempt` (attempt-history bookkeeping). Pure functions throughout — no session/LLM/graph dependency, independently unit-tested in `tests/test_fvvw_supervisor.py`. |
+| `fvvw/monitors.py` | T3-L's concurrent bounded pollers: `process_health_monitor`, `parse_transcript_events` (a pure GDB-transcript parser), `artifact_monitor`, `stall_monitor`, `run_monitors_until` (drives a set of them via `asyncio.gather` under a hard deadline), `drain_queue`, `EventSequencer`. Every monitor is the ONLY code (alongside a node body) permitted to construct a `common.verification.VerificationEvent`. |
 | `fvvw/joint.py` | `joint_evaluate()` — the only function reading both `TrackResult`s. `classify_agreement`/`classify_mechanism_confidence`/`classify_reachability_confidence`/`collect_residual_unknowns`. |
 | `fvvw/graph.py` | `run_fvvw()` — the actual fork-join: `characterize → strategy → fork(static_track, static_crosscheck, run_dynamic_track_only running concurrently) → await both → joint_evaluate`. `resolve_checkpointer()`, `FVVWDeps`/`resolve_fvvw_deps()` (now resolves SEVEN LLM roles — the original four plus `bringup_llm`/`trigger_llm`/`dynamic_evaluator_llm` — each wrapped in `llm_logging.LoggingChatModel`; `live=True` also attaches a `LiveConsole` to both `CommandLog`s). `run_dynamic_track_only()` — compiles + streams (`streaming.stream_graph_live`, `stop_after=` for per-node diagnosis) `dynamic_graph.build_dynamic_graph()` under a `stage5_dynamic_wall_clock_seconds` timeout, unpacking the terminal `FVVWState` into the `(TrackResult, guard_logs, dynamic_reached_sink, gdb_transcript, dynamic_extras)` tuple every caller expects. `run_dynamic_only()` — the dynamic-track-alone production entry point (`characterize → strategy → run_dynamic_track_only`, no static/crosscheck/joint_evaluate), backing `fw-verify run --dynamic-only`. |
 | `fvvw/report.py` | `write_report()` — one LLM call composing the seven-layer disclosure document + reconciliation section, with every raw tool output (Joern attempts, GDB transcript) quoted verbatim. `static_result: TrackResult \| None = None` — when `None` (the dynamic-only path), selects `DYNAMIC_ONLY_REPORT_SYSTEM_PROMPT` and `render_report_brief` omits the static/reconciliation content instead of fabricating it. |
@@ -527,6 +649,9 @@ fork-join (both write the same dynamic-track artifacts for the same `gid`).
   `Prompter` (no real stdin); `test_fvvw_graph.py`'s `test_run_fvvw_hitl_*`
   tests exercise the full hook end-to-end (mode off, both tracks decisive,
   force_verdict, skip, and the `stage5_hitl_max_rounds` bound).
+  `tests/test_fvvw_supervisor.py`/`test_fvvw_monitors.py` (Tier 3) are pure
+  — the reducer/propose/validate functions and the monitor pollers need no
+  executor/LLM at all, only `asyncio`/fake `exec_in_session` doubles.
 - A dynamic-track run stuck INCONCLUSIVE with no obvious cause → read
   `fvvw/logs/<gid>.dynamic.jsonl` (one JSON object per command: `node`,
   `kind`, `command`, `payload` for GDB recipe/Joern script text, full
@@ -624,6 +749,48 @@ fork-join (both write the same dynamic-track artifacts for the same `gid`).
   fault-classification/`ensure_session` groups,
   `tests/test_fvvw_graph.py::test_run_fvvw_actually_invokes_bringup_agent`,
   `tests/test_stage5_cmdlog.py::test_logging_session_executor_logs_start_and_stop_as_ok`.
+- **Second real-firmware incident (same DIR-825 `sbin_hostapd` candidate),
+  the false-CONFIRMED-with-zero-evidence bug — Tier 1/2/3 fix wave:** the
+  SAME candidate, once bring-up worked, reported dynamic **CONFIRMED /
+  HIGH** even though the target exited on the FIRST `continue` (breakpoint
+  never hit), the injected marker was never created, and the GDB trigger
+  recipe errored `The program is not being run` — an empty
+  `ObservationRecord` minted a confirmation. Root cause: `match_oracle`
+  (T1-A) regex-matched the oracle's own PROSE (`/tmp/<id>_proof`) against
+  `observation.stdout`, which is full of the harness's OWN `/tmp/fvvw/...`
+  scratch-path traffic — a substring collision, never a real observation.
+  Fixed by the full Tier 1 (T1-A structured-field-only match; T1-B a
+  positive-evidence gate at BOTH `_run_evaluate_route` and
+  `_build_track_result`, defense in depth; T1-C a real GDB-batch liveness
+  ADVANCE probe in `health_gate`, since `pgrep`/`/proc/net/tcp` alone only
+  prove "QEMU is waiting", never "the target can execute"; T1-D signal
+  handlers moved before the recipe's first `continue` plus a
+  `STOPPED_MARKER_PREFIX` reached/exited marker; T1-E a dedicated
+  `escalate_direct_call` route for a process that exited before the
+  breakpoint, replacing the dead-daemon `retry_gdb_attach` loop), Tier 2
+  (T2-F real sink/PLT-GOT/call-site address resolution via `objdump`/
+  `readelf -r`, since the sink breakpoint was falling back to the function
+  ENTRY, reading param_1 instead of the string passed to `system()`; T2-G a
+  daemon/startup-reachability signal from Stage 2's own call table,
+  consumed by `plan_emulation` to prefer `direct_call` up front; T2-H
+  wiring `direct_call_trigger` — it existed but had no caller;
+  T2-I tightening the trigger-shape gate so a WPS/802.11/EAP finding can
+  never be delivered via a network listener that doesn't exist under
+  partial emulation), and Tier 3 (the Continuous Verification Supervisor
+  — see that section above — generalizing T1-E's fix and the dead-daemon
+  loop fix into a reusable, bounded no-repeat/escalation mechanism for
+  EVERY recovery route, not just one hand-coded case). Regression tests:
+  `tests/test_fvvw_dynamic_track.py::test_match_oracle_ignores_oracle_prose_paths`/
+  `test_health_gate_fails_when_target_exits_on_continue`/
+  `test_recipe_sets_signal_handlers_before_continue`,
+  `tests/test_fvvw_dynamic_graph.py::test_confirmed_route_refused_on_empty_observation`/
+  `test_process_exit_before_bp_routes_to_escalate`,
+  `tests/test_stage5_crosscheck_tool.py::test_sink_addr_resolved_to_plt_call_site`,
+  `tests/test_stage5_characterize_tool.py::test_daemon_target_prefers_direct_call`... — see
+  `fw_audit/config/settings.py`'s Tier 3 settings block
+  (`stage5_supervisor_max_same_action`, `stage5_monitor_poll_seconds`) and
+  the full test list in `tests/test_fvvw_supervisor.py`/
+  `test_fvvw_monitors.py` for the complete regression coverage.
 
 ## Adding a feature here
 
@@ -645,15 +812,35 @@ fork-join (both write the same dynamic-track artifacts for the same `gid`).
   actually knows the tool exists.
 - A new arch for the dynamic track is one `QEMU_ARCH_TABLE` entry in
   `tools/qemu_gdb_tool.py`, not a new `if`/`elif` branch anywhere.
-- A new Node 8 route (beyond the spec's existing seven) needs: a new
-  `Literal` value on `common.verification.RouteDecision.route`, a new
-  entry in `dynamic_graph._TERMINAL_ROUTES` if it's a terminal
-  disposition (with the `(VerificationVerdict, proved_hypothesis)` pair
-  `_build_track_result` should stamp) or a new `_ROUTE_TO_NODE`/
-  conditional-edge mapping if it's a repair route, and a description of
-  when to choose it in `dynamic_prompts.py`'s `DYNAMIC_ROUTER_SYSTEM_PROMPT`.
-  Never let a new route bypass the hard iteration-budget cutoff in
-  `_run_evaluate_route` (checked BEFORE the LLM router is even called).
+- A new Node 8 route (beyond the spec's existing seven, or Tier 3's
+  `resolve_address`/`restart_execution`/`escalate`) needs: a new `Literal`
+  value on `common.verification.RouteDecision.route`, a new entry in
+  `dynamic_graph._TERMINAL_ROUTES` if it's a terminal disposition (with
+  the `(VerificationVerdict, proved_hypothesis)` pair `_build_track_result`
+  should stamp) or a new `_ROUTE_TO_NODE`/conditional-edge mapping if it's
+  a repair route, and a description of when to choose it in `dynamic_
+  prompts.py`'s `DYNAMIC_ROUTER_SYSTEM_PROMPT`. If the route should ALSO
+  be proposable deterministically (not just by the LLM router), add the
+  case to `fvvw/supervisor.py`'s `propose_action` too, in priority order
+  against the OTHER cases already there. Never let a new route bypass the
+  hard iteration-budget cutoff in `_run_evaluate_route` (checked BEFORE
+  the supervisor/LLM router is even called), and never let it construct
+  or imply a `VerificationVerdict` anywhere outside `_build_track_result`.
+- A new structured event kind (Tier 3, T3-J) needs: a new value on
+  `common.verification.VerificationEventKind`'s `Literal`, a new `elif`
+  branch in `fvvw/supervisor.py`'s `apply_event` describing exactly which
+  `VerificationState` fields it updates (never regress a monotonic status
+  field — see the existing branches' own pattern), and the harness code
+  (a node body or a new `fvvw/monitors.py` poller) that actually emits it
+  — an event must always trace back to a concrete command the harness ran
+  and a concrete result it parsed, never an agent's own reasoning. A new
+  monitor follows `fvvw/monitors.py`'s existing shape exactly: bounded,
+  cancellable, driven by `run_monitors_until`, emitting into the shared
+  queue via a shared `EventSequencer`.
+- A new bounded recovery tier for `fvvw/supervisor.py`'s no-repeat gate
+  goes in `_ESCALATION_CHAIN` — every entry's value must be strictly
+  "further along" toward a terminal disposition so the chain always
+  converges on `inconclusive`; never add a cycle.
 - A new agentic loop (a fourth `dynamic_agents.py`-shaped role, beyond
   bring-up/trigger/router) needs: an `AgentRole` in `config/llm_config.py`
   (`ROLE_TO_TIER` + `_ROLE_OVERRIDE_SETTINGS_FIELD`), a `Settings` model

@@ -212,6 +212,44 @@ def test_parse_strategy_response_strips_think_and_fences():
 
 
 # ---------------------------------------------------------------------- #
+# P2-1 regression: an unresolved-placeholder address token in
+# dynamic_plan (the DIR-825 incident's `entry_addr: "unspecified"`) must
+# be normalized to "" so the existing empty-field fallback
+# (target.func_offset) applies, instead of reaching the dynamic track as
+# a poisoned recipe operand.
+# ---------------------------------------------------------------------- #
+
+
+def test_parse_strategy_response_normalizes_unspecified_entry_addr():
+    payload = json.loads(_valid_plan_json())
+    payload["dynamic_plan"]["entry_addr"] = "unspecified"
+    plan = parse_strategy_response(json.dumps(payload))
+    assert isinstance(plan, StrategyPlan)
+    assert plan.dynamic_plan.entry_addr == ""
+
+
+def test_parse_strategy_response_normalizes_unresolved_sink_and_target_addr():
+    payload = json.loads(_valid_plan_json())
+    payload["dynamic_plan"]["sink_addr"] = ""
+    payload["dynamic_plan"]["target_addr"] = "none"
+    plan = parse_strategy_response(json.dumps(payload))
+    assert isinstance(plan, StrategyPlan)
+    assert plan.dynamic_plan.target_addr == ""
+    # Already-empty sink_addr is unaffected (nothing to normalize).
+    assert plan.dynamic_plan.sink_addr == ""
+
+
+def test_parse_strategy_response_leaves_resolved_addresses_untouched():
+    """Model-agnostic: a well-formed plan (real addresses everywhere)
+    must never be altered by the normalizer — a no-op on the happy path."""
+    plan = parse_strategy_response(_valid_plan_json())
+    assert isinstance(plan, StrategyPlan)
+    assert plan.dynamic_plan.entry_addr == "0x00022594"
+    assert plan.dynamic_plan.target_addr == "0x00026938"
+    assert plan.dynamic_plan.sink_addr == "0x00020ba8"
+
+
+# ---------------------------------------------------------------------- #
 # strategy_agent (end-to-end with the scripted LLM)
 # ---------------------------------------------------------------------- #
 

@@ -52,6 +52,15 @@ def readelf_dynsym_command(binary_relpath: str) -> str:
     return f"readelf --dyn-syms {shlex.quote(binary_relpath)}"
 
 
+def readelf_relocs_command(binary_relpath: str) -> str:
+    """T2-F: dump the relocation table (`.rel.plt`/`.rela.plt` for a
+    dynamically-linked ELF) — where an imported sink symbol's PLT/GOT
+    entry ADDRESS actually lives, which `readelf --dyn-syms` alone does
+    not carry (that only gives the symbol's own st_value, typically 0 for
+    an UNDEFINED imported symbol)."""
+    return f"readelf -r {shlex.quote(binary_relpath)}"
+
+
 class CrosscheckResult:
     """Plain result object (not a pydantic model — this is intermediate
     tool output, not a persisted/LLM-facing schema; `fvvw.static_track`/
@@ -206,9 +215,281 @@ async def static_crosscheck(
     )
 
 
+# --------------------------------------------------------------------- #
+# T2-F: resolve real sink / PLT-GOT / call-site addresses. Deterministic,
+# script-based, never LLM-controlled — the same discipline this module's
+# own docstring already establishes for `static_crosscheck`. Consumed by
+# `fvvw.graph.run_fvvw` to populate/override `DynamicPlan.sink_addr` (and
+# guard addrs) with the REAL call-site address of the sink, rather than
+# leaving the dynamic track's sink breakpoint to fall back to the
+# function's own entry (where `(char*)$a0` reads whatever parameter
+# happens to sit in that register at entry — never the actual string
+# passed to the sink call).
+# --------------------------------------------------------------------- #
+
+
+class SinkAddressResolution:
+    """Plain result object (same "intermediate tool output, not a
+    persisted/LLM-facing schema" posture as `CrosscheckResult`) —
+    `{sink_name: {"plt_addr": str, "call_site_addr": str}}`-shaped,
+    exposed as a typed accessor rather than a bare dict so a caller gets
+    `.resolved(sink_name)`/`.best_call_site(sink_name)` instead of
+    re-deriving "empty string means unresolved" at every call site."""
+
+    def __init__(self, *, addresses: dict[str, dict[str, str]], stderr: str = "") -> None:
+        self.addresses = addresses
+        """`{sink_name: {"plt_addr": "0x...", "call_site_addr": "0x..."}}` —
+        `plt_addr` is the imported symbol's PLT/GOT stub address (from the
+        relocation table); `call_site_addr` is the address, inside the
+        TARGET function's own disassembly, of the instruction that CALLS
+        that stub — the actual sink breakpoint address. Either may be the
+        empty string if that half couldn't be resolved."""
+        self.stderr = stderr
+
+    def resolved(self, sink_name: str) -> bool:
+        return bool(self.best_call_site(sink_name))
+
+    def best_call_site(self, sink_name: str) -> str:
+        """The address to actually set the sink breakpoint at: the real
+        CALL-SITE address when resolved (this is what T2-F exists to
+        produce), else empty string — deliberately NEVER falls back to
+        `plt_addr` alone (a breakpoint on the PLT stub itself, rather than
+        the call site inside the target function, would fire for EVERY
+        caller of that imported function anywhere in the binary, not just
+        the one path this finding claims — a materially different,
+        weaker breakpoint location the caller must not silently accept as
+        equivalent)."""
+        return self.addresses.get(sink_name, {}).get("call_site_addr", "")
+
+    def to_evidence_dict(self) -> dict:
+        return {"addresses": self.addresses, "stderr": self.stderr}
+
+
+_HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]+$")
+_SYMBOL_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?:@\S+)?$")
+
+_CALL_MNEMONICS = frozenset({"call", "callq", "bl", "blx", "jal"})
+"""Call mnemonics across every arch `QEMU_ARCH_TABLE` supports:
+`call`/`callq` (x86, kept for host-tooling parity), `bl`/`blx` (ARM/
+Thumb — `blx` for a Thumb<->ARM interworking call), `jal` (MIPS)."""
+
+_CALL_INSN_LINE_RE = re.compile(
+    r"^\s*([0-9a-fA-F]+):\s+(?P<rest>.+)$"
+)
+"""Matches ONE disassembly line's leading address column — `objdump -d`'s
+own per-instruction line shape (`  <addr>:\\t<hex bytes>\\t<mnemonic>
+<operands>`). Deliberately scoped to a SINGLE line's text (this module
+processes `_CALL_INSN_LINE_RE` line-by-line, never with `re.MULTILINE`
+across the whole disassembly blob at once) — an earlier version of this
+regex spanned multiple lines because `\\s` also matches the newline
+between instructions, which silently anchored a call's captured ADDRESS
+to a PRECEDING, unrelated line. Line-by-line matching makes that class of
+bug structurally impossible: `finditer` is never called against a
+multi-line blob for this pattern."""
+
+_CALL_TARGET_RE = re.compile(r"<([^>]+)>\s*$")
+"""Matches the trailing `<symbol[+offset]>` objdump annotates a resolved
+call target with, once a line has already been confirmed to contain a
+call mnemonic — kept as a separate, narrower pattern from
+`_CALL_INSN_LINE_RE` so the two concerns (`is this a call line at all`
+vs `what does it target`) stay independently readable."""
+
+
+def _resolve_plt_addresses(reloc_output: str, sink_names: list[str]) -> dict[str, str]:
+    """`{sink_name: plt_addr}` from a `readelf -r` relocation table — the
+    PLT/GOT slot address for each named sink that appears in the
+    relocation table at all (an imported dynamic symbol). A sink not
+    present here is either statically linked (no relocation needed — its
+    calls resolve directly to a local address, handled entirely by
+    `_resolve_call_sites` below) or genuinely absent from this binary.
+
+    Deliberately TOKEN-based rather than one fixed-column regex: `readelf
+    -r`'s exact column count/spacing varies across binutils versions and
+    relocation types (REL vs RELA carries an extra addend column; some
+    reloc types omit Sym.Value entirely) — real firmware toolchains are
+    never guaranteed to match one fixed layout. The first HEX token on a
+    data row is always the Offset (the PLT/GOT slot address this function
+    needs); the LAST token that looks like a symbol name (starts with a
+    letter/underscore, never pure hex) is always the Sym.Name column,
+    regardless of how many hex-looking columns sit between them."""
+    plt_addrs: dict[str, str] = {}
+    sink_set = set(sink_names)
+    for line in reloc_output.splitlines():
+        tokens = line.split()
+        if not tokens or not _HEX_TOKEN_RE.match(tokens[0]):
+            continue
+        offset = tokens[0]
+        symbol_token = next(
+            (t for t in reversed(tokens[1:]) if _SYMBOL_TOKEN_RE.match(t)), None
+        )
+        if symbol_token is None:
+            continue
+        base_symbol = symbol_token.split("@", 1)[0]
+        if base_symbol in sink_set and base_symbol not in plt_addrs:
+            plt_addrs[base_symbol] = f"0x{offset}"
+    return plt_addrs
+
+
+def _resolve_call_sites(disassembly: str, sink_names: list[str]) -> dict[str, list[str]]:
+    """`{sink_name: [call_site_addr, ...]}` — every address, ANYWHERE in
+    the supplied disassembly text, of an instruction that calls a symbol
+    matching one of `sink_names` (by exact name, or `name@plt` for an
+    imported symbol's PLT stub — objdump's own annotation convention).
+    Caller passes just the TARGET FUNCTION's own disassembly slice (not
+    the whole binary's) so "anywhere" in practice means "anywhere inside
+    the one function this finding claims the sink call happens in".
+
+    Processes `disassembly` STRICTLY line by line (never one regex against
+    the whole multi-line blob) — see `_CALL_INSN_LINE_RE`'s own docstring
+    for the cross-line-capture bug this avoids."""
+    call_sites: dict[str, list[str]] = {name: [] for name in sink_names}
+    for line in disassembly.splitlines():
+        line_match = _CALL_INSN_LINE_RE.match(line)
+        if line_match is None:
+            continue
+        insn_addr = line_match.group(1)
+        rest = line_match.group("rest")
+        rest_tokens = rest.split()
+        if not any(tok.lower().rstrip(":") in _CALL_MNEMONICS for tok in rest_tokens):
+            continue
+        target_match = _CALL_TARGET_RE.search(rest)
+        if target_match is None:
+            continue
+        target_symbol = target_match.group(1)
+        base_symbol = target_symbol.split("@", 1)[0].split("+", 1)[0]
+        if base_symbol in call_sites:
+            call_sites[base_symbol].append(f"0x{insn_addr}")
+    return call_sites
+
+
+def _extract_function_disassembly(full_disassembly: str, function_name: str) -> str:
+    """Slice out just ONE function's disassembly block from `objdump -d`'s
+    whole-binary output — objdump prints each function under its own
+    `<name>:` header line, so this returns the text from that header up to
+    (not including) the NEXT such header, or end of text if this is the
+    last function. Falls back to the WHOLE disassembly when the function
+    header can't be found (e.g. a stripped binary with no symbol for it,
+    or a name mismatch) — resolution then degrades to "match call sites
+    anywhere in the binary" rather than failing outright, since a false
+    positive here is still bounded by requiring an EXACT sink-name match
+    at the call instruction itself."""
+    header_re = re.compile(
+        rf"^[0-9a-fA-F]+\s*<{re.escape(function_name)}>:\s*$", re.MULTILINE
+    )
+    match = header_re.search(full_disassembly)
+    if match is None:
+        return full_disassembly
+    next_header = re.search(
+        r"^[0-9a-fA-F]+\s*<[^>]+>:\s*$", full_disassembly[match.end() :], re.MULTILINE
+    )
+    end = match.end() + next_header.start() if next_header is not None else len(full_disassembly)
+    return full_disassembly[match.start() : end]
+
+
+async def resolve_sink_addresses(
+    candidate: VerificationCandidate,
+    *,
+    target_function: str,
+    sink_names: list[str],
+    executor: Executor | None = None,
+    settings: Settings | None = None,
+    command_log: CommandLog | None = None,
+) -> SinkAddressResolution:
+    """T2-F's deterministic sink-address resolver: disassemble the REAL
+    target ELF (reusing `objdump_disassemble_command`, the SAME
+    disassembly `static_crosscheck` already produces — this function
+    re-runs it independently rather than threading a `CrosscheckResult`
+    through, since the two calls can run concurrently and neither should
+    depend on the other's completion), slice out `target_function`'s own
+    disassembly block, and find the CALL-SITE address of each named
+    `sink_names` entry inside that block. Falls back to the relocation
+    table (`readelf -r`) to resolve a sink's PLT/GOT stub address too,
+    for completeness/evidence, even though `SinkAddressResolution.
+    best_call_site` never uses the PLT address alone as a breakpoint
+    location (see that method's own docstring on why).
+
+    Returns a `SinkAddressResolution` with EMPTY entries (never raises)
+    when `candidate.binary_path` is unresolved or the sandbox is
+    unreachable — mirrors `static_crosscheck`'s own "purely corroborative,
+    never blocks the track" posture. An unresolved sink address is the
+    honest, expected outcome for many real binaries (stripped symbols,
+    an inlined/optimized-away call, a sink this finding named that
+    doesn't actually appear in THIS function) — the caller
+    (`fvvw.graph.run_fvvw`) is what turns "never resolved" into "cannot
+    honestly confirm" for a CONFIRMED verdict, not this function raising.
+    """
+    settings = settings or get_settings()
+    executor = executor or verification_executor(settings)
+
+    if candidate.binary_path is None or not sink_names:
+        return SinkAddressResolution(
+            addresses={},
+            stderr="no binary_path resolved for this candidate, or no sink_names given — "
+            "cannot resolve sink addresses.",
+        )
+
+    workspace_dir = candidate.binary_path.parent
+    binary_name = candidate.binary_path.name
+
+    async with aspan(
+        "stage5.resolve_sink_addresses",
+        run_type="tool",
+        inputs={
+            "global_id": candidate.global_id,
+            "bin_id": candidate.bin_id,
+            "sink_names": sink_names,
+        },
+    ) as run:
+        disasm_command = objdump_disassemble_command(binary_name)
+        disasm_result = await executor.run(
+            disasm_command, files=workspace_dir, timeout=settings.stage5_qemu_timeout_seconds
+        )
+        reloc_command = readelf_relocs_command(binary_name)
+        reloc_result = await executor.run(
+            reloc_command, files=workspace_dir, timeout=settings.stage5_qemu_timeout_seconds
+        )
+
+        if command_log is not None:
+            command_log.record(
+                node="resolve_sink_addresses", kind="objdump", command=disasm_command,
+                result=disasm_result,
+            )
+            command_log.record(
+                node="resolve_sink_addresses", kind="readelf", command=reloc_command,
+                result=reloc_result,
+            )
+
+        plt_addrs = _resolve_plt_addresses(reloc_result.stdout, sink_names)
+        function_slice = _extract_function_disassembly(disasm_result.stdout, target_function)
+        call_sites = _resolve_call_sites(function_slice, sink_names)
+
+        addresses: dict[str, dict[str, str]] = {}
+        for name in sink_names:
+            # The EARLIEST call site inside the target function is the
+            # one a straightforward, non-inlined control flow reaches
+            # first — a deterministic, reproducible choice rather than an
+            # arbitrary "last match wins".
+            sites = call_sites.get(name) or []
+            addresses[name] = {
+                "plt_addr": plt_addrs.get(name, ""),
+                "call_site_addr": sites[0] if sites else "",
+            }
+
+        if run is not None:
+            run.end(outputs={"addresses": addresses})
+
+    return SinkAddressResolution(
+        addresses=addresses,
+        stderr=(disasm_result.stderr + reloc_result.stderr).strip(),
+    )
+
+
 __all__ = [
     "CrosscheckResult",
+    "SinkAddressResolution",
     "objdump_disassemble_command",
     "readelf_dynsym_command",
+    "readelf_relocs_command",
+    "resolve_sink_addresses",
     "static_crosscheck",
 ]

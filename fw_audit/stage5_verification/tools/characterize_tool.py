@@ -129,6 +129,83 @@ def _find_function(
     return None
 
 
+# --------------------------------------------------------------------- #
+# T2-G: daemon / startup-reachability signal. Deliberately CHEAP (a string
+# scan over Stage 2's already-computed GhidraFunction.calls table — no
+# sandbox call, no new decompilation) — the same "seed from what Stage 2
+# already computed" posture this whole module follows for every other
+# fact. Best-effort by design: a false negative here just means
+# `plan_emulation` falls back to its existing guard-name heuristic; a
+# false positive just means a strategy prefers direct_call slightly more
+# often than strictly necessary — neither can produce an incorrect
+# VERDICT, since Tier 1's positive-evidence gates are what actually decide
+# CONFIRMED, independent of which reach strategy was tried.
+# --------------------------------------------------------------------- #
+
+_DAEMON_CALL_MARKERS: tuple[str, ...] = ("daemon", "fork", "setsid", "openlog", "daemonize")
+"""Call names that, on a self-contained Linux/embedded C daemon, are the
+standard way a process detaches into the background and announces itself
+as a long-running service — see `daemon(3)`/`fork(2)`/`setsid(2)`/
+`openlog(3)`'s own man pages. A match against `GhidraFunction.calls` (a
+plain list of called-symbol NAMES Stage 2 already resolved) is
+necessarily best-effort: a statically-linked or PLT-stub-only call table
+may not carry every libc symbol by its familiar name, so absence here is
+never treated as proof the target ISN'T a daemon — only presence is
+treated as a positive signal."""
+
+_CONFIG_PARSE_MARKERS: tuple[str, ...] = (
+    "fopen",
+    "getconfig",
+    "config_read",
+    "parseconfig",
+    "parse_config",
+    "readconfig",
+    "read_config",
+    "nvram_get",
+)
+"""Call names suggesting a mandatory config-file/NVRAM read near `main` —
+the concrete "hard startup dependency" half of `startup_reachable=False`'s
+definition (daemon-ness ALONE is not enough; plenty of daemons run fine
+with no config file present at all under partial emulation)."""
+
+
+def detect_daemon_signal(functions: tuple[GhidraFunction, ...]) -> tuple[bool, bool | None]:
+    """Returns `(is_daemon, startup_reachable)` — T2-G's deterministic,
+    dependency-free scan over Stage 2's already-computed function/call
+    table (`VerificationCandidate.functions`), no sandbox/readelf call
+    needed.
+
+    `is_daemon`: any function's `calls` list contains one of
+    `_DAEMON_CALL_MARKERS`.
+
+    `startup_reachable`: `None` (undetermined — the common, "nothing
+    suspicious" case) unless `is_daemon` is `True` AND at least one
+    function ALSO calls something in `_CONFIG_PARSE_MARKERS` — that
+    combination (daemonizes AND reads a config/NVRAM value somewhere) is
+    the concrete "mandatory config-file parser near main" signal the plan
+    calls for; in that case `startup_reachable=False` (the plan's own
+    "PLUS an apparent hard startup dependency" qualifier — daemon-ness
+    alone never sets this False, since a daemon with no config dependency
+    may well start fine under partial emulation).
+    """
+    is_daemon = False
+    has_config_dependency = False
+    for fn in functions:
+        calls_lower = [c.lower() for c in fn.calls]
+        if not is_daemon and any(
+            any(marker in call for marker in _DAEMON_CALL_MARKERS) for call in calls_lower
+        ):
+            is_daemon = True
+        if not has_config_dependency and any(
+            any(marker in call for marker in _CONFIG_PARSE_MARKERS) for call in calls_lower
+        ):
+            has_config_dependency = True
+        if is_daemon and has_config_dependency:
+            break
+    startup_reachable = False if (is_daemon and has_config_dependency) else None
+    return is_daemon, startup_reachable
+
+
 async def characterize_target(candidate: VerificationCandidate) -> TargetMeta:
     """Build `mem.target` for one candidate — the `characterize_target`
     node's actual work, factored out from any LangGraph node wrapper so
@@ -179,6 +256,11 @@ async def characterize_target(candidate: VerificationCandidate) -> TargetMeta:
             func_offset = resolved_fn.entry_point
             dispatch_resolvable = bool(resolved_fn.called_by) and not resolved_fn.is_thunk
 
+        # T2-G: cheap, dependency-free daemon/startup-reachability signal
+        # — scans the SAME already-computed function/call table above, no
+        # extra sandbox call.
+        is_daemon, startup_reachable = detect_daemon_signal(candidate.functions)
+
         if run is not None:
             run.end(
                 outputs={
@@ -186,6 +268,8 @@ async def characterize_target(candidate: VerificationCandidate) -> TargetMeta:
                     "pie": pie,
                     "func_offset": func_offset,
                     "dispatch_resolvable": dispatch_resolvable,
+                    "is_daemon": is_daemon,
+                    "startup_reachable": startup_reachable,
                 }
             )
 
@@ -200,7 +284,9 @@ async def characterize_target(candidate: VerificationCandidate) -> TargetMeta:
         dispatch_resolvable=dispatch_resolvable,
         binary_path=str(candidate.binary_path) if candidate.binary_path else "",
         rootfs_dir=str(candidate.rootfs_dir) if candidate.rootfs_dir else "",
+        is_daemon=is_daemon,
+        startup_reachable=startup_reachable,
     )
 
 
-__all__ = ["characterize_target", "detect_pie", "guess_libc"]
+__all__ = ["characterize_target", "detect_daemon_signal", "detect_pie", "guess_libc"]

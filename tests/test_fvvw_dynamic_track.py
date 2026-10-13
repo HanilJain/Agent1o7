@@ -24,7 +24,13 @@ from fw_audit.common.findings import (
     FindingSource,
     Severity,
 )
-from fw_audit.common.verification import DynamicPlan, GuardSpec, TargetMeta, VerificationVerdict
+from fw_audit.common.verification import (
+    DynamicPlan,
+    GuardSpec,
+    ObservationRecord,
+    TargetMeta,
+    VerificationVerdict,
+)
 from fw_audit.config.settings import Settings
 from fw_audit.executors.base import ExecutionResult, SessionHandle
 from fw_audit.stage5_verification.candidate_index import VerificationCandidate
@@ -33,20 +39,31 @@ from fw_audit.stage5_verification.fvvw.dynamic_track import (
     BringupContext,
     BringupExhausted,
     DynamicFault,
+    HealthGateFailure,
+    UnresolvedPlanFault,
     _bringup_exec_user,
+    _build_and_lint_recipe,
     _classify_bringup_fault,
+    _looks_like_setup_fault,
+    _parse_instrumentation_error,
+    _parse_process_exit,
+    _parse_reached_marker,
     bringup_stabilize,
     cleanup_marker_artifact,
+    collect_observation,
     collect_signals,
     dynamic_evaluate,
     ensure_session,
+    health_gate,
     instrument_trigger,
+    match_oracle,
     plan_emulation,
     reach_target,
     satisfy_guards,
     validate_benign_marker,
     validate_injected_recipe,
 )
+from fw_audit.stage5_verification.tools.qemu_gdb_tool import STOPPED_MARKER_PREFIX
 
 # ---------------------------------------------------------------------- #
 # validate_benign_marker — safety-critical, tested most thoroughly
@@ -216,6 +233,35 @@ def test_plan_emulation_unsupported_arch():
     assert "no QEMU support" in result["emulation_plan"]["reason"]
 
 
+def test_daemon_target_prefers_direct_call():
+    """T2-G: a daemon target with an unreachable startup path
+    (is_daemon=True, startup_reachable=False — characterize_target's
+    detect_daemon_signal) must prefer direct_call mode from the START,
+    rather than attempting natural_drive/user-mode emulation that is
+    unlikely to ever get past bring-up. This is the deterministic-plan
+    counterpart to the router's OWN escalate_direct_call route — chosen
+    proactively instead of only after repeated bring-up failures."""
+    daemon_target = TargetMeta(
+        arch="arm", endianness="little", func_offset="0x1000",
+        is_daemon=True, startup_reachable=False,
+    )
+    result = plan_emulation(daemon_target, _dynamic_plan())
+    assert result["emulation_plan"]["mode"] == "direct_call"
+    assert "daemon" in result["emulation_plan"]["reason"].lower()
+
+
+def test_daemon_target_without_config_dependency_does_not_force_direct_call():
+    """is_daemon=True ALONE (startup_reachable still None/undetermined)
+    must NOT force direct_call — only the combination with a confirmed
+    unreachable startup path does."""
+    daemon_target = TargetMeta(
+        arch="arm", endianness="little", func_offset="0x1000",
+        is_daemon=True, startup_reachable=None,
+    )
+    result = plan_emulation(daemon_target, _dynamic_plan())
+    assert result["emulation_plan"]["mode"] != "direct_call"
+
+
 # ---------------------------------------------------------------------- #
 # dynamic_evaluate — the A/B hypothesis rule engine (SYMMETRIC: no
 # active_hypothesis switch — an earlier version threaded one through here
@@ -342,6 +388,364 @@ def test_dynamic_evaluate_retries_mid_budget_when_stalling():
         max_iterations=4,
     )
     assert result["route"] == "retry"
+
+
+# ---------------------------------------------------------------------- #
+# match_oracle — T1-A: structured-field match only, never oracle prose
+# ---------------------------------------------------------------------- #
+
+
+def test_match_oracle_ignores_oracle_prose_paths():
+    """The exact DIR-825 regression: an oracle whose prose contains
+    `/tmp/<id>_proof`, an empty `filesystem_artifacts`, and a transcript
+    full of the harness's own `/tmp/fvvw/...` scratch paths — `match_
+    oracle` must return False, never a false HIT from a substring
+    collision between the oracle's own example text and the harness's
+    scratch-file traffic in `observation.stdout`."""
+    oracle_text = (
+        "a file is written to /tmp/claim_001_proof containing OVERFLOW_CONFIRMED"
+    )
+    plan = _dynamic_plan(oracle=oracle_text, decisive_observable=oracle_text)
+    observation = ObservationRecord(
+        filesystem_artifacts=[],
+        stdout="mkdir -p /tmp/fvvw && cat > /tmp/fvvw/recipe_trigger.gdb << 'FVVWEOF'\n"
+        "target remote localhost:1234\n",
+        stderr="",
+    )
+    assert match_oracle(observation, plan) is False
+
+
+def test_match_oracle_hits_on_real_filesystem_artifact():
+    """The positive counterpart: the SAME oracle text matches when
+    `observation.filesystem_artifacts` actually contains the claimed
+    path — populated by `collect_observation`'s real `test -e` probe,
+    never guessed from prose."""
+    oracle_text = (
+        "a file is written to /tmp/claim_001_proof containing OVERFLOW_CONFIRMED"
+    )
+    plan = _dynamic_plan(oracle=oracle_text, decisive_observable=oracle_text)
+    observation = ObservationRecord(filesystem_artifacts=["/tmp/claim_001_proof"])
+    assert match_oracle(observation, plan) is True
+
+
+def test_match_oracle_never_matches_stdout_substring():
+    """Even with a plausible-looking match in stdout, match_oracle must
+    NEVER check observation.stdout/.stderr for a filesystem-artifact
+    oracle — only observation.filesystem_artifacts is structured,
+    harness-derived evidence."""
+    oracle_text = "a file is written to /tmp/claim_001_proof"
+    plan = _dynamic_plan(oracle=oracle_text, decisive_observable=oracle_text)
+    observation = ObservationRecord(
+        filesystem_artifacts=[],
+        stdout="/tmp/claim_001_proof was mentioned here but never actually created",
+    )
+    assert match_oracle(observation, plan) is False
+
+
+def test_match_oracle_signal_requires_matching_pc():
+    plan = _dynamic_plan(
+        oracle="process receives SIGSEGV with PC 0x00012345",
+        decisive_observable="crash",
+    )
+    wrong_pc = ObservationRecord(signal="SIGSEGV", faulting_pc="0x00099999")
+    assert match_oracle(wrong_pc, plan) is False
+    right_pc = ObservationRecord(signal="SIGSEGV", faulting_pc="0x00012345")
+    assert match_oracle(right_pc, plan) is True
+
+
+def test_match_oracle_memory_diff_requires_flag():
+    plan = _dynamic_plan(oracle="memory overwrite detected", decisive_observable="diff")
+    assert match_oracle(ObservationRecord(memory_diff_detected=False), plan) is False
+    assert match_oracle(ObservationRecord(memory_diff_detected=True), plan) is True
+
+
+# ---------------------------------------------------------------------- #
+# GDB recipe codegen — T1-D: signal handlers before continue, reached/
+# exited markers, and the process-exit/reached parsers those markers feed
+# ---------------------------------------------------------------------- #
+
+
+def test_recipe_sets_signal_handlers_before_continue():
+    from fw_audit.stage5_verification.tools.qemu_gdb_tool import render_gdb_recipe
+
+    recipe = render_gdb_recipe(
+        architecture="arm", gdb_port=1234, entry_addr="0x1000", breakpoint_commands=[]
+    )
+    handle_idx = recipe.index("handle SIGSEGV")
+    first_continue_idx = recipe.index("continue")
+    assert handle_idx < first_continue_idx, (
+        "handle SIGSEGV/SIGABRT/SIGILL must be set BEFORE the first continue — "
+        "handle needs no running inferior, and setting it after the first continue "
+        "means a crash on that very first continue is never caught."
+    )
+    assert STOPPED_MARKER_PREFIX in recipe
+
+
+def test_parse_process_exit_recognizes_inferior_exit_line():
+    combined = "Continuing.\n[Inferior 1 (process 1) exited with code 01]\n"
+    assert _parse_process_exit(combined) == 1
+
+
+def test_parse_process_exit_none_when_no_exit_line():
+    assert _parse_process_exit("Breakpoint 1, 0x1000 in main ()\n") is None
+
+
+def test_parse_reached_marker_present_when_stopped():
+    combined = f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n"
+    assert _parse_reached_marker(combined) == "0x1000"
+
+
+def test_parse_reached_marker_absent_when_never_printed():
+    combined = "[Inferior 1 (process 1) exited with code 01]\n"
+    assert _parse_reached_marker(combined) is None
+
+
+async def test_collect_observation_sets_process_exited_before_bp(tmp_path: Path):
+    """The exact DIR-825 failure signature: the transcript shows the
+    inferior exiting WITHOUT the STOPPED marker ever printing —
+    collect_observation must set process_exited_before_bp=True and
+    reached=False."""
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor())
+    combined_stdout = (
+        "target remote localhost:1234\n"
+        "Continuing.\n"
+        "[Inferior 1 (process 1) exited with code 01]\n"
+    )
+    observation = await collect_observation(
+        ctx, result_stdout=combined_stdout, result_stderr=""
+    )
+    assert observation.process_exited_before_bp is True
+    assert observation.reached is False
+
+
+async def test_collect_observation_reached_true_when_stopped_marker_present(tmp_path: Path):
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor())
+    combined_stdout = f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n"
+    observation = await collect_observation(
+        ctx, result_stdout=combined_stdout, result_stderr=""
+    )
+    assert observation.reached is True
+    assert observation.process_exited_before_bp is False
+
+
+# ---------------------------------------------------------------------- #
+# P0-1/P0-2/P0-3/P1-1 — DIR-825 regression: an unresolved plan address
+# (`entry_addr="unspecified"`) must never reach a `break *` line, and a
+# GDB instrumentation error must never collapse into an ordinary
+# "breakpoint not hit" observation.
+# ---------------------------------------------------------------------- #
+
+
+def test_looks_like_setup_fault_recognizes_no_symbol_table():
+    """The EXACT DIR-825 transcript text — `break *unspecified` -> 'No
+    symbol table is loaded' — must be classified as a setup fault, not
+    silently treated as an ordinary 'breakpoint not hit' round."""
+    transcript = (
+        'The target architecture is set to "mips".\n'
+        "0x3ffbba90 in _start () from /work/lib/ld-uClibc-0.9.28.so\n"
+        "warning: remote target does not support file transfer, attempting to access "
+        "files from local filesystem.\n"
+        "/tmp/fvvw/recipe_reach.gdb:5: Error in sourced command file:\n"
+        'No symbol table is loaded.  Use the "file" command.\n'
+    )
+    assert _looks_like_setup_fault(transcript) is True
+
+
+def test_looks_like_setup_fault_ignores_ordinary_miss():
+    """A transcript with no connection/instrumentation error text at all
+    — the ordinary 'connected fine, breakpoint just never fired' case —
+    must NOT be classified as a setup fault."""
+    transcript = "Continuing.\n[Inferior 1 (process 1) exited with code 00]\n"
+    assert _looks_like_setup_fault(transcript) is False
+
+
+def test_looks_like_setup_fault_never_overrides_a_real_hit():
+    """A transcript containing a real breakpoint hit line must never be
+    misclassified as a setup fault, even if an instrumentation-error
+    marker string also appears in it (e.g. echoed target output) —
+    positive evidence of a working breakpoint always wins."""
+    transcript = "Breakpoint 1, 0x00445688 in wps_nvram_set ()\nsome text mentioning no symbol table\n"
+    assert _looks_like_setup_fault(transcript) is False
+
+
+def test_parse_instrumentation_error_matches_no_symbol_table():
+    transcript = 'Error in sourced command file:\nNo symbol table is loaded.  Use the "file" command.\n'
+    error = _parse_instrumentation_error(transcript)
+    assert error is not None
+    assert "no symbol table" in error.lower()
+
+
+def test_parse_instrumentation_error_none_on_clean_transcript():
+    assert _parse_instrumentation_error("Continuing.\nBreakpoint 1, 0x1000 in main ()\n") is None
+
+
+async def test_collect_observation_flags_instrumentation_failure(tmp_path: Path):
+    """P1-1: an observation built from a transcript showing a GDB
+    instrumentation error must set `instrumentation_ok=False` and populate
+    `instrumentation_error` — this is the field the DIR-825 incident's
+    ObservationRecord was missing (an empty record with `oracle_match=None,
+    signal=None, filesystem_artifacts=[]` was indistinguishable from
+    'ran cleanly, nothing happened')."""
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor())
+    combined_stdout = (
+        'The target architecture is set to "mips".\n'
+        "warning: remote target does not support file transfer.\n"
+        "/tmp/fvvw/recipe_trigger.gdb:5: Error in sourced command file:\n"
+        'No symbol table is loaded.  Use the "file" command.\n'
+    )
+    observation = await collect_observation(ctx, result_stdout=combined_stdout, result_stderr="")
+    assert observation.instrumentation_ok is False
+    assert observation.instrumentation_error is not None
+    assert "no symbol table" in observation.instrumentation_error.lower()
+
+
+async def test_collect_observation_instrumentation_ok_on_clean_hit(tmp_path: Path):
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor())
+    combined_stdout = f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n"
+    observation = await collect_observation(ctx, result_stdout=combined_stdout, result_stderr="")
+    assert observation.instrumentation_ok is True
+    assert observation.instrumentation_error is None
+
+
+def test_build_and_lint_recipe_raises_unresolved_plan_fault_for_unspecified():
+    """The exact DIR-825 value must raise `UnresolvedPlanFault` (a
+    `DynamicFault` subclass, so every existing `except DynamicFault` catch
+    site still catches it) — never reach `render_gdb_recipe` at all, so a
+    `break *unspecified` line can never even be constructed."""
+    with pytest.raises(UnresolvedPlanFault):
+        _build_and_lint_recipe(
+            global_id="test", architecture="mips", gdb_port=1234,
+            entry_addr="unspecified", breakpoint_commands=[],
+        )
+
+
+def test_build_and_lint_recipe_accepts_resolved_entry_addr():
+    recipe = _build_and_lint_recipe(
+        global_id="test", architecture="mips", gdb_port=1234,
+        entry_addr="0x00445688", breakpoint_commands=[],
+    )
+    assert "break *0x00445688" in recipe.splitlines()
+
+
+async def test_reach_target_raises_unresolved_plan_fault_when_entry_addr_unspecified(
+    tmp_path: Path,
+):
+    """End-to-end: a plan carrying `entry_addr="unspecified"` with no
+    resolvable `target.func_offset` fallback must make `reach_target`
+    raise `UnresolvedPlanFault` BEFORE ever issuing a GDB batch call —
+    the fast-fail fix for the DIR-825 incident's root cause."""
+    plan = _dynamic_plan(entry_addr="unspecified", sink_addr="0x2000")
+    ctx = _ctx(tmp_path, session_executor=_FakeSessionExecutor(), plan=plan)
+    ctx.handle = SessionHandle(container_name="fake-session")
+    with pytest.raises(UnresolvedPlanFault):
+        await reach_target(ctx)
+
+
+# ---------------------------------------------------------------------- #
+# health_gate — T1-C: a real liveness ADVANCE, not just "QEMU is waiting"
+# ---------------------------------------------------------------------- #
+
+
+async def test_health_gate_fails_when_target_exits_on_continue(tmp_path: Path):
+    """The DIR-825 root cause reproduced directly: pgrep reports ALIVE,
+    the gdbstub port is BOUND, but the health-gate's own advance-probe
+    GDB batch shows the inferior exiting WITHOUT ever printing the
+    STOPPED marker — health_gate must raise HealthGateFailure (never a
+    silent pass), with a diagnosis naming "process exits during startup"."""
+
+    def on_exec(command: str):
+        if "pgrep" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
+        if "gdb-multiarch" in command and "recipe_health_advance" in command:
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout="Continuing.\n[Inferior 1 (process 1) exited with code 01]\n",
+                stderr="",
+                timed_out=False,
+            )
+        return None
+
+    session = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=session)
+    ctx.handle = SessionHandle(container_name="fake-session")
+
+    with pytest.raises(HealthGateFailure) as excinfo:
+        await health_gate(ctx)
+    assert "process exits during startup" in str(excinfo.value).lower()
+
+
+async def test_health_gate_fails_when_entry_addr_unresolved_instead_of_silently_skipping(
+    tmp_path: Path,
+):
+    """DIR-825 bug #2 regression: before this fix, an unresolved
+    `entry_addr` (`"unspecified"`, non-empty so the OLD `if entry_addr.
+    strip():` check let the advance probe run — but not a real address)
+    made the T1-C advance probe SILENTLY SKIP, degrading health_gate back
+    to "QEMU is waiting" (pgrep ALIVE + port BOUND) with no real liveness
+    evidence — exactly how a dead-on-arrival hostapd (exiting during
+    startup with no config argv) passed health_gate as healthy. An
+    unresolved entry_addr must now be an outright HealthGateFailure."""
+
+    def on_exec(command: str):
+        if "pgrep" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
+        if "gdb-multiarch" in command and "recipe_health_advance" in command:
+            pytest.fail(
+                "the advance-probe GDB batch must never run with an unresolved "
+                "entry_addr — health_gate must fail BEFORE attempting to build a "
+                "recipe with no real break operand"
+            )
+        return None
+
+    plan = _dynamic_plan(entry_addr="unspecified", sink_addr="0x2000")
+    session = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=session, plan=plan)
+    ctx.target = TargetMeta(arch="arm", endianness="little", func_offset="")
+    ctx.handle = SessionHandle(container_name="fake-session")
+
+    with pytest.raises(HealthGateFailure) as excinfo:
+        await health_gate(ctx)
+    assert "unresolved" in str(excinfo.value).lower()
+
+
+async def test_health_gate_passes_when_target_advances_past_entry(tmp_path: Path):
+    def on_exec(command: str):
+        if "pgrep" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="ALIVE\n", stderr="", timed_out=False
+            )
+        if "/proc/net/tcp" in command and "BOUND" in command:
+            return ExecutionResult(
+                command=command, returncode=0, stdout="BOUND\n", stderr="", timed_out=False
+            )
+        if "gdb-multiarch" in command and "recipe_health_advance" in command:
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout=f"Breakpoint 1, 0x1000 in main ()\n{STOPPED_MARKER_PREFIX}0x1000\n",
+                stderr="",
+                timed_out=False,
+            )
+        return None
+
+    session = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=session)
+    ctx.handle = SessionHandle(container_name="fake-session")
+
+    await health_gate(ctx)  # must not raise
 
 
 # ---------------------------------------------------------------------- #
