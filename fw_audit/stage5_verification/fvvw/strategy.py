@@ -92,6 +92,23 @@ look like), crosscheck_required (true whenever the evidence traces back to \
 decompiler output, which is nearly always), and decisive_observable \
 restated in CPGQL/data-flow terms.
 
+sink_names and expected_intermediate_calls are matched EXACTLY against real \
+symbol tables (`resolve_sink_addresses`'s CPG/PLT lookup, `static_crosscheck`'s \
+disassembly grep) — every entry MUST be a bare, concrete function-name \
+candidate (e.g. "strcpy", "sprintf", "memcpy"), never a role description or \
+sentence. A description like "stack buffer write (memcpy/strcpy/sprintf/ \
+strcat into a local array)" matches NOTHING in either lookup and silently \
+produces false-empty results downstream. If the finding's own data_flow \
+does not name the concrete function, list EVERY plausible candidate as its \
+OWN separate list entry instead of describing the sink in words — e.g. \
+sink_names: ["strcpy", "sprintf", "memcpy", "strcat", "vsprintf", \
+"snprintf"], never a single combined description string. The same rule \
+applies to expected_intermediate_calls: name actual function symbols (e.g. \
+"websGetVar", "httpGetByte"), never a role like "HTTP request parser / \
+field extractor" — if the finding's data_flow only describes a role and \
+names no function, leave expected_intermediate_calls empty rather than \
+inventing a descriptive placeholder.
+
 4. dynamic_plan: reach_strategy ("natural_drive" if the target's dispatch \
 is statically resolvable per the supplied target facts AND the target facts \
 do not show is_daemon=true with startup_reachable=false — a daemon whose own \
@@ -295,6 +312,36 @@ def validate_decisive_observable(plan: StrategyPlan) -> bool:
     return all(observables) and all(oracles) and all(disconfirms)
 
 
+def _looks_like_concrete_symbol(name: str) -> bool:
+    """`sink_names`/`expected_intermediate_calls` entries are matched
+    EXACTLY against real symbol tables downstream (`resolve_sink_addresses`'s
+    CPG/PLT lookup, `static_crosscheck`'s disassembly grep) — a prose
+    description can never match either, and silently produces false-empty
+    results (observed in production: `sink_names: ["stack buffer write
+    (memcpy/strcpy/sprintf/strcat into a local array)"]` resolved to nothing
+    in both lookups). A bare C/libc symbol never contains whitespace,
+    parentheses, or a slash, so rejecting any entry that does is a cheap,
+    reliable proxy for "this is prose, not a name" without needing a real
+    symbol table at validation time."""
+    name = name.strip()
+    if not name:
+        return False
+    return not any(ch in name for ch in " ()/")
+
+
+def validate_concrete_names(plan: StrategyPlan) -> bool:
+    """Deterministic post-check (script, not LLM) alongside
+    `validate_decisive_observable`: every `static_plan.sink_names`/
+    `.expected_intermediate_calls` entry must look like a concrete symbol
+    candidate, never a role description — see `_looks_like_concrete_symbol`.
+    An EMPTY list passes (the prompt explicitly allows leaving
+    `expected_intermediate_calls` empty when the finding names no function);
+    only a non-empty entry that fails the bare-symbol shape check rejects
+    the plan."""
+    candidates = (*plan.static_plan.sink_names, *plan.static_plan.expected_intermediate_calls)
+    return all(_looks_like_concrete_symbol(name) for name in candidates)
+
+
 def _normalize_unresolved_addr_fields(plan: StrategyPlan) -> StrategyPlan:
     """P2-1 (model-agnostic hygiene, not a model-specific prompt patch): a
     weaker LLM may write a placeholder WORD (`"unspecified"`, `"none"`,
@@ -402,7 +449,11 @@ async def strategy_agent(
         )
         last_raw = str(getattr(response, "content", response))
         plan = parse_strategy_response(response.content)
-        if plan is not None and validate_decisive_observable(plan):
+        if (
+            plan is not None
+            and validate_decisive_observable(plan)
+            and validate_concrete_names(plan)
+        ):
             if command_log is not None:
                 command_log.record(
                     node="strategy_agent",
@@ -414,11 +465,15 @@ async def strategy_agent(
             return plan
 
         if command_log is not None:
-            reason = (
-                "parsed but failed validate_decisive_observable"
-                if plan is not None
-                else "did not parse as a StrategyPlan"
-            )
+            if plan is None:
+                reason = "did not parse as a StrategyPlan"
+            elif not validate_decisive_observable(plan):
+                reason = "parsed but failed validate_decisive_observable"
+            else:
+                reason = (
+                    "parsed but sink_names/expected_intermediate_calls contained "
+                    "prose, not symbol names"
+                )
             command_log.record(
                 node="strategy_agent",
                 kind="parse_failed",
@@ -430,14 +485,20 @@ async def strategy_agent(
         if attempt < max_regenerate_attempts:
             nudge = (
                 "Your previous response either did not parse as the required JSON "
-                "object, or one of hypotheses/static_plan/dynamic_plan's "
+                "object, one of hypotheses/static_plan/dynamic_plan's "
                 "decisive_observable/oracle/disconfirm_condition fields was empty or did "
-                "not consistently restate the same underlying claim. Return ONLY the "
-                "corrected JSON object this time, with decisive_observable describing the "
-                "same fact everywhere it appears, and hypotheses.oracle/dynamic_plan.oracle "
-                "(and hypotheses.disconfirm_condition/dynamic_plan.disconfirm_condition) "
-                "both filled in with the exact, mechanically-checkable confirm/disconfirm "
-                "conditions — never left empty."
+                "not consistently restate the same underlying claim, or "
+                "static_plan.sink_names/expected_intermediate_calls contained a prose "
+                "description instead of bare symbol-name candidates (no spaces, "
+                "parentheses, or slashes — e.g. \"strcpy\", not \"stack buffer write "
+                "(strcpy/memcpy/...)\"). Return ONLY the corrected JSON object this time: "
+                "decisive_observable describing the same fact everywhere it appears; "
+                "hypotheses.oracle/dynamic_plan.oracle (and hypotheses."
+                "disconfirm_condition/dynamic_plan.disconfirm_condition) both filled in "
+                "with the exact, mechanically-checkable confirm/disconfirm conditions — "
+                "never left empty; and sink_names/expected_intermediate_calls as a list of "
+                "concrete candidate symbol names (list every plausible one separately if "
+                "the finding doesn't name the exact function), never a description."
             )
             messages = [*messages, HumanMessage(content=nudge)]
 
@@ -454,5 +515,6 @@ __all__ = [
     "parse_strategy_response",
     "render_strategy_brief",
     "strategy_agent",
+    "validate_concrete_names",
     "validate_decisive_observable",
 ]

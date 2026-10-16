@@ -871,7 +871,13 @@ async def test_bringup_stabilize_stages_static_qemu_binary_into_rootfs(tmp_path:
     assert any(
         "cp " in c and "command -v qemu-arm" in c for c in executor.exec_calls
     ), "bringup_stabilize did not stage the static QEMU binary into the rootfs"
-    assert "staged qemu-arm into rootfs" in " ".join(ctx.applied_fixes)
+    # Deliberately NOT recorded in `ctx.applied_fixes`: staging is an
+    # unconditional, idempotent setup step run on every call, not a
+    # corrective repair — recording it there would defeat
+    # `no_progress_since_last_fault()`'s "did anything actually change"
+    # comparison (see that method's docstring and `bringup_stabilize`'s own
+    # comment at the staging call site).
+    assert "staged qemu-arm into rootfs" not in " ".join(ctx.applied_fixes)
     launch = next(c for c in executor.exec_calls if "-g 1234" in c)
     assert "/qemu-arm" in launch and "-L /" in launch
 
@@ -966,6 +972,42 @@ async def test_bringup_stabilize_raises_dynamic_fault_when_gdbstub_never_ready(t
 
     with pytest.raises(DynamicFault):
         await bringup_stabilize(ctx)
+
+
+async def test_bringup_stabilize_repeated_identical_failure_is_detected_as_no_progress(
+    tmp_path: Path,
+):
+    """Regression: `bringup_stabilize` unconditionally re-stages the static
+    QEMU binary on every call (success or failure) — that staging step must
+    never be recorded as a "fix" in `ctx.applied_fixes`, or
+    `no_progress_since_last_fault()`'s `len(applied_fixes)` comparison can
+    never detect two consecutive IDENTICAL failures (the counter would
+    always have grown by the staging step alone, masking a real repeat).
+    Observed on real ARM firmware: an unfixable chroot/launch-command bug
+    failed identically 5 times in a row, exhausting the whole repair budget
+    instead of aborting after the second repeat."""
+
+    def on_exec(command: str):
+        if "04D2" in command:
+            return ExecutionResult(
+                command=command, returncode=1, stdout="", stderr="", timed_out=False
+            )
+        return None
+
+    executor = _FakeSessionExecutor(on_exec)
+    ctx = _ctx(tmp_path, session_executor=executor)
+
+    with pytest.raises(DynamicFault):
+        await bringup_stabilize(ctx)
+    assert ctx.no_progress_since_last_fault() is False  # only one fault so far
+
+    with pytest.raises(DynamicFault):
+        await bringup_stabilize(ctx)
+    assert ctx.no_progress_since_last_fault() is True, (
+        "a second identical bring-up failure, with no real fix applied in "
+        "between, must be detected as no-progress — the unconditional QEMU "
+        "binary re-staging step must not be counted as a fix"
+    )
 
 
 async def test_bringup_stabilize_surfaces_qemu_log_in_fault_message(tmp_path: Path):
