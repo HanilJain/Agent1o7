@@ -780,7 +780,19 @@ async def bringup_stabilize(ctx: BringupContext) -> SessionHandle:
                     f"{arch_spec.user_binary!r} into the rootfs for chroot: "
                     f"{copy_result.stderr.strip() or copy_result.stdout.strip()!r}"
                 )
-            ctx.applied_fixes.append(f"staged {arch_spec.user_binary} into rootfs")
+            # Deliberately NOT appended to `ctx.applied_fixes`: staging the
+            # QEMU binary is an unconditional, idempotent setup step this
+            # function performs on EVERY call (success or failure), not a
+            # corrective repair. `no_progress_since_last_fault()` uses
+            # `len(applied_fixes)` as its sole "did anything actually
+            # change" signal between two consecutive faults — if this
+            # per-attempt no-op kept incrementing that counter, the
+            # comparison could never detect a repeated, unchanging fault
+            # (the counter would always differ), defeating the whole
+            # early-abort it exists for. Confirmed against a real run: an
+            # ARM target failed this same way 5 times in a row (bounded
+            # only by stage5_bringup_max_repairs) because this line used to
+            # mask the repeat.
 
         await _launch_qemu_and_wait(ctx)
 

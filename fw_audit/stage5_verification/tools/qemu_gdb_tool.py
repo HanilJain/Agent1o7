@@ -152,6 +152,34 @@ def gdb_binary() -> str:
     return "gdb-multiarch"
 
 
+def _cpu_probe_env_parts(cpu_probe_env: dict[str, str]) -> list[str]:
+    """Render `arch_spec.cpu_probe_env` as bare `KEY=value` shell-prefix
+    tokens, meant to be placed as the VERY FIRST tokens of the whole
+    command — i.e. BEFORE `chroot`, never between `chroot NEWROOT` and the
+    real command. `exec_in_session`/`run()` both execute the assembled
+    command string via `docker exec ... sh -c "<command>"`
+    (`executors/sandbox_executor.py`), so it IS shell-interpreted — but only
+    as a prefix immediately preceding the command it applies to. `chroot`'s
+    own argv contract is `chroot NEWROOT COMMAND ARGS...`; it does not parse
+    `KEY=value` tokens the way a shell parses a `VAR=val cmd` prefix, so a
+    bare `KEY=value` sitting between `chroot NEWROOT` and the real command
+    is taken AS the command to exec (and fails `No such file or directory`,
+    since no program is literally named e.g. `OPENSSL_armcap=0`) — a real,
+    100%-reproducing bring-up failure for every ARM target (the only arch
+    table entries with a non-empty `cpu_probe_env`).
+
+    Placing the assignment BEFORE `chroot` instead (`OPENSSL_armcap=0
+    chroot . /qemu-arm ...`) lets the OUTER shell set it in `chroot`'s own
+    environment; GNU coreutils `chroot` does not strip/reset the
+    environment before exec'ing its COMMAND, so the variable reaches the
+    QEMU process inside the new root via ordinary fork/exec inheritance.
+    This needs nothing — no `env` binary, no shell — to exist INSIDE the
+    chroot'd rootfs itself, unlike an `env KEY=value ...` prefix placed
+    after `chroot`, which would depend on `env` being present in a
+    (frequently minimal/busybox) embedded rootfs."""
+    return [f"{key}={shlex.quote(value)}" for key, value in cpu_probe_env.items()]
+
+
 def build_qemu_user_launch_command(
     *,
     arch_spec: QemuArchSpec,
@@ -162,12 +190,15 @@ def build_qemu_user_launch_command(
     qemu_binary_in_chroot: str | None = None,
 ) -> str:
     """Assemble the exact user-mode QEMU launch command
-    (`bringup_stabilize`'s job per the design doc), in order: chroot prefix
-    (if `rootfs_relpath` is given — the target resolves paths relative to
-    its own rootfs, as `/sbin/rc`-style dispatcher binaries do), the
-    CPU-probe environment-variable fixes (`arch_spec.cpu_probe_env`), the
-    QEMU user-mode binary, the GDB stub flag `-g <port>`, the library/
-    sysroot path `-L <rootfs>`, then the target path and any argv.
+    (`bringup_stabilize`'s job per the design doc), in order: the CPU-probe
+    environment-variable fixes (`arch_spec.cpu_probe_env`, as a shell-level
+    `KEY=value` prefix — see `_cpu_probe_env_parts`), the chroot prefix (if
+    `rootfs_relpath` is given — the target resolves paths relative to its
+    own rootfs, as `/sbin/rc`-style dispatcher binaries do), the QEMU
+    user-mode binary, the GDB stub flag `-g <port>`, the library/sysroot
+    path `-L <rootfs>`, then the target path and any argv. The env prefix
+    comes BEFORE `chroot`, never between `chroot NEWROOT` and the command —
+    see `_cpu_probe_env_parts`'s docstring for why that ordering matters.
 
     All paths are relative to the bind-mounted session workspace
     (`CONTAINER_WORKDIR`) — this function never sees or needs a host path.
@@ -187,11 +218,13 @@ def build_qemu_user_launch_command(
             "chroot the container's qemu-<arch> is unreachable, so the caller must "
             "stage a static QEMU binary into the rootfs and pass its in-chroot path."
         )
-    parts: list[str] = []
+    # The env-var shell prefix must come FIRST — even before `chroot` — so
+    # the outer shell applies it to chroot's own environment, which chroot
+    # then passes through to the exec'd command. See
+    # `_cpu_probe_env_parts`'s docstring for why.
+    parts: list[str] = list(_cpu_probe_env_parts(arch_spec.cpu_probe_env))
     if rootfs_relpath:
         parts += ["chroot", shlex.quote(rootfs_relpath)]
-    for key, value in arch_spec.cpu_probe_env.items():
-        parts.append(f"{key}={shlex.quote(value)}")
     # After chroot, the container's /usr/bin/qemu-<arch> is no longer
     # reachable — use the copy the caller staged inside the rootfs.
     parts.append(shlex.quote(qemu_binary_in_chroot) if rootfs_relpath else arch_spec.user_binary)
@@ -600,11 +633,11 @@ def build_qemu_strace_command(
             "qemu_binary_in_chroot is required when rootfs_relpath is set — see "
             "build_qemu_user_launch_command's identical requirement."
         )
-    parts: list[str] = []
+    # Env-var shell prefix first — even before `chroot` — see
+    # `_cpu_probe_env_parts`'s docstring.
+    parts: list[str] = list(_cpu_probe_env_parts(arch_spec.cpu_probe_env))
     if rootfs_relpath:
         parts += ["chroot", shlex.quote(rootfs_relpath)]
-    for key, value in arch_spec.cpu_probe_env.items():
-        parts.append(f"{key}={shlex.quote(value)}")
     parts.append(shlex.quote(qemu_binary_in_chroot) if rootfs_relpath else arch_spec.user_binary)
     parts.append("-strace")
     if rootfs_relpath:

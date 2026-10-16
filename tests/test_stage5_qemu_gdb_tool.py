@@ -123,8 +123,13 @@ def test_user_launch_command_with_chroot_and_rootfs():
     )
     # After chroot the emulator runs from inside the rootfs (staged static
     # binary at /qemu-arm) and the sysroot is the new root `/`, not the
-    # pre-chroot path.
-    assert cmd.startswith("chroot . OPENSSL_armcap=0 /qemu-arm -g 1234 -L / sbin/rc")
+    # pre-chroot path. The CPU-probe env fix is a shell-level `KEY=value`
+    # prefix placed BEFORE `chroot` itself (not between `chroot NEWROOT`
+    # and the real command, which `chroot` would misparse as the command
+    # to exec — see `_cpu_probe_env_parts`'s docstring). `chroot` passes
+    # its inherited environment through to the exec'd command, so this
+    # needs no `env` binary (or anything else) present inside the rootfs.
+    assert cmd.startswith("OPENSSL_armcap=0 chroot . /qemu-arm -g 1234 -L / sbin/rc")
 
 
 def test_user_launch_command_chroot_requires_qemu_binary_in_chroot():
